@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ExHentai Recommender</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>ExHentai Recommender</h1>
+        <p id="status">Loading</p>
+      </div>
+      <div class="actions">
+        <button id="fetchBtn" type="button">Fetch</button>
+        <button id="enrichBtn" type="button">Enrich</button>
+        <button id="retrainBtn" type="button">Retrain</button>
+        <button id="modelBtn" type="button">Model</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="settings">
+        <h2>Settings</h2>
+        <label>
+          Cookie header
+          <textarea id="cookie" rows="5" autocomplete="off" spellcheck="false" placeholder="ipb_member_id=...; ipb_pass_hash=...; igneous=..."></textarea>
+        </label>
+        <div class="hint">Leave this blank to keep the stored cookie.</div>
+        <div class="hint" id="cookiePreview"></div>
+        <div class="actions stacked">
+          <button id="checkBtn" type="button">Check Login</button>
+          <button id="clearCookieBtn" type="button">Clear Cookie</button>
+        </div>
+
+        <label>
+          Bootstrap tags
+          <textarea id="tags" rows="8" spellcheck="false" placeholder="artist:name&#10;language:english&#10;-tag you dislike&#10;parody:name:2"></textarea>
+        </label>
+
+        <div class="row">
+          <label>
+            Pages
+            <input id="pages" type="number" min="1" max="5" value="1">
+          </label>
+          <label>
+            Details
+            <input id="detailLimit" type="number" min="0" max="50" value="8">
+          </label>
+          <label>
+            Learned
+            <input id="learnedLimit" type="number" min="0" max="20" value="6">
+          </label>
+          <label>
+            Pool
+            <input id="candidateLimit" type="number" min="100" max="10000" step="100" value="2000">
+          </label>
+          <label>
+            Minutes
+            <input id="minutes" type="number" min="5" max="240" value="30">
+          </label>
+        </div>
+
+        <label class="check">
+          <input id="autoRefresh" type="checkbox">
+          Auto refresh
+        </label>
+
+        <button id="saveBtn" type="button">Save</button>
+
+        <section class="status-panel">
+          <h2>Refresh</h2>
+          <dl id="refreshStatus">
+            <div><dt>State</dt><dd>Loading</dd></div>
+          </dl>
+        </section>
+
+        <section class="status-panel">
+          <h2>Backup</h2>
+          <div class="actions stacked">
+            <button id="exportBtn" type="button">Export</button>
+            <button id="importBtn" type="button">Import</button>
+          </div>
+          <label class="check">
+            <input id="replaceImport" type="checkbox">
+            Replace data
+          </label>
+          <input id="importFile" class="hidden" type="file" accept="application/json,.json">
+        </section>
+      </aside>
+
+      <section class="content">
+        <div class="toolbar">
+          <input id="query" type="search" placeholder="Optional one-off search query">
+          <button id="searchFetchBtn" type="button">Fetch Query</button>
+          <input id="localFilter" type="search" placeholder="Filter local title, tag, category, uploader">
+          <label class="check inline">
+            <input id="includeRated" type="checkbox">
+            Rated
+          </label>
+        </div>
+        <div id="recommendations" class="grid"></div>
+        <div class="loadbar">
+          <button id="loadMoreBtn" type="button">Load More</button>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="modelDialog">
+      <form method="dialog">
+        <header>
+          <h2 id="dialogTitle">Learned Model</h2>
+          <button value="close" aria-label="Close">x</button>
+        </header>
+        <pre id="modelBody"></pre>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

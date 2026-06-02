@@ -1,0 +1,901 @@
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import threading
+import time
+import urllib.parse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+from . import db
+from .exhentai import Gallery, check_access, fetch_galleries, fetch_gallery_detail, normalize_cookie_header
+from .recommender import (
+    clear_feedback,
+    export_preferences,
+    feedback_history,
+    get_bootstrap_tags,
+    import_preferences,
+    learned_query_tags,
+    model_snapshot,
+    parse_bootstrap_tags,
+    recommend_page,
+    record_feedback,
+    retrain_model,
+    score_gallery,
+    store_galleries,
+    upsert_bootstrap_tags,
+)
+
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+FETCH_LOCK = threading.Lock()
+FETCH_STATE: dict[str, Any] = {"running": False}
+
+
+class ApiError(Exception):
+    def __init__(self, status: HTTPStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ExhRec/0.1"
+
+    def do_HEAD(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/":
+                self.serve_static("index.html", body=False)
+            elif path.startswith("/static/"):
+                self.serve_static(path.removeprefix("/static/"), body=False)
+            else:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
+        except Exception as exc:
+            self.handle_error(exc)
+
+    def do_GET(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/":
+                self.serve_static("index.html")
+            elif path.startswith("/static/"):
+                self.serve_static(path.removeprefix("/static/"))
+            elif path == "/api/settings":
+                self.send_json(get_settings())
+            elif path == "/api/status":
+                self.send_json(get_status())
+            elif path == "/api/fetch-runs":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = int(query.get("limit", ["10"])[0])
+                with db.connect() as conn:
+                    self.send_json({"items": fetch_runs(conn, limit=limit)})
+            elif path == "/api/plan":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                force_query = query.get("query", [None])[0]
+                self.send_json(plan_fetch(force_query=force_query))
+            elif path == "/api/recommendations":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = int(query.get("limit", ["40"])[0])
+                offset = int(query.get("offset", ["0"])[0])
+                include_rated = parse_bool(query.get("include_rated", ["0"])[0])
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(
+                        recommendation_payload(
+                            conn,
+                            limit=limit,
+                            include_rated=include_rated,
+                            offset=offset,
+                            filter_text=filter_text,
+                        )
+                    )
+            elif path == "/api/feedback":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                gallery_url = str(query.get("gallery_url", [""])[0])
+                limit = int(query.get("limit", ["25"])[0])
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                with db.connect() as conn:
+                    self.send_json(feedback_history_payload(conn, gallery_url, limit=limit))
+            elif path == "/api/model":
+                with db.connect() as conn:
+                    self.send_json(model_snapshot(conn))
+            elif path == "/api/export":
+                with db.connect() as conn:
+                    self.send_json(export_preferences(conn))
+            else:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
+        except Exception as exc:
+            self.handle_error(exc)
+
+    def do_POST(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/settings":
+                payload = self.read_json()
+                save_settings(payload)
+                self.send_json(get_settings())
+            elif path == "/api/fetch":
+                payload = self.read_json()
+                result = fetch_and_store(
+                    force_query=payload.get("query"),
+                    include_rated=bool(payload.get("include_rated")),
+                    filter_text=payload.get("filter_text"),
+                )
+                self.send_json(result)
+            elif path == "/api/enrich":
+                payload = self.read_json()
+                result = enrich_recommendations(
+                    include_rated=bool(payload.get("include_rated")),
+                    filter_text=payload.get("filter_text"),
+                    limit=payload.get("limit"),
+                )
+                self.send_json(result)
+            elif path == "/api/feedback":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "")
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                score = payload.get("score")
+                vote = payload.get("vote")
+                if score is not None:
+                    score = int(score)
+                    if score < 1 or score > 5:
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "score must be between 1 and 5")
+                elif vote is not None:
+                    vote = int(vote)
+                    if vote not in (-1, 1):
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "vote must be 1 or -1")
+                else:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "vote or score is required")
+                with db.connect() as conn:
+                    ensure_gallery_exists(conn, gallery_url)
+                    record_feedback(conn, gallery_url, vote=vote, score=score, note=payload.get("note"))
+                feedback_enrichment = enrich_feedback_gallery(gallery_url)
+                with db.connect() as conn:
+                    page = recommendation_payload(
+                        conn,
+                        limit=40,
+                        include_rated=bool(payload.get("include_rated")),
+                        filter_text=payload.get("filter_text"),
+                    )
+                self.send_json({"ok": True, "feedback_enrichment": feedback_enrichment, **page})
+            elif path == "/api/feedback/clear":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "")
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                with db.connect() as conn:
+                    ensure_gallery_exists(conn, gallery_url)
+                    removed = clear_feedback(conn, gallery_url)
+                    page = recommendation_payload(
+                        conn,
+                        limit=40,
+                        include_rated=bool(payload.get("include_rated")),
+                        filter_text=payload.get("filter_text"),
+                    )
+                self.send_json({"ok": True, "removed": removed, **page})
+            elif path == "/api/retrain":
+                payload = self.read_json()
+                with db.connect() as conn:
+                    retrain_model(conn)
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "model": model_snapshot(conn),
+                            **recommendation_payload(
+                                conn,
+                                limit=40,
+                                include_rated=bool(payload.get("include_rated")),
+                                filter_text=payload.get("filter_text"),
+                            ),
+                        }
+                    )
+            elif path == "/api/check":
+                result = check_saved_access()
+                self.send_json(result, status=HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST)
+            elif path == "/api/import":
+                payload = self.read_json()
+                replace = bool(payload.get("replace"))
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "data must be an exported preferences object")
+                with db.connect() as conn:
+                    result = import_preferences(conn, data, replace=replace)
+                    self.send_json({"ok": True, "imported": result, "model": model_snapshot(conn)})
+            else:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
+        except Exception as exc:
+            self.handle_error(exc)
+
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+        try:
+            return json.loads(raw or "{}")
+        except json.JSONDecodeError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid JSON") from exc
+
+    def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_static(self, name: str, body: bool = True) -> None:
+        path = (STATIC_DIR / name).resolve()
+        if not str(path).startswith(str(STATIC_DIR.resolve())) or not path.exists() or not path.is_file():
+            raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
+        data = path.read_bytes()
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
+
+    def handle_error(self, exc: Exception) -> None:
+        if isinstance(exc, ApiError):
+            self.send_json({"error": exc.message}, status=exc.status)
+            return
+        self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {format % args}")
+
+
+def get_settings() -> dict:
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+        return {
+            "has_cookie": bool(cookie),
+            "cookie_preview": preview_cookie(cookie),
+            "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
+            "refresh_interval_minutes": int(db.get_setting(conn, "refresh_interval_minutes", "30")),
+            "fetch_pages": int(db.get_setting(conn, "fetch_pages", "1")),
+            "detail_fetch_limit": int(db.get_setting(conn, "detail_fetch_limit", "8")),
+            "learned_query_limit": int(db.get_setting(conn, "learned_query_limit", "6")),
+            "recommend_candidate_limit": recommend_candidate_limit(conn),
+            "last_access_check": get_access_check(conn),
+            "bootstrap_tags": get_bootstrap_tags(conn),
+        }
+
+
+def get_status() -> dict:
+    with db.connect() as conn:
+        return {
+            "fetch": dict(FETCH_STATE),
+            "last_fetch": last_fetch_run(conn),
+            "fetch_history": fetch_runs(conn, limit=5),
+            "plan": plan_fetch_from_conn(conn),
+            "refresh": refresh_summary(conn),
+            "settings": {
+                "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
+                "refresh_interval_minutes": int(db.get_setting(conn, "refresh_interval_minutes", "30")),
+                "fetch_pages": int(db.get_setting(conn, "fetch_pages", "1")),
+                "detail_fetch_limit": int(db.get_setting(conn, "detail_fetch_limit", "8")),
+                "learned_query_limit": int(db.get_setting(conn, "learned_query_limit", "6")),
+                "recommend_candidate_limit": recommend_candidate_limit(conn),
+                "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
+                "last_access_check": get_access_check(conn),
+            },
+        }
+
+
+def save_settings(payload: dict[str, Any]) -> None:
+    with db.connect() as conn:
+        if payload.get("clear_cookie"):
+            db.set_setting(conn, "cookie_header", "")
+            db.set_setting(conn, "last_access_check", "")
+        if "cookie_header" in payload:
+            cookie_header = normalize_cookie_header(str(payload["cookie_header"]))
+            if cookie_header:
+                db.set_setting(conn, "cookie_header", cookie_header)
+        if "auto_refresh" in payload:
+            db.set_setting(conn, "auto_refresh", "1" if payload["auto_refresh"] else "0")
+        if "refresh_interval_minutes" in payload:
+            minutes = max(5, min(240, int(payload["refresh_interval_minutes"])))
+            db.set_setting(conn, "refresh_interval_minutes", str(minutes))
+        if "fetch_pages" in payload:
+            pages = max(1, min(5, int(payload["fetch_pages"])))
+            db.set_setting(conn, "fetch_pages", str(pages))
+        if "detail_fetch_limit" in payload:
+            limit = max(0, min(50, int(payload["detail_fetch_limit"])))
+            db.set_setting(conn, "detail_fetch_limit", str(limit))
+        if "learned_query_limit" in payload:
+            limit = max(0, min(20, int(payload["learned_query_limit"])))
+            db.set_setting(conn, "learned_query_limit", str(limit))
+        if "recommend_candidate_limit" in payload:
+            limit = max(100, min(10000, int(payload["recommend_candidate_limit"])))
+            db.set_setting(conn, "recommend_candidate_limit", str(limit))
+        if "bootstrap_tags_raw" in payload:
+            upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
+
+
+def check_saved_access() -> dict:
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+    if not cookie:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+    try:
+        result = check_access(cookie)
+    except Exception as exc:
+        result = {"ok": False, "gallery_count": 0, "message": str(exc)}
+    result["checked_at"] = current_timestamp()
+    with db.connect() as conn:
+        db.set_setting(conn, "last_access_check", json.dumps(result, ensure_ascii=True))
+    return result
+
+
+def plan_fetch(force_query: str | None = None) -> dict:
+    with db.connect() as conn:
+        return plan_fetch_from_conn(conn, force_query=force_query)
+
+
+def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
+    pages = int(db.get_setting(conn, "fetch_pages", "1"))
+    detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
+    learned_limit = int(db.get_setting(conn, "learned_query_limit", "6"))
+    tags = get_bootstrap_tags(conn)
+    learned_tags = learned_query_tags(conn, learned_limit)
+    entries = build_query_plan(tags, learned_tags, force_query=force_query)
+    return {
+        "queries": [entry["query"] for entry in entries],
+        "entries": entries,
+        "pages": pages,
+        "detail_fetch_limit": detail_limit,
+        "learned_query_limit": learned_limit,
+        "recommend_candidate_limit": recommend_candidate_limit(conn),
+        "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
+    }
+
+
+def refresh_summary(conn) -> dict:
+    enabled = db.get_setting(conn, "auto_refresh", "1") == "1"
+    interval = int(db.get_setting(conn, "refresh_interval_minutes", "30"))
+    has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
+    if not enabled:
+        message = "Auto refresh disabled"
+    elif not has_cookie:
+        message = "Auto refresh waiting for a saved cookie"
+    else:
+        message = f"Auto refresh every {interval} minutes"
+    return {
+        "enabled": enabled,
+        "has_cookie": has_cookie,
+        "ready": enabled and has_cookie,
+        "interval_minutes": interval,
+        "message": message,
+    }
+
+
+def get_access_check(conn) -> dict | None:
+    raw = db.get_setting(conn, "last_access_check", "")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def fetch_and_store(
+    force_query: str | None = None,
+    trigger: str = "manual",
+    include_rated: bool = False,
+    filter_text: str | None = None,
+) -> dict:
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch is already running")
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+        pages = int(db.get_setting(conn, "fetch_pages", "1"))
+        detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
+        learned_limit = int(db.get_setting(conn, "learned_query_limit", "6"))
+        tags = get_bootstrap_tags(conn)
+        learned_tags = learned_query_tags(conn, learned_limit)
+    if not cookie:
+        FETCH_LOCK.release()
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+
+    queries = build_queries(tags, learned_tags, force_query)
+    run_id: int | None = None
+    fetched = 0
+    stored = 0
+    enriched = 0
+    selected_for_detail = []
+    selected_urls: set[str] = set()
+    errors: list[str] = []
+    FETCH_STATE.update(
+        {
+            "running": True,
+            "trigger": trigger,
+            "queries": queries,
+            "started_at": current_timestamp(),
+            "fetched": 0,
+            "stored": 0,
+            "enriched": 0,
+            "errors": [],
+        }
+    )
+    try:
+        with db.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO fetch_runs(trigger, status, queries_json) VALUES (?, ?, ?)",
+                (trigger, "running", json.dumps(queries, ensure_ascii=True)),
+            )
+            run_id = int(cursor.lastrowid)
+
+        for query in queries:
+            try:
+                galleries = fetch_galleries(cookie, query=query, pages=pages)
+                fetched += len(galleries)
+                with db.connect() as conn:
+                    stored += store_galleries(conn, galleries)
+                    candidates = select_detail_candidates(conn, galleries, detail_limit - len(selected_for_detail))
+                for gallery in candidates:
+                    if gallery.url not in selected_urls:
+                        selected_for_detail.append(gallery)
+                        selected_urls.add(gallery.url)
+                FETCH_STATE.update({"fetched": fetched, "stored": stored})
+            except Exception as exc:
+                errors.append(str(exc))
+                FETCH_STATE["errors"] = list(errors)
+
+        for gallery in selected_for_detail:
+            try:
+                detailed = fetch_gallery_detail(cookie, gallery)
+                with db.connect() as conn:
+                    store_galleries(conn, [detailed], detail_fetched=True)
+                enriched += 1
+                FETCH_STATE.update({"enriched": enriched})
+            except Exception as exc:
+                errors.append(f"detail {gallery.url}: {exc}")
+                FETCH_STATE["errors"] = list(errors)
+
+        status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE fetch_runs
+                SET status = ?, fetched_count = ?, stored_count = ?, enriched_count = ?, errors_json = ?, finished_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, fetched, stored, enriched, json.dumps(errors, ensure_ascii=True), run_id),
+            )
+            last_fetch = last_fetch_run(conn)
+            page = recommend_page(
+                conn,
+                limit=40,
+                include_rated=include_rated,
+                filter_text=filter_text,
+                candidate_limit=recommend_candidate_limit(conn),
+            )
+        return {
+            "ok": not errors,
+            "status": status,
+            "queries": queries,
+            "fetched": fetched,
+            "stored": stored,
+            "enriched": enriched,
+            "errors": errors,
+            "last_fetch": last_fetch,
+            **page,
+        }
+    finally:
+        if run_id is not None:
+            with db.connect() as conn:
+                last = last_fetch_run(conn)
+        else:
+            last = None
+        FETCH_STATE.update({"running": False, "last_fetch": last})
+        FETCH_LOCK.release()
+
+
+def enrich_recommendations(include_rated: bool = False, filter_text: str | None = None, limit: Any = None) -> dict:
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+        detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
+    if not cookie:
+        FETCH_LOCK.release()
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+
+    requested_limit = detail_limit if limit is None else int(limit)
+    requested_limit = max(0, min(50, requested_limit))
+    run_id: int | None = None
+    enriched = 0
+    errors: list[str] = []
+    FETCH_STATE.update(
+        {
+            "running": True,
+            "trigger": "enrich",
+            "queries": ["recommendation details"],
+            "started_at": current_timestamp(),
+            "fetched": 0,
+            "stored": 0,
+            "enriched": 0,
+            "errors": [],
+        }
+    )
+    try:
+        with db.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO fetch_runs(trigger, status, queries_json) VALUES (?, ?, ?)",
+                ("enrich", "running", json.dumps(["recommendation details"], ensure_ascii=True)),
+            )
+            run_id = int(cursor.lastrowid)
+            candidates = select_recommendation_detail_candidates(
+                conn,
+                limit=requested_limit,
+                include_rated=include_rated,
+                filter_text=filter_text,
+            )
+
+        for gallery in candidates:
+            try:
+                detailed = fetch_gallery_detail(cookie, gallery)
+                with db.connect() as conn:
+                    store_galleries(conn, [detailed], detail_fetched=True)
+                enriched += 1
+                FETCH_STATE.update({"enriched": enriched})
+            except Exception as exc:
+                errors.append(f"detail {gallery.url}: {exc}")
+                FETCH_STATE["errors"] = list(errors)
+
+        status = "failed" if errors and enriched == 0 else "partial" if errors else "success"
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE fetch_runs
+                SET status = ?, enriched_count = ?, errors_json = ?, finished_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, enriched, json.dumps(errors, ensure_ascii=True), run_id),
+            )
+            last_fetch = last_fetch_run(conn)
+            page = recommend_page(
+                conn,
+                limit=40,
+                include_rated=include_rated,
+                filter_text=filter_text,
+                candidate_limit=recommend_candidate_limit(conn),
+            )
+        return {
+            "ok": not errors,
+            "status": status,
+            "enriched": enriched,
+            "errors": errors,
+            "last_fetch": last_fetch,
+            **page,
+        }
+    finally:
+        if run_id is not None:
+            with db.connect() as conn:
+                last = last_fetch_run(conn)
+        else:
+            last = None
+        FETCH_STATE.update({"running": False, "last_fetch": last})
+        FETCH_LOCK.release()
+
+
+def enrich_feedback_gallery(gallery_url: str) -> dict:
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+        row = conn.execute("SELECT * FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        if not row:
+            return {"status": "skipped", "reason": "gallery not found"}
+        item = db.row_to_dict(row)
+        if item.get("detail_fetched_at"):
+            return {"status": "skipped", "reason": "already enriched"}
+        if not cookie:
+            return {"status": "skipped", "reason": "no cookie"}
+        gallery = gallery_from_item(item)
+
+    try:
+        detailed = fetch_gallery_detail(cookie, gallery, delay=0)
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)}
+
+    with db.connect() as conn:
+        store_galleries(conn, [detailed], detail_fetched=True)
+        retrain_model(conn)
+    return {"status": "success", "gallery_url": gallery_url}
+
+
+def ensure_gallery_exists(conn, gallery_url: str) -> None:
+    exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+    if not exists:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery not found")
+
+
+def select_detail_candidates(conn, galleries, remaining_limit: int) -> list:
+    if remaining_limit <= 0:
+        return []
+    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    candidates = []
+    seen: set[str] = set()
+    for order, gallery in enumerate(galleries):
+        if gallery.url in seen:
+            continue
+        seen.add(gallery.url)
+        row = conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
+        if row and row["detail_fetched_at"]:
+            continue
+        score, _ = score_gallery(
+            {
+                "title": gallery.title,
+                "category": gallery.category,
+                "uploader": gallery.uploader,
+                "rating": gallery.rating,
+                "tags": gallery.tags,
+            },
+            bootstrap,
+            weights,
+        )
+        candidates.append((score, order, gallery))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [gallery for _, _, gallery in candidates[:remaining_limit]]
+
+
+def select_recommendation_detail_candidates(
+    conn,
+    limit: int,
+    include_rated: bool = False,
+    filter_text: str | None = None,
+) -> list[Gallery]:
+    if limit <= 0:
+        return []
+    page = recommend_page(
+        conn,
+        limit=100,
+        include_rated=include_rated,
+        filter_text=filter_text,
+        candidate_limit=recommend_candidate_limit(conn),
+    )
+    candidates: list[Gallery] = []
+    for item in page["items"]:
+        if item.get("detail_fetched_at"):
+            continue
+        candidates.append(gallery_from_item(item))
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def gallery_from_item(item: dict) -> Gallery:
+    return Gallery(
+        url=item["url"],
+        gid=item.get("gid"),
+        token=item.get("token"),
+        title=item.get("title") or "Gallery",
+        category=item.get("category"),
+        uploader=item.get("uploader"),
+        posted_at=item.get("posted_at"),
+        thumb_url=item.get("thumb_url"),
+        rating=item.get("rating"),
+        tags=list(item.get("tags") or []),
+        source_query=item.get("source_query"),
+    )
+
+
+def build_queries(
+    tags: list[dict],
+    learned_tags: list[str] | None = None,
+    force_query: str | None = None,
+) -> list[str | None]:
+    return [entry["query"] for entry in build_query_plan(tags, learned_tags, force_query=force_query)]
+
+
+def build_query_plan(
+    tags: list[dict],
+    learned_tags: list[str] | None = None,
+    force_query: str | None = None,
+) -> list[dict]:
+    if force_query:
+        return [{"query": force_query.strip(), "source": "manual", "label": force_query.strip()}] if force_query.strip() else []
+    candidates: list[dict] = [{"query": None, "source": "recent", "label": "Recent galleries"}]
+    bootstrap_tags = [
+        item
+        for item in tags
+        if float(item["weight"]) > 0 and is_remote_search_preference(item["tag"])
+    ]
+    bootstrap_tags.sort(key=lambda item: (-float(item["weight"]), str(item["tag"])))
+    for item in bootstrap_tags[:6]:
+        candidates.append(
+            {
+                "query": format_generated_query(item["tag"]),
+                "source": "bootstrap",
+                "label": item["tag"],
+                "weight": item["weight"],
+            }
+        )
+    for tag in (learned_tags or [])[:20]:
+        candidates.append({"query": format_generated_query(tag), "source": "learned", "label": tag})
+    entries: list[dict] = []
+    seen: set[str | None] = set()
+    for candidate in candidates:
+        query = candidate["query"]
+        normalized = query.strip() if isinstance(query, str) else query
+        if normalized == "":
+            continue
+        if normalized in seen:
+            continue
+        candidate["query"] = normalized
+        entries.append(candidate)
+        seen.add(normalized)
+    return entries
+
+
+def is_remote_search_preference(tag: str) -> bool:
+    value = str(tag).strip().lower()
+    if not value:
+        return False
+    namespace = value.split(":", 1)[0] if ":" in value else ""
+    return namespace not in {"category", "uploader"}
+
+
+def format_generated_query(tag: str) -> str:
+    value = str(tag).strip()
+    if not value or '"' in value:
+        return value
+    if ":" in value:
+        namespace, tag_value = value.split(":", 1)
+        tag_value = tag_value.strip()
+        if " " in tag_value:
+            return f'{namespace.strip()}:"{tag_value}"'
+        return value
+    if " " in value:
+        return f'"{value}"'
+    return value
+
+
+def parse_bool(value: str | int | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def recommend_candidate_limit(conn) -> int:
+    return max(100, min(10000, int(db.get_setting(conn, "recommend_candidate_limit", "2000"))))
+
+
+def recommendation_payload(
+    conn,
+    limit: int = 40,
+    include_rated: bool = False,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    return {
+        **recommend_page(
+            conn,
+            limit=limit,
+            include_rated=include_rated,
+            offset=offset,
+            filter_text=filter_text,
+            candidate_limit=recommend_candidate_limit(conn),
+        ),
+        "last_fetch": last_fetch_run(conn),
+    }
+
+
+def feedback_history_payload(conn, gallery_url: str, limit: int = 25) -> dict:
+    row = conn.execute(
+        """
+        SELECT url, title, category, uploader, thumb_url
+        FROM galleries
+        WHERE url = ?
+        """,
+        (gallery_url,),
+    ).fetchone()
+    if not row:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery not found")
+    items = feedback_history(conn, gallery_url, limit=limit)
+    return {
+        "gallery": dict(row),
+        "items": items,
+        "latest": items[0] if items else None,
+    }
+
+
+def preview_cookie(cookie: str) -> str:
+    if not cookie:
+        return ""
+    names = []
+    for part in cookie.split(";"):
+        name = part.strip().split("=", 1)[0]
+        if name:
+            names.append(name)
+    return ", ".join(names[:8])
+
+
+def current_timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def last_fetch_run(conn) -> dict | None:
+    runs = fetch_runs(conn, limit=1)
+    return runs[0] if runs else None
+
+
+def fetch_runs(conn, limit: int = 10) -> list[dict]:
+    limit = max(1, min(100, int(limit)))
+    rows = conn.execute(
+        """
+        SELECT id, trigger, status, queries_json, fetched_count, stored_count, enriched_count, errors_json, started_at, finished_at
+        FROM fetch_runs
+        ORDER BY started_at DESC, id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    history = []
+    for row in rows:
+        data = dict(row)
+        data["queries"] = safe_json_list(data.pop("queries_json"))
+        data["errors"] = safe_json_list(data.pop("errors_json"))
+        history.append(data)
+    return history
+
+
+def safe_json_list(raw: str | None) -> list:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def background_refresh(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            with db.connect() as conn:
+                enabled = db.get_setting(conn, "auto_refresh", "1") == "1"
+                interval = int(db.get_setting(conn, "refresh_interval_minutes", "30"))
+                has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
+            if enabled and has_cookie:
+                fetch_and_store(trigger="background")
+            stop.wait(max(300, interval * 60))
+        except Exception as exc:
+            print(f"background refresh failed: {exc}")
+            stop.wait(300)
+
+
+def main() -> None:
+    db.init_db()
+    with db.connect() as conn:
+        retrain_model(conn)
+    stop = threading.Event()
+    worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
+    worker.start()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Serving ExHentai recommender at http://{HOST}:{PORT}")
+    print(f"SQLite data: {db.DB_PATH}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

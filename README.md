@@ -1,93 +1,105 @@
 # exhentai-self-recommend
 
+A small local recommendation engine for ExHentai galleries.
 
+It stores your login cookies locally, fetches recent/search result pages, ranks galleries from your bootstrap tags and feedback, and lets you vote with thumbs up/down so the model can adapt over time.
 
-## Getting started
+## Features
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Local web UI for recommendations and voting.
+- Cookie-based ExHentai access.
+- Cookie input accepts either a normal `Cookie:` header or copied browser cookie-table rows.
+- Stored cookies can be cleared from the settings panel without deleting preferences.
+- Bootstrap preferences with positive/negative weights across tags, title text, category, and uploader metadata.
+- SQLite storage for galleries, settings, votes, and learned feature weights.
+- Online learning from thumbs up/down or 1-5 scores using title tokens, categories, uploaders, and parsed tags, with namespace-aware weighting for stronger identity tags.
+- Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
+- Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
+- Gallery and tag links from either `exhentai.org` or `e-hentai.org` are accepted, including relative gallery paths; stored gallery URLs are canonicalized to `exhentai.org`.
+- On-demand enrichment for the current top recommendation queue without fetching new result pages.
+- Learned query expansion: positive feedback teaches the fetcher which tags to search next.
+- Deterministic retraining from feedback history using the latest vote/score per gallery.
+- Preference export/import for bootstrap tags and feedback. Cookies are not exported.
+- Paginated recommendation browsing with `Load More` once the local gallery pool grows.
+- Local filtering by stored gallery title, tag, category, or uploader.
+- Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
+- Fetch-plan preview showing recent, bootstrap, learned, or manual queries before a refresh.
+- Fetch status history so you can see recent refreshes, queries, counts, and errors.
+- Background refresh while the server is running, with the browser queue reloading after completed refreshes.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Quick start
 
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```bash
+python3 -m exh_rec.app
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/xmxjqsanaewin-group/exhentai-self-rec.git
-git branch -M main
-git push -uf origin main
+
+Open <http://127.0.0.1:8787>.
+
+In the settings panel:
+
+- Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows; the app stores only the cookie name/value pairs.
+- Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
+- Use `Clear Cookie` if you want to remove the stored login cookie while keeping bootstrap tags, feedback, and fetched galleries.
+- Add bootstrap preferences, one per line or comma-separated. Tags like `artist:name`, metadata like `category:manga` or `uploader:name`, and plain title terms are supported. Underscore tag input such as `artist:some_name` is normalized to match parsed ExHentai tags. Use `-tag` or `tag:-2` for negative preferences. Numeric namespaced values like `parody:1984` are preserved; add an extra suffix such as `parody:1984:2` to weight them.
+- Set `Details` to the maximum number of fetched galleries that should be opened for full tag metadata per refresh. The app spends this budget on newly fetched galleries that already look promising under your bootstrap and learned model. `0` disables detail-page enrichment.
+- Set `Learned` to the maximum number of positive learned tags that should be added to each refresh query plan. `0` disables learned query expansion.
+- Set `Pool` to the number of recent local galleries that should be scored before the recommendation page is sliced. Higher values let older fetched galleries compete with newer ones.
+- Click `Save`, then `Fetch`.
+
+The refresh panel shows the current fetch plan. Typing an optional one-off search query and leaving the field updates the plan preview to that manual query.
+
+Generated bootstrap and learned tag queries quote multi-word tag values for ExHentai search reliability, while keeping the plain tag label visible in the plan.
+
+Positive bootstrap preferences are added to the fetch plan by descending weight, with at most six bootstrap-driven searches per refresh.
+
+The refresh panel also shows whether auto refresh is disabled, waiting for a saved cookie, or ready to run at the configured interval.
+
+Local metadata preferences such as `category:manga` and `uploader:name` affect ranking and detail selection, but are not used as generated remote search queries.
+
+The refresh panel also shows recent fetch history in `status:fetched/enriched` form so background refresh behavior is visible at a glance.
+
+When a background refresh finishes, the browser reloads the first recommendation page automatically so newly fetched galleries enter the queue without a manual page refresh.
+
+Recommendation page responses include the latest fetch or enrichment summary, so the browser can keep the queue and refresh panel aligned.
+
+Recommendation cards show the model score, uploader metadata when available, and the current feedback signal you have given that gallery. Thumbs are strong positive/negative signals. A 1-5 score maps to a softer signal: 1 is negative, 3 is neutral, and 5 is positive. `Skip` records a neutral score of `3`.
+
+The ranked queue applies a small diversity penalty to repeated artists, groups, parodies, characters, and uploaders so one learned preference does not completely crowd out nearby alternatives.
+
+When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background of the same action and retrains from the fuller tag set. If no cookie is saved or the detail request fails, the feedback still records normally.
+
+Rated galleries are hidden from the main queue by default after you vote, score, or skip them. A neutral score of `3` also hides the gallery but does not add positive or negative learned weight. Enable `Rated` in the toolbar to review already-rated galleries.
+
+Rated cards include `History` so you can inspect the exact vote/score events currently feeding the learned model.
+
+Use `Load More` below the recommendation grid to page through additional scored candidates from the local gallery pool.
+
+Use the local filter field to narrow recommendations already stored in SQLite by title, tag, category, or uploader. This does not fetch a new ExHentai search; use the one-off search field and `Fetch Query` for that.
+
+Use `Enrich` to open detail pages for the best currently recommended galleries that still have only list metadata. This uses the same `Details` limit and saved cookie, but does not fetch new result pages.
+
+Use `Clear` on a rated card to remove that gallery's feedback history, retrain the model, and put it back into the unrated queue.
+
+Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.
+
+Learned feature weights are intentionally simple and inspectable. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
+
+Use `Export` and `Import` in the backup panel to move bootstrap tags and feedback history between local installs. `Replace data` clears existing local bootstrap tags and feedback before import. Exports intentionally do not include your ExHentai cookie.
+
+Data is stored in `data/recommender.sqlite3` by default. Override with:
+
+```bash
+EXH_REC_DATA_DIR=/path/to/private/data python3 -m exh_rec.app
 ```
 
-## Integrate with your tools
+## Safety notes
 
-* [Set up project integrations](https://gitlab.com/xmxjqsanaewin-group/exhentai-self-rec/-/settings/integrations)
+This is a local personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.
 
-## Collaborate with your team
+The scraper intentionally fetches normal result pages and does not attempt to bypass access controls. You are responsible for using the site within its terms and with your own account.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Tests
 
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+python3 -m unittest discover -s tests
+```
