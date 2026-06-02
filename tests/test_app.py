@@ -1,5 +1,7 @@
 import unittest
 import sqlite3
+import threading
+import time
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +9,8 @@ from unittest.mock import patch
 from exh_rec import db
 from exh_rec.app import (
     ApiError,
+    REFRESH_WAKE,
+    background_refresh,
     build_queries,
     build_query_plan,
     enrich_feedback_gallery,
@@ -427,6 +431,33 @@ class AppTest(unittest.TestCase):
                 save_settings({"recommend_candidate_limit": 50000})
                 with db.connect() as conn:
                     self.assertEqual(recommend_candidate_limit(conn), 10000)
+
+    def test_save_settings_wakes_background_refresh_after_cookie_added(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                stop = threading.Event()
+                called = threading.Event()
+                REFRESH_WAKE.clear()
+
+                def fake_fetch(*, trigger="manual", **_kwargs):
+                    if trigger == "background":
+                        called.set()
+                        stop.set()
+                    return {"ok": True}
+
+                with patch("exh_rec.app.fetch_and_store", side_effect=fake_fetch):
+                    worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
+                    worker.start()
+                    time.sleep(0.05)
+                    save_settings({"cookie_header": "ipb_member_id=123; ipb_pass_hash=abc", "auto_refresh": True})
+
+                    self.assertTrue(called.wait(2))
+                    stop.set()
+                    REFRESH_WAKE.set()
+                    worker.join(2)
+                    REFRESH_WAKE.clear()
 
 
 if __name__ == "__main__":

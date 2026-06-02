@@ -36,6 +36,7 @@ PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
+REFRESH_WAKE = threading.Event()
 
 
 class ApiError(Exception):
@@ -293,33 +294,48 @@ def get_status() -> dict:
 
 
 def save_settings(payload: dict[str, Any]) -> None:
+    refresh_relevant_change = False
     with db.connect() as conn:
         if payload.get("clear_cookie"):
             db.set_setting(conn, "cookie_header", "")
             db.set_setting(conn, "last_access_check", "")
+            refresh_relevant_change = True
         if "cookie_header" in payload:
             cookie_header = normalize_cookie_header(str(payload["cookie_header"]))
             if cookie_header:
                 db.set_setting(conn, "cookie_header", cookie_header)
+                refresh_relevant_change = True
         if "auto_refresh" in payload:
             db.set_setting(conn, "auto_refresh", "1" if payload["auto_refresh"] else "0")
+            refresh_relevant_change = True
         if "refresh_interval_minutes" in payload:
             minutes = max(5, min(240, int(payload["refresh_interval_minutes"])))
             db.set_setting(conn, "refresh_interval_minutes", str(minutes))
+            refresh_relevant_change = True
         if "fetch_pages" in payload:
             pages = max(1, min(5, int(payload["fetch_pages"])))
             db.set_setting(conn, "fetch_pages", str(pages))
+            refresh_relevant_change = True
         if "detail_fetch_limit" in payload:
             limit = max(0, min(50, int(payload["detail_fetch_limit"])))
             db.set_setting(conn, "detail_fetch_limit", str(limit))
+            refresh_relevant_change = True
         if "learned_query_limit" in payload:
             limit = max(0, min(20, int(payload["learned_query_limit"])))
             db.set_setting(conn, "learned_query_limit", str(limit))
+            refresh_relevant_change = True
         if "recommend_candidate_limit" in payload:
             limit = max(100, min(10000, int(payload["recommend_candidate_limit"])))
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
+            refresh_relevant_change = True
+    if refresh_relevant_change:
+        wake_background_refresh()
+
+
+def wake_background_refresh() -> None:
+    REFRESH_WAKE.set()
 
 
 def check_saved_access() -> dict:
@@ -882,10 +898,21 @@ def background_refresh(stop: threading.Event) -> None:
                 has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
             if enabled and has_cookie:
                 fetch_and_store(trigger="background")
-            stop.wait(max(300, interval * 60))
+            wait_for_refresh_wake(stop, max(300, interval * 60))
         except Exception as exc:
             print(f"background refresh failed: {exc}")
-            stop.wait(300)
+            wait_for_refresh_wake(stop, 300)
+
+
+def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
+    deadline = time.monotonic() + max(0, timeout)
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if REFRESH_WAKE.wait(min(remaining, 1.0)):
+            REFRESH_WAKE.clear()
+            return
 
 
 def main() -> None:
