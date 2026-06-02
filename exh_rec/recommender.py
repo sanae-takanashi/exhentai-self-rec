@@ -574,9 +574,10 @@ def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str,
     score = 0.0
     reasons: list[str] = []
     searchable = bootstrap_search_text(gallery)
+    exact_bootstrap_values = bootstrap_exact_values(gallery)
 
     for tag, weight in bootstrap.items():
-        if tag in searchable:
+        if bootstrap_matches(tag, searchable, exact_bootstrap_values):
             score += weight
             reasons.append(f"bootstrap {tag} {weight:+g}")
 
@@ -598,6 +599,28 @@ def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str,
     if not reasons:
         reasons.append("recent")
     return score, reasons
+
+
+def bootstrap_matches(tag: str, searchable: str, exact_values: set[str]) -> bool:
+    tag = str(tag).strip().lower()
+    if ":" in tag and tag.split(":", 1)[0] in BOOTSTRAP_NAMESPACES:
+        return tag in exact_values
+    return tag in searchable
+
+
+def bootstrap_exact_values(gallery: dict) -> set[str]:
+    values: set[str] = set()
+    category = str(gallery.get("category") or "").strip().lower()
+    if category:
+        values.add(f"category:{category}")
+    uploader = str(gallery.get("uploader") or "").strip().lower()
+    if uploader:
+        values.add(f"uploader:{uploader}")
+    for tag in gallery.get("tags") or []:
+        tag = str(tag).strip().lower()
+        if tag:
+            values.add(tag)
+    return values
 
 
 def bootstrap_search_text(gallery: dict) -> str:

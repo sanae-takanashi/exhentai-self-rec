@@ -104,6 +104,38 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(items[0]["url"], uploader_url)
         self.assertEqual(items[1]["url"], category_url)
 
+    def test_namespaced_bootstrap_requires_exact_metadata_match(self):
+        exact_url = "https://exhentai.org/g/22/a/"
+        partial_url = "https://exhentai.org/g/23/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=partial_url, gid="23", token="b", title="Partial", tags=["artist:anna"]),
+                Gallery(url=exact_url, gid="22", token="a", title="Exact", tags=["artist:ann"]),
+            ],
+        )
+        upsert_bootstrap_tags(self.conn, [("artist:ann", 2.0)])
+
+        items = recommend(self.conn)
+        reasons_by_url = {item["url"]: item["reasons"] for item in items}
+
+        self.assertEqual(items[0]["url"], exact_url)
+        self.assertIn("bootstrap artist:ann +2", reasons_by_url[exact_url])
+        self.assertNotIn("bootstrap artist:ann +2", reasons_by_url[partial_url])
+
+    def test_plain_bootstrap_terms_still_match_title_text(self):
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url="https://exhentai.org/g/24/a/", gid="24", token="a", title="Plain Term Match"),
+            ],
+        )
+        upsert_bootstrap_tags(self.conn, [("term", 1.0)])
+
+        item = recommend(self.conn)[0]
+
+        self.assertIn("bootstrap term +1", item["reasons"])
+
     def test_bootstrap_search_text_includes_metadata_forms(self):
         text = bootstrap_search_text(
             {
