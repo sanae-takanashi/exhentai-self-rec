@@ -194,6 +194,24 @@ class RecommenderTest(unittest.TestCase):
         row = self.conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         self.assertIsNotNone(row["detail_fetched_at"])
 
+    def test_store_galleries_counts_only_new_urls(self):
+        gallery_url = "https://exhentai.org/g/4b/d/"
+        first_count = store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4b", token="d", title="First Title")],
+        )
+        second_count = store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4b", token="d", title="Updated Title", tags=["artist:updated"])],
+        )
+
+        row = self.conn.execute("SELECT title, tags_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(row["title"], "Updated Title")
+        self.assertIn("artist:updated", row["tags_json"])
+
     def test_positive_feedback_creates_learned_query_tags(self):
         gallery_url = "https://exhentai.org/g/5/e/"
         store_galleries(

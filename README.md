@@ -64,6 +64,8 @@ Saving cookies, bootstrap tags, or refresh settings wakes the background refresh
 
 The refresh panel also shows recent fetch history in `status:fetched/enriched` form so background refresh behavior is visible at a glance.
 
+Fetch history counts `fetched` as galleries seen on fetched pages and `stored` as newly discovered gallery URLs, so repeated refreshes make duplicate-heavy runs obvious.
+
 When a background refresh finishes, the browser reloads the first recommendation page automatically so newly fetched galleries enter the queue without a manual page refresh.
 
 Recommendation page responses include the latest fetch or enrichment summary, so the browser can keep the queue and refresh panel aligned.

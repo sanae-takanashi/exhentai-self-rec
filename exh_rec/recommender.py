@@ -122,6 +122,7 @@ def learned_query_tags(conn: sqlite3.Connection, limit: int = 6) -> list[str]:
 def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_fetched: bool = False) -> int:
     count = 0
     for gallery in galleries:
+        existing = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
         conn.execute(
             """
             INSERT INTO galleries(
@@ -161,7 +162,8 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
         )
         if detail_fetched:
             conn.execute("UPDATE galleries SET detail_fetched_at = CURRENT_TIMESTAMP WHERE url = ?", (gallery.url,))
-        count += 1
+        if not existing:
+            count += 1
     return count
 
 
