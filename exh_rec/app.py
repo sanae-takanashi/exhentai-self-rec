@@ -413,6 +413,7 @@ def fetch_and_store(
     fetched = 0
     stored = 0
     enriched = 0
+    model_retrained = False
     selected_for_detail = []
     selected_urls: set[str] = set()
     errors: list[str] = []
@@ -465,6 +466,9 @@ def fetch_and_store(
 
         status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
+            if enriched:
+                retrain_model(conn)
+                model_retrained = True
             conn.execute(
                 """
                 UPDATE fetch_runs
@@ -488,6 +492,7 @@ def fetch_and_store(
             "fetched": fetched,
             "stored": stored,
             "enriched": enriched,
+            "model_retrained": model_retrained,
             "errors": errors,
             "last_fetch": last_fetch,
             **page,
@@ -516,6 +521,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
     requested_limit = max(0, min(50, requested_limit))
     run_id: int | None = None
     enriched = 0
+    model_retrained = False
     errors: list[str] = []
     FETCH_STATE.update(
         {
@@ -556,6 +562,9 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
 
         status = "failed" if errors and enriched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
+            if enriched:
+                retrain_model(conn)
+                model_retrained = True
             conn.execute(
                 """
                 UPDATE fetch_runs
@@ -576,6 +585,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             "ok": not errors,
             "status": status,
             "enriched": enriched,
+            "model_retrained": model_retrained,
             "errors": errors,
             "last_fetch": last_fetch,
             **page,

@@ -10,7 +10,9 @@ from exh_rec.app import (
     build_queries,
     build_query_plan,
     enrich_feedback_gallery,
+    enrich_recommendations,
     ensure_gallery_exists,
+    fetch_and_store,
     feedback_history_payload,
     fetch_runs,
     format_generated_query,
@@ -336,6 +338,63 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
                 self.assertIsNotNone(row["detail_fetched_at"])
                 self.assertIn("artist:detailfav", learned)
+
+    def test_fetch_and_store_retrains_after_detail_enrichment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/33/a/"
+                gallery = Gallery(url=gallery_url, gid="33", token="a", title="Fetch Detail")
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="33",
+                    token="a",
+                    title="Fetch Detail",
+                    tags=["artist:fetchdetail"],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [gallery])
+                    record_feedback(conn, gallery_url, vote=1)
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[gallery]), patch(
+                    "exh_rec.app.fetch_gallery_detail", return_value=detailed
+                ):
+                    result = fetch_and_store()
+
+                with db.connect() as conn:
+                    learned = learned_query_tags(conn, limit=5)
+
+                self.assertTrue(result["model_retrained"])
+                self.assertIn("artist:fetchdetail", learned)
+
+    def test_enrich_recommendations_retrains_after_detail_enrichment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/34/a/"
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="34",
+                    token="a",
+                    title="Enrich Detail",
+                    tags=["artist:enrichdetail"],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="34", token="a", title="Enrich Detail")])
+                    record_feedback(conn, gallery_url, vote=1)
+
+                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed):
+                    result = enrich_recommendations(include_rated=True, limit=1)
+
+                with db.connect() as conn:
+                    learned = learned_query_tags(conn, limit=5)
+
+                self.assertTrue(result["model_retrained"])
+                self.assertIn("artist:enrichdetail", learned)
 
     def test_save_settings_clear_cookie_removes_access_check(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -14,6 +14,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - SQLite storage for galleries, settings, votes, and learned feature weights.
 - Online learning from thumbs up/down or 1-5 scores using title tokens, categories, uploaders, and parsed tags, with namespace-aware weighting for stronger identity tags.
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
+- Fetch and enrichment runs retrain the model whenever they add detail metadata, so feedback on an already-rated gallery can immediately learn from the fuller tag set.
 - Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
 - Gallery and tag links from either `exhentai.org` or `e-hentai.org` are accepted, including relative gallery paths; stored gallery URLs are canonicalized to `exhentai.org`.
 - On-demand enrichment for the current top recommendation queue without fetching new result pages.
@@ -78,6 +79,8 @@ Use `Load More` below the recommendation grid to page through additional scored 
 Use the local filter field to narrow recommendations already stored in SQLite by title, tag, category, or uploader. This does not fetch a new ExHentai search; use the one-off search field and `Fetch Query` for that.
 
 Use `Enrich` to open detail pages for the best currently recommended galleries that still have only list metadata. This uses the same `Details` limit and saved cookie, but does not fetch new result pages.
+
+Fetch and Enrich retrain the learned model after successfully saving new detail pages, so any existing feedback on those galleries starts using the fuller metadata right away.
 
 Use `Clear` on a rated card to remove that gallery's feedback history, retrain the model, and put it back into the unrated queue.
 
