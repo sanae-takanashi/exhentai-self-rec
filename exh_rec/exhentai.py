@@ -94,6 +94,8 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
         if "=" in line.split(None, 1)[0]:
             return []
         parts = line.split("\t")
@@ -101,12 +103,31 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
             parts = line.split()
         if len(parts) < 2:
             return []
-        name = parts[0].strip()
-        value = parts[1].strip()
+        if len(parts) >= 7 and looks_like_netscape_cookie_row(parts):
+            name = parts[5].strip()
+            value = parts[6].strip()
+        else:
+            name = parts[0].strip()
+            value = parts[1].strip()
         if not is_cookie_name(name) or not value:
             return []
         pairs.append((name, value))
     return pairs if pairs else []
+
+
+def looks_like_netscape_cookie_row(parts: list[str]) -> bool:
+    domain = parts[0].removeprefix("#HttpOnly_").strip()
+    include_subdomains = parts[1].strip().upper()
+    path = parts[2].strip()
+    secure = parts[3].strip().upper()
+    expires = parts[4].strip()
+    return (
+        ("." in domain or domain in {"localhost", "127.0.0.1"})
+        and include_subdomains in {"TRUE", "FALSE"}
+        and path.startswith("/")
+        and secure in {"TRUE", "FALSE"}
+        and expires.isdigit()
+    )
 
 
 def is_cookie_name(value: str) -> bool:

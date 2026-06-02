@@ -154,6 +154,20 @@ class ParserTest(unittest.TestCase):
             "ipb_member_id=123; ipb_pass_hash=abc123; sk=secret-session",
         )
 
+    def test_normalize_cookie_header_accepts_netscape_cookie_file(self):
+        exported = "\n".join(
+            [
+                "# Netscape HTTP Cookie File",
+                ".e-hentai.org\tTRUE\t/\tTRUE\t1796711646\tipb_member_id\t123",
+                ".e-hentai.org\tTRUE\t/\tTRUE\t1796711646\tipb_pass_hash\tabc123",
+                "#HttpOnly_.exhentai.org\tTRUE\t/\tTRUE\t1796711648\tsk\tsecret-session",
+            ]
+        )
+        self.assertEqual(
+            normalize_cookie_header(exported),
+            "ipb_member_id=123; ipb_pass_hash=abc123; sk=secret-session",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
