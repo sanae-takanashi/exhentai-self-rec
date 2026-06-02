@@ -214,6 +214,27 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["feedback_events"], 2)
         self.assertEqual(snapshot["counts"]["rated_galleries"], 1)
 
+    def test_model_snapshot_separates_positive_and_negative_weights(self):
+        liked_url = "https://exhentai.org/g/6p/f/"
+        disliked_url = "https://exhentai.org/g/6n/f/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=liked_url, gid="6p", token="f", title="Liked Model", tags=["artist:liked"]),
+                Gallery(url=disliked_url, gid="6n", token="f", title="Disliked Model", tags=["artist:disliked"]),
+            ],
+        )
+
+        record_feedback(self.conn, liked_url, vote=1)
+        record_feedback(self.conn, disliked_url, vote=-1)
+        snapshot = model_snapshot(self.conn)
+
+        positive_features = {item["feature"] for item in snapshot["positive_weights"]}
+        negative_features = {item["feature"] for item in snapshot["negative_weights"]}
+        self.assertIn("tag:artist:liked", positive_features)
+        self.assertIn("tag:artist:disliked", negative_features)
+        self.assertNotIn("tag:artist:disliked", positive_features)
+
     def test_recommend_hides_rated_by_default(self):
         rated_url = "https://exhentai.org/g/7/a/"
         unrated_url = "https://exhentai.org/g/8/b/"

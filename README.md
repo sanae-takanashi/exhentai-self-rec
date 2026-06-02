@@ -82,7 +82,7 @@ Use `Clear` on a rated card to remove that gallery's feedback history, retrain t
 
 Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.
 
-Learned feature weights are intentionally simple and inspectable. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
+Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
 
 Use `Export` and `Import` in the backup panel to move bootstrap tags and feedback history between local installs. `Replace data` clears existing local bootstrap tags and feedback before import. Exports intentionally do not include your ExHentai cookie.
 

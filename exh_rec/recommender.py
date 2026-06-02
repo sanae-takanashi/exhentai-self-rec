@@ -627,6 +627,8 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
                 """
             )
         ],
+        "positive_weights": model_weight_rows(conn, "weight > 0", "weight DESC"),
+        "negative_weights": model_weight_rows(conn, "weight < 0", "weight ASC"),
         "counts": {
             "galleries": conn.execute("SELECT COUNT(*) AS c FROM galleries").fetchone()["c"],
             "feedback_events": conn.execute("SELECT COUNT(*) AS c FROM feedback").fetchone()["c"],
@@ -634,6 +636,22 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "model_features": conn.execute("SELECT COUNT(*) AS c FROM feature_weights").fetchone()["c"],
         },
     }
+
+
+def model_weight_rows(conn: sqlite3.Connection, where_clause: str, order_clause: str, limit: int = 12) -> list[dict]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT feature, weight, positive_count, negative_count
+            FROM feature_weights
+            WHERE {where_clause}
+            ORDER BY {order_clause}, feature ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    ]
 
 
 def as_gallery_dict(gallery: Gallery) -> dict:
