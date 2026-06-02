@@ -605,7 +605,14 @@ def bootstrap_matches(tag: str, searchable: str, exact_values: set[str]) -> bool
     tag = str(tag).strip().lower()
     if ":" in tag and tag.split(":", 1)[0] in BOOTSTRAP_NAMESPACES:
         return tag in exact_values
-    return tag in searchable
+    return plain_bootstrap_matches(tag, searchable)
+
+
+def plain_bootstrap_matches(term: str, searchable: str) -> bool:
+    if not term:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+    return re.search(pattern, searchable) is not None
 
 
 def bootstrap_exact_values(gallery: dict) -> set[str]:

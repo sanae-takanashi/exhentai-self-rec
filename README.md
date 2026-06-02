@@ -41,7 +41,7 @@ In the settings panel:
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
 - Use `Clear Cookie` if you want to remove the stored login cookie while keeping bootstrap tags, feedback, and fetched galleries.
 - Add bootstrap preferences, one per line or comma-separated. Tags like `artist:name`, metadata like `category:manga` or `uploader:name`, and plain title terms are supported. Underscore tag input such as `artist:some_name` is normalized to match parsed ExHentai tags. Use `-tag` or `tag:-2` for negative preferences. Numeric namespaced values like `parody:1984` are preserved; add an extra suffix such as `parody:1984:2` to weight them.
-- Namespaced bootstrap preferences such as `artist:name` and `female:tag` match exact parsed tags or metadata. Plain preferences without a namespace still match title/tag text broadly.
+- Namespaced bootstrap preferences such as `artist:name` and `female:tag` match exact parsed tags or metadata. Plain preferences without a namespace match title/tag text on term boundaries.
 - Set `Details` to the maximum number of fetched galleries that should be opened for full tag metadata per refresh. The app spends this budget on newly fetched galleries that already look promising under your bootstrap and learned model. `0` disables detail-page enrichment.
 - Set `Learned` to the maximum number of positive learned tags that should be added to each refresh query plan. `0` disables learned query expansion.
 - Set `Pool` to the number of recent local galleries that should be scored before the recommendation page is sliced. Higher values let older fetched galleries compete with newer ones.

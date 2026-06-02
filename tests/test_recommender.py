@@ -136,6 +136,25 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertIn("bootstrap term +1", item["reasons"])
 
+    def test_plain_bootstrap_terms_do_not_match_inside_words(self):
+        exact_url = "https://exhentai.org/g/25/a/"
+        partial_url = "https://exhentai.org/g/26/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=partial_url, gid="26", token="b", title="Banana Archive"),
+                Gallery(url=exact_url, gid="25", token="a", title="Ann Archive"),
+            ],
+        )
+        upsert_bootstrap_tags(self.conn, [("ann", 2.0)])
+
+        items = recommend(self.conn)
+        reasons_by_url = {item["url"]: item["reasons"] for item in items}
+
+        self.assertEqual(items[0]["url"], exact_url)
+        self.assertIn("bootstrap ann +2", reasons_by_url[exact_url])
+        self.assertNotIn("bootstrap ann +2", reasons_by_url[partial_url])
+
     def test_bootstrap_search_text_includes_metadata_forms(self):
         text = bootstrap_search_text(
             {
