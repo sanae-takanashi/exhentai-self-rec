@@ -16,6 +16,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
 - Fetch and enrichment runs retrain the model whenever they add detail metadata, so feedback on an already-rated gallery can immediately learn from the fuller tag set.
 - Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
+- List/detail parsing reads thumbnails from normal image tags and inline CSS background URLs.
 - Gallery and tag links from either `exhentai.org` or `e-hentai.org` are accepted, including relative gallery paths; stored gallery URLs are canonicalized to `exhentai.org`.
 - On-demand enrichment for the current top recommendation queue without fetching new result pages.
 - Learned query expansion: positive feedback teaches the fetcher which tags to search next.

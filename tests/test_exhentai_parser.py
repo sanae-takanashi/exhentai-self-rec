@@ -65,6 +65,23 @@ class ParserTest(unittest.TestCase):
             "https://exhentai.org/g/54323/abc123def2/",
         ])
 
+    def test_parse_gallery_list_reads_css_background_thumbnail(self):
+        html = """
+        <tr class="gtr0">
+          <td>
+            <a href="https://exhentai.org/g/55555/abc555/">
+              <div style="background-image: url('https://t.example/css-thumb.jpg')"></div>
+            </a>
+          </td>
+          <td><a class="glink" href="https://exhentai.org/g/55555/abc555/">CSS Thumb Title</a></td>
+        </tr>
+        """
+
+        galleries = parse_gallery_list(html)
+
+        self.assertEqual(len(galleries), 1)
+        self.assertEqual(galleries[0].thumb_url, "https://t.example/css-thumb.jpg")
+
     def test_parse_gallery_detail(self):
         html = """
         <html>

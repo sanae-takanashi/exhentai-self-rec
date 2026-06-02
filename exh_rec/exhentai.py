@@ -18,6 +18,7 @@ TAG_ATTR_RE = re.compile(
     re.I,
 )
 IMG_RE = re.compile(r"<img\b[^>]*(?:data-src|src)=[\"']([^\"']+)[\"']", re.I)
+CSS_URL_RE = re.compile(r"url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)", re.I)
 CAT_RE = re.compile(r"class=[\"'][^\"']*\bcn\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
 UPLOADER_RE = re.compile(r"class=[\"'][^\"']*\bglhide\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
 RATING_RE = re.compile(r"Rating:\s*([0-9.]+)", re.I)
@@ -329,9 +330,12 @@ def normalize_tag(raw: str) -> str:
 
 def extract_thumb(block: str) -> str | None:
     img = IMG_RE.search(block)
-    if not img:
-        return None
-    return html.unescape(img.group(1))
+    if img:
+        return html.unescape(img.group(1))
+    css_url = CSS_URL_RE.search(block)
+    if css_url:
+        return html.unescape(css_url.group(1))
+    return None
 
 
 def strip_html_match(match: re.Match[str] | None) -> str | None:
