@@ -343,7 +343,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         if not exists:
             continue
-        vote = optional_float(item.get("vote", 0))
+        vote = import_feedback_vote(item.get("vote", 0))
         if vote is None:
             continue
         conn.execute(
@@ -354,7 +354,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             (
                 gallery_url,
                 vote,
-                optional_int(item.get("score")),
+                import_feedback_score(item.get("score")),
                 item.get("note"),
                 item.get("created_at"),
             ),
@@ -390,18 +390,31 @@ def import_tags_json(raw: object) -> str:
 
 def optional_float(value: object) -> float | None:
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if math.isnan(parsed) or math.isinf(parsed):
+        return None
+    return parsed
 
 
-def optional_int(value: object) -> int | None:
+def import_feedback_vote(value: object) -> float | None:
+    vote = optional_float(value)
+    if vote is None or vote < -MAX_FEEDBACK_SIGNAL or vote > MAX_FEEDBACK_SIGNAL:
+        return None
+    return vote
+
+
+def import_feedback_score(value: object) -> int | None:
     if value is None:
         return None
     try:
-        return int(value)
+        score = int(value)
     except (TypeError, ValueError):
         return None
+    if score < 1 or score > 5:
+        return None
+    return score
 
 
 def retrain_model(conn: sqlite3.Connection) -> None:
