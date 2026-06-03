@@ -24,6 +24,7 @@ from exh_rec.app import (
     ensure_gallery_exists,
     fetch_and_store,
     feedback_history_payload,
+    finish_interrupted_fetch_runs,
     fetch_runs,
     format_generated_query,
     get_access_check,
@@ -408,6 +409,26 @@ class AppTest(unittest.TestCase):
         self.assertEqual(history[0]["queries"], ["artist:test"])
         self.assertEqual(history[0]["errors"], [])
         self.assertEqual(history[0]["enriched_count"], 3)
+        conn.close()
+
+    def test_finish_interrupted_fetch_runs_marks_running_rows_failed(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO fetch_runs(trigger, status, queries_json)
+            VALUES (?, ?, ?)
+            """,
+            ("background", "running", "[null]"),
+        )
+
+        finish_interrupted_fetch_runs(conn)
+        row = fetch_runs(conn)[0]
+
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["errors"], ["interrupted before completion"])
+        self.assertIsNotNone(row["finished_at"])
         conn.close()
 
     def test_recommendation_payload_includes_last_fetch_summary(self):

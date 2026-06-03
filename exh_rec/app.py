@@ -1290,6 +1290,19 @@ def finish_running_fetch_run(
     )
 
 
+def finish_interrupted_fetch_runs(conn) -> None:
+    conn.execute(
+        """
+        UPDATE fetch_runs
+        SET status = 'failed',
+            errors_json = ?,
+            finished_at = CURRENT_TIMESTAMP
+        WHERE status = 'running'
+        """,
+        (json.dumps(["interrupted before completion"], ensure_ascii=True),),
+    )
+
+
 def fetch_runs(conn, limit: int = 10) -> list[dict]:
     limit = max(1, min(100, int(limit)))
     rows = conn.execute(
@@ -1360,11 +1373,12 @@ def server_display_url(host: str, port: int) -> str:
 def main() -> None:
     db.init_db()
     with db.connect() as conn:
+        finish_interrupted_fetch_runs(conn)
         retrain_model(conn)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop = threading.Event()
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     worker.start()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Serving ExHentai recommender at {server_display_url(HOST, PORT)}")
     if HOST == "0.0.0.0":
         print(f"Remote clients can use http://<server-ip>:{PORT}")
