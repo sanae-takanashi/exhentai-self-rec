@@ -84,7 +84,27 @@ def normalize_cookie_header(raw: str) -> str:
     table_pairs = parse_cookie_export(raw)
     if table_pairs:
         return "; ".join(f"{name}={value}" for name, value in table_pairs)
+    header_pairs = parse_cookie_header_fragments(raw)
+    if header_pairs:
+        return "; ".join(f"{name}={value}" for name, value in header_pairs)
     return " ".join(raw.split())
+
+
+def parse_cookie_header_fragments(raw: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for part in re.split(r"[;\n]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            return []
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not is_cookie_name(name) or not value:
+            return []
+        pairs.append((name, value))
+    return pairs
 
 
 def valid_cookie_header(cookie_header: str) -> bool:

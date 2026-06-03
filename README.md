@@ -8,7 +8,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 
 - Local web UI for recommendations and voting.
 - Cookie-based ExHentai access.
-- Cookie input accepts a normal `Cookie:` header, copied browser cookie-table rows with or without headers, or Netscape/curl cookie file rows.
+- Cookie input accepts a normal `Cookie:` header, multiline `name=value` cookie fragments, copied browser cookie-table rows with or without headers, or Netscape/curl cookie file rows.
 - Stored cookies can be cleared from the settings panel without deleting preferences.
 - Bootstrap preferences with positive/negative weights across tags, title text, category, and uploader metadata.
 - SQLite storage for galleries, settings, votes, and learned feature weights.
@@ -42,7 +42,7 @@ Open <http://127.0.0.1:8787>.
 
 In the settings panel:
 
-- Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows, with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
+- Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste multiline `name=value` cookie fragments, copied browser cookie-table rows with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
 - Non-empty cookie input must parse into `name=value` cookie pairs. Malformed cookie text is rejected without replacing a previously saved cookie.
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
 - Failed login checks show the specific access-check message instead of a generic HTTP error, so expired or incomplete cookies are easier to diagnose.

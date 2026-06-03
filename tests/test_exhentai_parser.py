@@ -165,6 +165,19 @@ class ParserTest(unittest.TestCase):
             "ipb_member_id=123; ipb_pass_hash=abc; sk=xyz",
         )
 
+    def test_normalize_cookie_header_accepts_multiline_cookie_header_fragments(self):
+        raw = "Cookie: ipb_member_id=123\nipb_pass_hash=abc\nigneous=secret"
+
+        self.assertEqual(
+            normalize_cookie_header(raw),
+            "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret",
+        )
+
+    def test_normalize_cookie_header_preserves_equals_inside_values(self):
+        raw = "ipb_member_id=123\nsk=abc=="
+
+        self.assertEqual(normalize_cookie_header(raw), "ipb_member_id=123; sk=abc==")
+
     def test_valid_cookie_header_requires_name_value_pairs(self):
         self.assertTrue(valid_cookie_header("ipb_member_id=123; ipb_pass_hash=abc"))
         self.assertFalse(valid_cookie_header("not a cookie"))
