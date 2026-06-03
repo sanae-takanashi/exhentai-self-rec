@@ -37,6 +37,7 @@ from exh_rec.app import (
     save_settings,
     select_detail_candidates,
     select_recommendation_detail_candidates,
+    server_display_url,
 )
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import learned_query_tags, parse_bootstrap_tags, record_feedback, store_galleries, upsert_bootstrap_tags
@@ -170,6 +171,10 @@ class AppTest(unittest.TestCase):
         self.assertEqual(query_int({"limit": ["500"]}, "limit", default=40, lower=1, upper=100), 100)
         self.assertEqual(query_int({"offset": ["-5"]}, "offset", default=0, lower=0, upper=10000), 0)
         self.assertEqual(query_int({}, "limit", default=40, lower=1, upper=100), 40)
+
+    def test_server_display_url_uses_loopback_for_wildcard_bind(self):
+        self.assertEqual(server_display_url("0.0.0.0", 8787), "http://127.0.0.1:8787")
+        self.assertEqual(server_display_url("192.0.2.10", 8787), "http://192.0.2.10:8787")
 
     def test_parse_feedback_request_validates_bad_numeric_values(self):
         self.assertEqual(parse_feedback_request({"vote": "1"}), (1, None))

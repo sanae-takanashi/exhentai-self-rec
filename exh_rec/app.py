@@ -31,7 +31,7 @@ from .recommender import (
 )
 
 
-HOST = "127.0.0.1"
+HOST = os.environ.get("EXH_REC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
@@ -1053,6 +1053,11 @@ def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
     REFRESH_STATE["next_check_at"] = None
 
 
+def server_display_url(host: str, port: int) -> str:
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return f"http://{display_host}:{port}"
+
+
 def main() -> None:
     db.init_db()
     with db.connect() as conn:
@@ -1061,7 +1066,9 @@ def main() -> None:
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     worker.start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Serving ExHentai recommender at http://{HOST}:{PORT}")
+    print(f"Serving ExHentai recommender at {server_display_url(HOST, PORT)}")
+    if HOST == "0.0.0.0":
+        print(f"Remote clients can use http://<server-ip>:{PORT}")
     print(f"SQLite data: {db.DB_PATH}")
     try:
         server.serve_forever()

@@ -40,6 +40,12 @@ python3 -m exh_rec.app
 
 Open <http://127.0.0.1:8787>.
 
+The server binds to `0.0.0.0` by default, so another device on the same network can open `http://<server-ip>:8787` if your firewall allows the port. To force local-only access, run:
+
+```bash
+EXH_REC_HOST=127.0.0.1 python3 -m exh_rec.app
+```
+
 In the settings panel:
 
 - Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste multiline `name=value` cookie fragments, copied browser cookie-table rows with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
@@ -131,9 +137,17 @@ Data is stored in `data/recommender.sqlite3` by default. Override with:
 EXH_REC_DATA_DIR=/path/to/private/data python3 -m exh_rec.app
 ```
 
+Override the bind address or port with:
+
+```bash
+EXH_REC_HOST=0.0.0.0 EXH_REC_PORT=8787 python3 -m exh_rec.app
+```
+
 ## Safety notes
 
-This is a local personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.
+This is a personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.
+
+By default the web server listens on all interfaces for remote access. Do not expose it to the public internet without firewall rules, a VPN, SSH tunnel, or an authenticating reverse proxy.
 
 The scraper intentionally fetches normal result pages and does not attempt to bypass access controls. You are responsible for using the site within its terms and with your own account.
 
