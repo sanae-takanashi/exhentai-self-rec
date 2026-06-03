@@ -38,6 +38,7 @@ FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
+COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 
 
 class ApiError(Exception):
@@ -249,6 +250,7 @@ def get_settings() -> dict:
         return {
             "has_cookie": bool(cookie),
             "cookie_preview": preview_cookie(cookie),
+            "cookie_missing_keys": missing_common_cookie_keys(cookie),
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
             "refresh_interval_minutes": refresh_interval_minutes(conn),
             "fetch_pages": fetch_pages(conn),
@@ -931,14 +933,24 @@ def feedback_history_payload(conn, gallery_url: str, limit: int = 25) -> dict:
 
 
 def preview_cookie(cookie: str) -> str:
+    names = cookie_key_names(cookie)
+    return ", ".join(names[:8])
+
+
+def cookie_key_names(cookie: str) -> list[str]:
     if not cookie:
-        return ""
+        return []
     names = []
     for part in cookie.split(";"):
-        name = part.strip().split("=", 1)[0]
+        name = part.strip().split("=", 1)[0].strip()
         if name:
             names.append(name)
-    return ", ".join(names[:8])
+    return names
+
+
+def missing_common_cookie_keys(cookie: str) -> list[str]:
+    names = {name.lower() for name in cookie_key_names(cookie)}
+    return [name for name in COMMON_EXHENTAI_COOKIE_KEYS if name not in names]
 
 
 def current_timestamp() -> str:

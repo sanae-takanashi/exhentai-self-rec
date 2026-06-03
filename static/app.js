@@ -48,12 +48,7 @@ function bootstrapText(tags) {
 
 async function loadSettings() {
   const settings = await api("/api/settings");
-  cookiePreviewEl.textContent = settings.has_cookie
-    ? `Stored cookie keys: ${settings.cookie_preview}`
-    : "No cookie stored.";
-  if (settings.last_access_check) {
-    cookiePreviewEl.textContent += ` Last check: ${settings.last_access_check.message}`;
-  }
+  cookiePreviewEl.textContent = cookiePreviewText(settings);
   tagsEl.value = bootstrapText(settings.bootstrap_tags);
   pagesEl.value = settings.fetch_pages;
   detailLimitEl.value = settings.detail_fetch_limit;
@@ -94,11 +89,23 @@ async function saveSettings() {
     body: JSON.stringify(payload),
   });
   cookieEl.value = "";
-  cookiePreviewEl.textContent = settings.has_cookie
-    ? `Stored cookie keys: ${settings.cookie_preview}`
-    : "No cookie stored.";
+  cookiePreviewEl.textContent = cookiePreviewText(settings);
   await loadStatus();
   setStatus("Settings saved");
+}
+
+function cookiePreviewText(settings) {
+  if (!settings.has_cookie) {
+    return "No cookie stored.";
+  }
+  let text = `Stored cookie keys: ${settings.cookie_preview}`;
+  if (settings.cookie_missing_keys && settings.cookie_missing_keys.length) {
+    text += ` Missing common keys: ${settings.cookie_missing_keys.join(", ")}`;
+  }
+  if (settings.last_access_check) {
+    text += ` Last check: ${settings.last_access_check.message}`;
+  }
+  return text;
 }
 
 async function loadRecommendations(offset = 0, append = false) {

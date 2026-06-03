@@ -27,6 +27,7 @@ from exh_rec.app import (
     get_settings,
     import_preferences_payload,
     is_remote_search_preference,
+    missing_common_cookie_keys,
     parse_bool,
     parse_feedback_request,
     query_int,
@@ -206,6 +207,11 @@ class AppTest(unittest.TestCase):
         db.set_setting(conn, "last_access_check", "{bad")
         self.assertIsNone(get_access_check(conn))
         conn.close()
+
+    def test_missing_common_cookie_keys_reports_names_only(self):
+        missing = missing_common_cookie_keys("ipb_member_id=123; sk=secret")
+
+        self.assertEqual(missing, ["ipb_pass_hash", "igneous"])
 
     def test_check_api_returns_failed_access_message_as_json_result(self):
         sent = []
@@ -740,6 +746,18 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["detail_fetch_limit"], 8)
                 self.assertEqual(settings["learned_query_limit"], 6)
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)
+
+    def test_get_settings_reports_missing_common_cookie_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                settings = get_settings()
+
+                self.assertEqual(settings["cookie_missing_keys"], ["igneous"])
 
     def test_save_settings_wakes_background_refresh_after_cookie_added(self):
         with tempfile.TemporaryDirectory() as tmpdir:

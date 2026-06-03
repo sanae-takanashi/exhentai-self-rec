@@ -44,6 +44,7 @@ In the settings panel:
 
 - Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste multiline `name=value` cookie fragments, copied browser cookie-table rows with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
 - Non-empty cookie input must parse into `name=value` cookie pairs. Malformed cookie text is rejected without replacing a previously saved cookie.
+- The settings panel previews stored cookie key names and warns if common ExHentai login keys such as `ipb_member_id`, `ipb_pass_hash`, or `igneous` are missing. Cookie values are never shown in the preview.
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
 - Failed login checks show the specific access-check message instead of a generic HTTP error, so expired or incomplete cookies are easier to diagnose.
 - Saving a new non-empty cookie clears the previous login-check result so stale verification is not shown for a replaced cookie.
