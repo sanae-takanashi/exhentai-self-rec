@@ -268,7 +268,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         conn.execute("DELETE FROM feedback")
         conn.execute("DELETE FROM bootstrap_tags")
 
-    galleries = payload.get("galleries") or []
+    galleries = import_rows(payload, "galleries")
     imported_galleries = 0
     for gallery in galleries:
         gallery_url = str(gallery.get("url") or "").strip()
@@ -316,7 +316,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         imported_galleries += 1
 
     imported_tags = 0
-    for tag in payload.get("bootstrap_tags") or []:
+    for tag in import_rows(payload, "bootstrap_tags"):
         value = normalize_bootstrap_value(str(tag.get("tag") or "").strip().lower())
         if not value:
             continue
@@ -333,7 +333,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         imported_tags += 1
 
     imported_feedback = 0
-    for item in payload.get("feedback") or []:
+    for item in import_rows(payload, "feedback"):
         gallery_url = item.get("gallery_url")
         if not gallery_url:
             continue
@@ -361,6 +361,13 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         "galleries": imported_galleries,
         "feedback": imported_feedback,
     }
+
+
+def import_rows(payload: dict, key: str) -> list[dict]:
+    rows = payload.get(key) or []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def retrain_model(conn: sqlite3.Connection) -> None:

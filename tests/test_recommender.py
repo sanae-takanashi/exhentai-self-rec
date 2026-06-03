@@ -422,6 +422,26 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(result["feedback"], 0)
         self.assertEqual(count, 0)
 
+    def test_import_preferences_skips_non_object_entries(self):
+        valid_url = "https://exhentai.org/g/12b/e/"
+        payload = {
+            "schema": "exh-rec-preferences-v1",
+            "bootstrap_tags": ["broken", {"tag": "artist:valid_import", "weight": 2.0}],
+            "galleries": [
+                "broken",
+                {"url": valid_url, "gid": "12b", "token": "e", "title": "Valid Import", "tags_json": '["artist:valid"]'},
+            ],
+            "feedback": ["broken", {"gallery_url": valid_url, "vote": 1.0}],
+        }
+
+        result = import_preferences(self.conn, payload)
+
+        self.assertEqual(result["bootstrap_tags"], 1)
+        self.assertEqual(result["galleries"], 1)
+        self.assertEqual(result["feedback"], 1)
+        self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:valid import", "weight": 2.0}])
+        self.assertIn("artist:valid", learned_query_tags(self.conn, limit=5))
+
     def test_import_rejects_unknown_schema(self):
         with self.assertRaises(ValueError):
             import_preferences(self.conn, {"schema": "unknown"})
