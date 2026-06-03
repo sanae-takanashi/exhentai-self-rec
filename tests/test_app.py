@@ -21,6 +21,7 @@ from exh_rec.app import (
     fetch_runs,
     format_generated_query,
     get_access_check,
+    get_settings,
     is_remote_search_preference,
     parse_bool,
     recommend_candidate_limit,
@@ -468,6 +469,49 @@ class AppTest(unittest.TestCase):
                 save_settings({"recommend_candidate_limit": 50000})
                 with db.connect() as conn:
                     self.assertEqual(recommend_candidate_limit(conn), 10000)
+
+    def test_save_settings_defaults_invalid_numeric_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+
+                save_settings(
+                    {
+                        "refresh_interval_minutes": None,
+                        "fetch_pages": "",
+                        "detail_fetch_limit": "bad",
+                        "learned_query_limit": None,
+                        "recommend_candidate_limit": "bad",
+                    }
+                )
+
+                with db.connect() as conn:
+                    self.assertEqual(db.get_setting(conn, "refresh_interval_minutes", ""), "30")
+                    self.assertEqual(db.get_setting(conn, "fetch_pages", ""), "1")
+                    self.assertEqual(db.get_setting(conn, "detail_fetch_limit", ""), "8")
+                    self.assertEqual(db.get_setting(conn, "learned_query_limit", ""), "6")
+                    self.assertEqual(recommend_candidate_limit(conn), 2000)
+
+    def test_get_settings_defaults_corrupt_numeric_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "refresh_interval_minutes", "bad")
+                    db.set_setting(conn, "fetch_pages", "bad")
+                    db.set_setting(conn, "detail_fetch_limit", "bad")
+                    db.set_setting(conn, "learned_query_limit", "bad")
+                    db.set_setting(conn, "recommend_candidate_limit", "bad")
+
+                settings = get_settings()
+
+                self.assertEqual(settings["refresh_interval_minutes"], 30)
+                self.assertEqual(settings["fetch_pages"], 1)
+                self.assertEqual(settings["detail_fetch_limit"], 8)
+                self.assertEqual(settings["learned_query_limit"], 6)
+                self.assertEqual(settings["recommend_candidate_limit"], 2000)
 
     def test_save_settings_wakes_background_refresh_after_cookie_added(self):
         with tempfile.TemporaryDirectory() as tmpdir:

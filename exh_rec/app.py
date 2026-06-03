@@ -262,10 +262,10 @@ def get_settings() -> dict:
             "has_cookie": bool(cookie),
             "cookie_preview": preview_cookie(cookie),
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
-            "refresh_interval_minutes": int(db.get_setting(conn, "refresh_interval_minutes", "30")),
-            "fetch_pages": int(db.get_setting(conn, "fetch_pages", "1")),
-            "detail_fetch_limit": int(db.get_setting(conn, "detail_fetch_limit", "8")),
-            "learned_query_limit": int(db.get_setting(conn, "learned_query_limit", "6")),
+            "refresh_interval_minutes": refresh_interval_minutes(conn),
+            "fetch_pages": fetch_pages(conn),
+            "detail_fetch_limit": detail_fetch_limit(conn),
+            "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
             "last_access_check": get_access_check(conn),
             "bootstrap_tags": get_bootstrap_tags(conn),
@@ -282,10 +282,10 @@ def get_status() -> dict:
             "refresh": refresh_summary(conn),
             "settings": {
                 "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
-                "refresh_interval_minutes": int(db.get_setting(conn, "refresh_interval_minutes", "30")),
-                "fetch_pages": int(db.get_setting(conn, "fetch_pages", "1")),
-                "detail_fetch_limit": int(db.get_setting(conn, "detail_fetch_limit", "8")),
-                "learned_query_limit": int(db.get_setting(conn, "learned_query_limit", "6")),
+                "refresh_interval_minutes": refresh_interval_minutes(conn),
+                "fetch_pages": fetch_pages(conn),
+                "detail_fetch_limit": detail_fetch_limit(conn),
+                "learned_query_limit": learned_query_limit(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "last_access_check": get_access_check(conn),
@@ -310,23 +310,23 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "auto_refresh", "1" if payload["auto_refresh"] else "0")
             refresh_relevant_change = True
         if "refresh_interval_minutes" in payload:
-            minutes = max(5, min(240, int(payload["refresh_interval_minutes"])))
+            minutes = bounded_int(payload["refresh_interval_minutes"], default=30, lower=5, upper=240)
             db.set_setting(conn, "refresh_interval_minutes", str(minutes))
             refresh_relevant_change = True
         if "fetch_pages" in payload:
-            pages = max(1, min(5, int(payload["fetch_pages"])))
+            pages = bounded_int(payload["fetch_pages"], default=1, lower=1, upper=5)
             db.set_setting(conn, "fetch_pages", str(pages))
             refresh_relevant_change = True
         if "detail_fetch_limit" in payload:
-            limit = max(0, min(50, int(payload["detail_fetch_limit"])))
+            limit = bounded_int(payload["detail_fetch_limit"], default=8, lower=0, upper=50)
             db.set_setting(conn, "detail_fetch_limit", str(limit))
             refresh_relevant_change = True
         if "learned_query_limit" in payload:
-            limit = max(0, min(20, int(payload["learned_query_limit"])))
+            limit = bounded_int(payload["learned_query_limit"], default=6, lower=0, upper=20)
             db.set_setting(conn, "learned_query_limit", str(limit))
             refresh_relevant_change = True
         if "recommend_candidate_limit" in payload:
-            limit = max(100, min(10000, int(payload["recommend_candidate_limit"])))
+            limit = bounded_int(payload["recommend_candidate_limit"], default=2000, lower=100, upper=10000)
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
@@ -360,9 +360,9 @@ def plan_fetch(force_query: str | None = None) -> dict:
 
 
 def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
-    pages = int(db.get_setting(conn, "fetch_pages", "1"))
-    detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
-    learned_limit = int(db.get_setting(conn, "learned_query_limit", "6"))
+    pages = fetch_pages(conn)
+    detail_limit = detail_fetch_limit(conn)
+    learned_limit = learned_query_limit(conn)
     tags = get_bootstrap_tags(conn)
     learned_tags = learned_query_tags(conn, learned_limit)
     entries = build_query_plan(tags, learned_tags, force_query=force_query)
@@ -379,7 +379,7 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
 
 def refresh_summary(conn) -> dict:
     enabled = db.get_setting(conn, "auto_refresh", "1") == "1"
-    interval = int(db.get_setting(conn, "refresh_interval_minutes", "30"))
+    interval = refresh_interval_minutes(conn)
     has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
     if not enabled:
         message = "Auto refresh disabled"
@@ -416,9 +416,9 @@ def fetch_and_store(
         raise ApiError(HTTPStatus.CONFLICT, "A fetch is already running")
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
-        pages = int(db.get_setting(conn, "fetch_pages", "1"))
-        detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
-        learned_limit = int(db.get_setting(conn, "learned_query_limit", "6"))
+        pages = fetch_pages(conn)
+        detail_limit = detail_fetch_limit(conn)
+        learned_limit = learned_query_limit(conn)
         tags = get_bootstrap_tags(conn)
         learned_tags = learned_query_tags(conn, learned_limit)
     if not cookie:
@@ -529,7 +529,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
-        detail_limit = int(db.get_setting(conn, "detail_fetch_limit", "8"))
+        detail_limit = detail_fetch_limit(conn)
     if not cookie:
         FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
@@ -809,8 +809,32 @@ def parse_bool(value: str | int | bool | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(lower, min(upper, parsed))
+
+
+def fetch_pages(conn) -> int:
+    return bounded_int(db.get_setting(conn, "fetch_pages", "1"), default=1, lower=1, upper=5)
+
+
+def detail_fetch_limit(conn) -> int:
+    return bounded_int(db.get_setting(conn, "detail_fetch_limit", "8"), default=8, lower=0, upper=50)
+
+
+def learned_query_limit(conn) -> int:
+    return bounded_int(db.get_setting(conn, "learned_query_limit", "6"), default=6, lower=0, upper=20)
+
+
+def refresh_interval_minutes(conn) -> int:
+    return bounded_int(db.get_setting(conn, "refresh_interval_minutes", "30"), default=30, lower=5, upper=240)
+
+
 def recommend_candidate_limit(conn) -> int:
-    return max(100, min(10000, int(db.get_setting(conn, "recommend_candidate_limit", "2000"))))
+    return bounded_int(db.get_setting(conn, "recommend_candidate_limit", "2000"), default=2000, lower=100, upper=10000)
 
 
 def recommendation_payload(
@@ -907,7 +931,7 @@ def background_refresh(stop: threading.Event) -> None:
         try:
             with db.connect() as conn:
                 enabled = db.get_setting(conn, "auto_refresh", "1") == "1"
-                interval = int(db.get_setting(conn, "refresh_interval_minutes", "30"))
+                interval = refresh_interval_minutes(conn)
                 has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
             if enabled and has_cookie:
                 fetch_and_store(trigger="background")
