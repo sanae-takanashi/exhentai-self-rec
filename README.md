@@ -137,6 +137,8 @@ Data is stored in `data/recommender.sqlite3` by default. Override with:
 EXH_REC_DATA_DIR=/path/to/private/data python3 -m exh_rec.app
 ```
 
+Thumbnails are served through the local app instead of hotlinked from ExHentai, then cached under `data/thumbs`. This lets the server use the saved cookie and gallery referer when ExHentai's thumbnail host rejects direct browser requests.
+
 Override the bind address or port with:
 
 ```bash

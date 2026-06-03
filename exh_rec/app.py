@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,6 +42,8 @@ FETCH_STATE: dict[str, Any] = {"running": False}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
+ALLOWED_THUMB_HOSTS = {"s.exhentai.org"}
+THUMB_MAX_BYTES = 5 * 1024 * 1024
 
 
 class ApiError(Exception):
@@ -70,6 +75,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_static("index.html")
             elif path.startswith("/static/"):
                 self.serve_static(path.removeprefix("/static/"))
+            elif path == "/thumb":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                thumb_url = str(query.get("url", [""])[0])
+                gallery_url = str(query.get("gallery_url", [""])[0])
+                self.serve_thumbnail(thumb_url, gallery_url)
             elif path == "/api/settings":
                 self.send_json(get_settings())
             elif path == "/api/status":
@@ -220,6 +230,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def send_bytes(
+        self,
+        data: bytes,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        cache_control: str | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_thumbnail(self, thumb_url: str, gallery_url: str) -> None:
+        data, content_type = cached_thumbnail(thumb_url, gallery_url)
+        self.send_bytes(data, content_type, cache_control="private, max-age=86400")
 
     def serve_static(self, name: str, body: bool = True) -> None:
         path = (STATIC_DIR / name).resolve()
@@ -930,6 +959,113 @@ def feedback_history_payload(conn, gallery_url: str, limit: int = 25) -> dict:
         "items": items,
         "latest": items[0] if items else None,
     }
+
+
+def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]:
+    thumb_url = normalize_thumbnail_url(thumb_url)
+    if not thumb_url:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "thumbnail url is required")
+    if not is_allowed_thumbnail_url(thumb_url):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "unsupported thumbnail host")
+
+    data_path, meta_path = thumbnail_cache_paths(thumb_url)
+    cached = read_cached_thumbnail(data_path, meta_path, thumb_url)
+    if cached:
+        return cached
+
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+    if not cookie:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+
+    data, content_type = fetch_thumbnail_bytes(cookie, thumb_url, thumbnail_referer(gallery_url))
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.write_bytes(data)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "source_url": thumb_url,
+                "content_type": content_type,
+                "fetched_at": current_timestamp(),
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+    return data, content_type
+
+
+def normalize_thumbnail_url(thumb_url: str) -> str:
+    thumb_url = thumb_url.strip()
+    if thumb_url.startswith("//"):
+        return f"https:{thumb_url}"
+    return thumb_url
+
+
+def is_allowed_thumbnail_url(thumb_url: str) -> bool:
+    parsed = urllib.parse.urlparse(thumb_url)
+    hostname = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and hostname in ALLOWED_THUMB_HOSTS
+
+
+def thumbnail_cache_paths(thumb_url: str) -> tuple[Path, Path]:
+    digest = hashlib.sha256(thumb_url.encode("utf-8")).hexdigest()
+    cache_dir = db.DATA_DIR / "thumbs"
+    return cache_dir / f"{digest}.bin", cache_dir / f"{digest}.json"
+
+
+def read_cached_thumbnail(data_path: Path, meta_path: Path, thumb_url: str) -> tuple[bytes, str] | None:
+    if not data_path.exists():
+        return None
+    content_type = ""
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            content_type = str(meta.get("content_type") or "")
+        except (OSError, json.JSONDecodeError):
+            content_type = ""
+    if not content_type.startswith("image/"):
+        content_type = mimetypes.guess_type(urllib.parse.urlparse(thumb_url).path)[0] or "application/octet-stream"
+    return data_path.read_bytes(), content_type
+
+
+def thumbnail_referer(gallery_url: str) -> str:
+    parsed = urllib.parse.urlparse(gallery_url.strip())
+    if parsed.scheme == "https" and (parsed.hostname or "").lower() == "exhentai.org" and parsed.path.startswith("/g/"):
+        return gallery_url.strip()
+    return "https://exhentai.org/"
+
+
+def fetch_thumbnail_bytes(cookie_header: str, thumb_url: str, referer: str, timeout: int = 20) -> tuple[bytes, str]:
+    request = urllib.request.Request(
+        thumb_url,
+        headers={
+            "Cookie": normalize_cookie_header(cookie_header),
+            "User-Agent": "exhentai-self-recommend/0.1 (+local personal recommender)",
+            "Accept": "image/avif,image/webp,image/*,*/*",
+            "Referer": referer,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = response_content_type(response.headers)
+            data = response.read(THUMB_MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"Thumbnail fetch failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"Thumbnail fetch failed: {exc.reason}") from exc
+
+    if len(data) > THUMB_MAX_BYTES:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail is too large")
+    if not content_type.startswith("image/"):
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail response was not an image")
+    return data, content_type
+
+
+def response_content_type(headers: Any) -> str:
+    if hasattr(headers, "get_content_type"):
+        return str(headers.get_content_type())
+    return str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
 
 
 def preview_cookie(cookie: str) -> str:

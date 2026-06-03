@@ -16,6 +16,7 @@ from exh_rec.app import (
     background_refresh,
     build_queries,
     build_query_plan,
+    cached_thumbnail,
     enrich_feedback_gallery,
     enrich_recommendations,
     ensure_gallery_exists,
@@ -38,6 +39,7 @@ from exh_rec.app import (
     select_detail_candidates,
     select_recommendation_detail_candidates,
     server_display_url,
+    thumbnail_referer,
 )
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import learned_query_tags, parse_bootstrap_tags, record_feedback, store_galleries, upsert_bootstrap_tags
@@ -175,6 +177,67 @@ class AppTest(unittest.TestCase):
     def test_server_display_url_uses_loopback_for_wildcard_bind(self):
         self.assertEqual(server_display_url("0.0.0.0", 8787), "http://127.0.0.1:8787")
         self.assertEqual(server_display_url("192.0.2.10", 8787), "http://192.0.2.10:8787")
+
+    def test_thumbnail_referer_accepts_only_exhentai_gallery_urls(self):
+        self.assertEqual(
+            thumbnail_referer("https://exhentai.org/g/123/abcdef/"),
+            "https://exhentai.org/g/123/abcdef/",
+        )
+        self.assertEqual(thumbnail_referer("https://example.test/g/123/abcdef/"), "https://exhentai.org/")
+
+    def test_cached_thumbnail_fetches_with_cookie_referer_and_reuses_cache(self):
+        class Headers:
+            def get_content_type(self):
+                return "image/webp"
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, size=-1):
+                return b"thumb-bytes"
+
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(request)
+            return Response()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
+
+                with patch("exh_rec.app.urllib.request.urlopen", fake_urlopen):
+                    first = cached_thumbnail(
+                        "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
+                        "https://exhentai.org/g/123/abcdef/",
+                    )
+                    second = cached_thumbnail(
+                        "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
+                        "https://exhentai.org/g/123/abcdef/",
+                    )
+
+        self.assertEqual(first, (b"thumb-bytes", "image/webp"))
+        self.assertEqual(second, (b"thumb-bytes", "image/webp"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].full_url, "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp")
+        self.assertEqual(calls[0].get_header("Cookie"), "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
+        self.assertEqual(calls[0].get_header("Referer"), "https://exhentai.org/g/123/abcdef/")
+
+    def test_cached_thumbnail_rejects_unsupported_hosts(self):
+        with self.assertRaises(ApiError) as ctx:
+            cached_thumbnail("https://example.test/thumb.webp")
+
+        self.assertEqual(ctx.exception.status.value, 400)
+        self.assertEqual(ctx.exception.message, "unsupported thumbnail host")
 
     def test_parse_feedback_request_validates_bad_numeric_values(self):
         self.assertEqual(parse_feedback_request({"vote": "1"}), (1, None))

@@ -42,6 +42,14 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function thumbnailSrc(item) {
+  const params = new URLSearchParams({
+    url: item.thumb_url,
+    gallery_url: item.url,
+  });
+  return `/thumb?${params.toString()}`;
+}
+
 function bootstrapText(tags) {
   return tags.map((item) => `${item.tag}:${item.weight}`).join("\n");
 }
@@ -321,7 +329,7 @@ function renderRecommendations(items, append = false) {
     const card = document.createElement("article");
     card.className = "card";
     const thumb = item.thumb_url
-      ? `<img src="${escapeAttr(item.thumb_url)}" alt="">`
+      ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
