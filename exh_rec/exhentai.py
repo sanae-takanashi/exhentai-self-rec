@@ -104,6 +104,8 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
             parts = line.split()
         if len(parts) < 2:
             return []
+        if looks_like_cookie_table_header(parts):
+            continue
         if len(parts) >= 7 and looks_like_netscape_cookie_row(parts):
             name = parts[5].strip()
             value = parts[6].strip()
@@ -114,6 +116,14 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
             return []
         pairs.append((name, value))
     return pairs if pairs else []
+
+
+def looks_like_cookie_table_header(parts: list[str]) -> bool:
+    if len(parts) < 2:
+        return False
+    first = parts[0].strip().lower()
+    second = parts[1].strip().lower()
+    return first == "name" and second == "value"
 
 
 def looks_like_netscape_cookie_row(parts: list[str]) -> bool:

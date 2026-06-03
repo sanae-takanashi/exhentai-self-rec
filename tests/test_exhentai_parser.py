@@ -161,6 +161,7 @@ class ParserTest(unittest.TestCase):
     def test_normalize_cookie_header_accepts_browser_cookie_table(self):
         exported = "\n".join(
             [
+                "Name\tValue\tDomain\tPath\tExpires\tSize\tHttpOnly\tSecure\tSameSite",
                 "ipb_member_id\t123\t.e-hentai.org\t/\t2026-12-08T06:34:06.123Z\t19\t\t\t\t\t\tMedium",
                 "ipb_pass_hash\tabc123\t.e-hentai.org\t/\t2026-12-08T06:34:06.123Z\t45\t\t\t\t\t\tMedium",
                 "sk\tsecret-session\t.e-hentai.org\t/\t2026-12-08T06:34:08.149Z\t30\t\t\t\t\t\tMedium",

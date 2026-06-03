@@ -8,7 +8,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 
 - Local web UI for recommendations and voting.
 - Cookie-based ExHentai access.
-- Cookie input accepts a normal `Cookie:` header, copied browser cookie-table rows, or Netscape/curl cookie file rows.
+- Cookie input accepts a normal `Cookie:` header, copied browser cookie-table rows with or without headers, or Netscape/curl cookie file rows.
 - Stored cookies can be cleared from the settings panel without deleting preferences.
 - Bootstrap preferences with positive/negative weights across tags, title text, category, and uploader metadata.
 - SQLite storage for galleries, settings, votes, and learned feature weights.
@@ -40,7 +40,7 @@ Open <http://127.0.0.1:8787>.
 
 In the settings panel:
 
-- Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
+- Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows, with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
 - Use `Clear Cookie` if you want to remove the stored login cookie while keeping bootstrap tags, feedback, and fetched galleries.
 - Add bootstrap preferences, one per line or comma-separated. Tags like `artist:name`, metadata like `category:manga` or `uploader:name`, and plain title terms are supported. Underscore tag input such as `artist:some_name` is normalized to match parsed ExHentai tags. Use `-tag` or `tag:-2` for negative preferences. Numeric namespaced values like `parody:1984` are preserved; add an extra suffix such as `parody:1984:2` to weight them.
