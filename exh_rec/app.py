@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .exhentai import Gallery, check_access, fetch_galleries, fetch_gallery_detail, normalize_cookie_header
+from .exhentai import Gallery, check_access, fetch_galleries, fetch_gallery_detail, normalize_cookie_header, valid_cookie_header
 from .recommender import (
     clear_feedback,
     export_preferences,
@@ -289,7 +289,10 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "last_access_check", "")
             refresh_relevant_change = True
         if "cookie_header" in payload:
-            cookie_header = normalize_cookie_header(str(payload["cookie_header"]))
+            raw_cookie_header = str(payload["cookie_header"])
+            cookie_header = normalize_cookie_header(raw_cookie_header)
+            if raw_cookie_header.strip() and not valid_cookie_header(cookie_header):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Cookie input must contain name=value pairs")
             if cookie_header:
                 db.set_setting(conn, "cookie_header", cookie_header)
                 db.set_setting(conn, "last_access_check", "")

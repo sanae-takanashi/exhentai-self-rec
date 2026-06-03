@@ -1,7 +1,14 @@
 import unittest
 from unittest.mock import patch
 
-from exh_rec.exhentai import check_access, merge_gallery, normalize_cookie_header, parse_gallery_detail, parse_gallery_list
+from exh_rec.exhentai import (
+    check_access,
+    merge_gallery,
+    normalize_cookie_header,
+    parse_gallery_detail,
+    parse_gallery_list,
+    valid_cookie_header,
+)
 
 
 class ParserTest(unittest.TestCase):
@@ -158,6 +165,12 @@ class ParserTest(unittest.TestCase):
             "ipb_member_id=123; ipb_pass_hash=abc; sk=xyz",
         )
 
+    def test_valid_cookie_header_requires_name_value_pairs(self):
+        self.assertTrue(valid_cookie_header("ipb_member_id=123; ipb_pass_hash=abc"))
+        self.assertFalse(valid_cookie_header("not a cookie"))
+        self.assertFalse(valid_cookie_header("ipb_member_id=; ipb_pass_hash=abc"))
+        self.assertFalse(valid_cookie_header("bad name=abc"))
+
     def test_normalize_cookie_header_accepts_browser_cookie_table(self):
         exported = "\n".join(
             [
@@ -171,6 +184,11 @@ class ParserTest(unittest.TestCase):
             normalize_cookie_header(exported),
             "ipb_member_id=123; ipb_pass_hash=abc123; sk=secret-session",
         )
+
+    def test_normalize_cookie_header_does_not_treat_plain_words_as_cookie_table(self):
+        normalized = normalize_cookie_header("this is not a cookie")
+
+        self.assertFalse(valid_cookie_header(normalized))
 
     def test_normalize_cookie_header_accepts_netscape_cookie_file(self):
         exported = "\n".join(

@@ -633,6 +633,24 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=456; ipb_pass_hash=def")
                     self.assertIsNone(get_access_check(conn))
 
+    def test_save_settings_rejects_malformed_cookie_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "last_access_check", '{"ok": true, "message": "old check"}')
+
+                with self.assertRaises(ApiError) as ctx:
+                    save_settings({"cookie_header": "this is not a cookie"})
+
+                with db.connect() as conn:
+                    self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=123; ipb_pass_hash=abc")
+                    self.assertIsNotNone(get_access_check(conn))
+                self.assertEqual(ctx.exception.status.value, 400)
+                self.assertEqual(ctx.exception.message, "Cookie input must contain name=value pairs")
+
     def test_save_settings_clamps_recommend_candidate_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)

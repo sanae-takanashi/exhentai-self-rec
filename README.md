@@ -43,6 +43,7 @@ Open <http://127.0.0.1:8787>.
 In the settings panel:
 
 - Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows, with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
+- Non-empty cookie input must parse into `name=value` cookie pairs. Malformed cookie text is rejected without replacing a previously saved cookie.
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
 - Saving a new non-empty cookie clears the previous login-check result so stale verification is not shown for a replaced cookie.
 - Use `Clear Cookie` if you want to remove the stored login cookie while keeping bootstrap tags, feedback, and fetched galleries.

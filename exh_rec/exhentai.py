@@ -87,6 +87,19 @@ def normalize_cookie_header(raw: str) -> str:
     return " ".join(raw.split())
 
 
+def valid_cookie_header(cookie_header: str) -> bool:
+    parts = [part.strip() for part in cookie_header.split(";") if part.strip()]
+    if not parts:
+        return False
+    for part in parts:
+        if "=" not in part:
+            return False
+        name, value = part.split("=", 1)
+        if not is_cookie_name(name.strip()) or not value.strip():
+            return False
+    return True
+
+
 def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
     if ";" in raw and "\n" not in raw:
         return []
@@ -99,6 +112,7 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
             continue
         if "=" in line.split(None, 1)[0]:
             return []
+        tab_delimited = "\t" in line
         parts = line.split("\t")
         if len(parts) < 2:
             parts = line.split()
@@ -110,6 +124,8 @@ def parse_cookie_export(raw: str) -> list[tuple[str, str]]:
             name = parts[5].strip()
             value = parts[6].strip()
         else:
+            if not tab_delimited and not looks_like_browser_cookie_row(parts):
+                return []
             name = parts[0].strip()
             value = parts[1].strip()
         if not is_cookie_name(name) or not value:
@@ -124,6 +140,14 @@ def looks_like_cookie_table_header(parts: list[str]) -> bool:
     first = parts[0].strip().lower()
     second = parts[1].strip().lower()
     return first == "name" and second == "value"
+
+
+def looks_like_browser_cookie_row(parts: list[str]) -> bool:
+    if len(parts) < 4:
+        return False
+    domain = parts[2].strip()
+    path = parts[3].strip()
+    return ("." in domain or domain in {"localhost", "127.0.0.1"}) and path.startswith("/")
 
 
 def looks_like_netscape_cookie_row(parts: list[str]) -> bool:
