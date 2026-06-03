@@ -9,6 +9,7 @@ import urllib.parse
 from dataclasses import asdict
 
 from .exhentai import Gallery
+from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
 
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
@@ -18,10 +19,12 @@ FEEDBACK_CONFIDENCE_STEP = 0.15
 MAX_FEEDBACK_CONFIDENCE_BOOST = 0.45
 MAX_FEEDBACK_CONFIDENCE_HISTORY = 5
 DIVERSITY_PENALTY = 0.45
-VISUAL_EMBEDDING_VERSION = "canvas-rgb-8x8-v1"
+VISUAL_EMBEDDING_VERSION = DINOV2_VISUAL_VERSION
+FALLBACK_VISUAL_EMBEDDING_VERSION = SIMPLE_VISUAL_VERSION
+VISUAL_VERSION_PRIORITY = (DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION)
 VISUAL_SCORE_SCALE = 1.35
 VISUAL_MIN_DIMS = 16
-VISUAL_MAX_DIMS = 512
+VISUAL_MAX_DIMS = 2048
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -223,16 +226,7 @@ def normalize_visual_embedding(embedding: list[object]) -> list[float]:
         raise ValueError("embedding must be a list")
     if len(embedding) < VISUAL_MIN_DIMS or len(embedding) > VISUAL_MAX_DIMS:
         raise ValueError(f"embedding must have {VISUAL_MIN_DIMS} to {VISUAL_MAX_DIMS} values")
-    values: list[float] = []
-    for value in embedding:
-        parsed = optional_float(value)
-        if parsed is None:
-            raise ValueError("embedding values must be finite numbers")
-        values.append(parsed)
-    norm = math.sqrt(sum(value * value for value in values))
-    if norm <= 0:
-        raise ValueError("embedding must not be all zero")
-    return [round(value / norm, 6) for value in values]
+    return normalize_embedding(embedding)
 
 
 def parse_visual_embedding(raw: object) -> list[float] | None:
@@ -553,7 +547,7 @@ def retrain_model(conn: sqlite3.Connection) -> None:
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
     rows = conn.execute(
         """
-        SELECT g.url, g.visual_embedding_json, f.id AS feedback_id, f.vote AS feedback_signal
+        SELECT g.url, g.visual_embedding_json, g.visual_embedding_version, f.id AS feedback_id, f.vote AS feedback_signal
         FROM feedback f
         JOIN galleries g ON g.url = f.gallery_url
         JOIN (
@@ -566,11 +560,16 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
           AND g.visual_embedding_json != ''
         """
     ).fetchall()
+    version = active_visual_version(rows)
+    if not version:
+        return None
     vector_sum: list[float] | None = None
     positive_count = 0
     negative_count = 0
     total_weight = 0.0
     for row in rows:
+        if row["visual_embedding_version"] != version:
+            continue
         embedding = parse_visual_embedding(row["visual_embedding_json"])
         if not embedding:
             continue
@@ -593,13 +592,25 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
     if norm <= 0:
         return None
     return {
-        "version": VISUAL_EMBEDDING_VERSION,
+        "version": version,
         "vector": [value / norm for value in vector_sum],
         "positive_count": positive_count,
         "negative_count": negative_count,
         "rated_count": positive_count + negative_count,
         "total_weight": round(total_weight, 3),
     }
+
+
+def active_visual_version(rows: list[sqlite3.Row]) -> str | None:
+    versions = {
+        str(row["visual_embedding_version"] or "")
+        for row in rows
+        if row["visual_embedding_json"]
+    }
+    for version in VISUAL_VERSION_PRIORITY:
+        if version in versions:
+            return version
+    return sorted(versions)[0] if versions else None
 
 
 def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id: int, signal: float) -> float:
@@ -731,6 +742,7 @@ def recommend_page(
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
         gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
+        gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
         gallery["visual_ready"] = bool(gallery["visual_embedding"])
         score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
         gallery.pop("visual_embedding", None)
@@ -880,6 +892,8 @@ def score_gallery(
 def score_visual_similarity(gallery: dict, visual_model: dict | None) -> float:
     if not visual_model:
         return 0.0
+    if gallery.get("visual_embedding_version") != visual_model.get("version"):
+        return 0.0
     embedding = gallery.get("visual_embedding")
     if not embedding:
         embedding = parse_visual_embedding(gallery.get("visual_embedding_json"))
@@ -934,6 +948,7 @@ def bootstrap_search_text(gallery: dict) -> str:
 
 def model_snapshot(conn: sqlite3.Connection) -> dict:
     visual_model = visual_preference_model(conn)
+    visual_counts = visual_version_counts(conn)
     return {
         "bootstrap_tags": get_bootstrap_tags(conn),
         "learned_queries": learned_query_tags(conn, limit=12),
@@ -952,6 +967,8 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
         "negative_weights": model_weight_rows(conn, "weight < 0", "weight ASC"),
         "visual": {
             "version": VISUAL_EMBEDDING_VERSION,
+            "fallback_version": FALLBACK_VISUAL_EMBEDDING_VERSION,
+            "active_version": None if not visual_model else visual_model["version"],
             "embedded_galleries": conn.execute(
                 """
                 SELECT COUNT(*) AS c
@@ -962,6 +979,7 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "rated_embedded_galleries": 0 if not visual_model else visual_model["rated_count"],
             "positive_count": 0 if not visual_model else visual_model["positive_count"],
             "negative_count": 0 if not visual_model else visual_model["negative_count"],
+            "versions": visual_counts,
             "ready": bool(visual_model),
         },
         "counts": {
@@ -971,6 +989,21 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "model_features": conn.execute("SELECT COUNT(*) AS c FROM feature_weights").fetchone()["c"],
         },
     }
+
+
+def visual_version_counts(conn: sqlite3.Connection) -> list[dict]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT visual_embedding_version AS version, COUNT(*) AS count
+            FROM galleries
+            WHERE visual_embedding_json IS NOT NULL AND visual_embedding_json != ''
+            GROUP BY visual_embedding_version
+            ORDER BY count DESC, version ASC
+            """
+        )
+    ]
 
 
 def model_weight_rows(conn: sqlite3.Connection, where_clause: str, order_clause: str, limit: int = 12) -> list[dict]:

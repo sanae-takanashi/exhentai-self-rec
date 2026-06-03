@@ -27,6 +27,7 @@ from exh_rec.recommender import (
     upsert_bootstrap_tags,
     visual_preference_model,
 )
+from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION
 
 
 class RecommenderTest(unittest.TestCase):
@@ -351,6 +352,26 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(model["negative_count"], 1)
         self.assertGreater(model["vector"][0], 0)
         self.assertLess(model["vector"][1], 0)
+
+    def test_visual_preference_model_prefers_dinov2_over_simple_vectors(self):
+        simple_url = "https://exhentai.org/g/5vs/a/"
+        dinov2_url = "https://exhentai.org/g/5vs/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=simple_url, gid="5vs", token="a", title="Simple Visual"),
+                Gallery(url=dinov2_url, gid="5vs", token="b", title="DINO Visual"),
+            ],
+        )
+        store_visual_embedding(self.conn, simple_url, [1, 0, 0, 0] * 16, version=SIMPLE_VISUAL_VERSION)
+        store_visual_embedding(self.conn, dinov2_url, [0, 1, 0, 0] * 16, version=DINOV2_VISUAL_VERSION)
+
+        record_feedback(self.conn, simple_url, vote=1)
+        record_feedback(self.conn, dinov2_url, vote=1)
+        model = visual_preference_model(self.conn)
+
+        self.assertEqual(model["version"], DINOV2_VISUAL_VERSION)
+        self.assertEqual(model["positive_count"], 1)
 
     def test_score_gallery_reports_rating_adjustment_reason(self):
         score, reasons = score_gallery({"title": "Rated", "rating": 4.5, "tags": []}, {}, {})

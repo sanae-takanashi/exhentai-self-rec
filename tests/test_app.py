@@ -48,6 +48,7 @@ from exh_rec.app import (
 )
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import learned_query_tags, parse_bootstrap_tags, record_feedback, store_galleries, upsert_bootstrap_tags
+from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, VisualEncoderUnavailable
 
 
 class AppTest(unittest.TestCase):
@@ -269,8 +270,56 @@ class AppTest(unittest.TestCase):
 
         self.assertTrue(result["visual_ready"])
         self.assertIsNotNone(row["visual_embedding_json"])
-        self.assertEqual(row["visual_embedding_version"], "canvas-rgb-8x8-v1")
+        self.assertEqual(row["visual_embedding_version"], SIMPLE_VISUAL_VERSION)
         self.assertIsNotNone(row["visual_embedding_at"])
+
+    def test_save_visual_embedding_payload_defaults_to_dinov2_for_image_urls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/41/a/"
+                with db.connect() as conn:
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="41", token="a", title="DINO Save")])
+
+                with patch("exh_rec.app.cached_thumbnail", return_value=(b"image", "image/webp")) as cached, patch(
+                    "exh_rec.app.dinov2_embedding",
+                    return_value=[1, 0, 0, 0] * 16,
+                ):
+                    result = save_visual_embedding_payload(
+                        {
+                            "gallery_url": gallery_url,
+                            "image_urls": ["https://s.exhentai.org/t/1.webp"],
+                        }
+                    )
+
+                with db.connect() as conn:
+                    row = conn.execute(
+                        "SELECT visual_embedding_version FROM galleries WHERE url = ?",
+                        (gallery_url,),
+                    ).fetchone()
+
+        self.assertTrue(result["visual_ready"])
+        self.assertEqual(result["encoder"], "dinov2")
+        self.assertEqual(row["visual_embedding_version"], DINOV2_VISUAL_VERSION)
+        cached.assert_called_once()
+
+    def test_save_visual_embedding_payload_reports_simple_fallback_when_dinov2_unavailable(self):
+        with patch("exh_rec.app.cached_thumbnail", return_value=(b"image", "image/webp")), patch(
+            "exh_rec.app.dinov2_embedding",
+            side_effect=VisualEncoderUnavailable("missing torch"),
+        ):
+            result = save_visual_embedding_payload(
+                {
+                    "gallery_url": "https://exhentai.org/g/42/a/",
+                    "encoder": "dinov2",
+                    "image_urls": ["https://s.exhentai.org/t/1.webp"],
+                }
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["fallback_required"])
+        self.assertEqual(result["fallback_encoder"], "simple")
 
     def test_save_visual_embedding_payload_rejects_bad_embedding(self):
         with self.assertRaises(ApiError) as ctx:

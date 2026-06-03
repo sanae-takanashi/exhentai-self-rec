@@ -44,6 +44,14 @@ from .recommender import (
     store_visual_embedding,
     upsert_bootstrap_tags,
 )
+from .visual import (
+    DEFAULT_VISUAL_ENCODER,
+    DINOV2_VISUAL_VERSION,
+    SIMPLE_VISUAL_VERSION,
+    VisualEncoderUnavailable,
+    dinov2_dependency_status,
+    dinov2_embedding,
+)
 
 
 HOST = os.environ.get("EXH_REC_HOST", "0.0.0.0")
@@ -305,6 +313,7 @@ def get_settings() -> dict:
             "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
             "sample_extra_pages": sample_extra_pages(conn),
+            "visual": visual_settings(),
             "last_access_check": get_access_check(conn),
             "bootstrap_tags": get_bootstrap_tags(conn),
         }
@@ -328,6 +337,7 @@ def get_status() -> dict:
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "last_access_check": get_access_check(conn),
             },
+            "visual": visual_settings(),
         }
 
 
@@ -413,13 +423,68 @@ def save_visual_embedding_payload(payload: dict[str, Any]) -> dict:
     if not gallery_url:
         raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
     embedding = payload.get("embedding")
-    version = str(payload.get("version") or "").strip() or "unknown"
+    default_encoder = "simple" if embedding is not None else DEFAULT_VISUAL_ENCODER
+    encoder = str(payload.get("encoder") or default_encoder).strip().lower()
+    if embedding is None and encoder == "dinov2":
+        return save_dinov2_visual_embedding(gallery_url, payload)
+    version = str(payload.get("version") or "").strip() or SIMPLE_VISUAL_VERSION
     try:
         with db.connect() as conn:
             store_visual_embedding(conn, gallery_url, embedding, version=version)
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-    return {"ok": True, "gallery_url": gallery_url, "visual_ready": True}
+    return {"ok": True, "gallery_url": gallery_url, "encoder": encoder, "version": version, "visual_ready": True}
+
+
+def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> dict:
+    image_urls = payload.get("image_urls") or []
+    if not isinstance(image_urls, list):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "image_urls must be a list")
+    blobs = []
+    errors = []
+    for raw_url in image_urls[:12]:
+        try:
+            data, _ = cached_thumbnail(str(raw_url), gallery_url)
+            blobs.append(data)
+        except Exception as exc:
+            errors.append(str(exc))
+    if not blobs:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "no usable visual images")
+    try:
+        embedding = dinov2_embedding(blobs)
+    except VisualEncoderUnavailable as exc:
+        return {
+            "ok": False,
+            "gallery_url": gallery_url,
+            "encoder": "dinov2",
+            "fallback_required": True,
+            "fallback_encoder": "simple",
+            "reason": str(exc),
+        }
+    try:
+        with db.connect() as conn:
+            store_visual_embedding(conn, gallery_url, embedding, version=DINOV2_VISUAL_VERSION)
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    return {
+        "ok": True,
+        "gallery_url": gallery_url,
+        "encoder": "dinov2",
+        "version": DINOV2_VISUAL_VERSION,
+        "visual_ready": True,
+        "image_count": len(blobs),
+        "errors": errors,
+    }
+
+
+def visual_settings() -> dict:
+    return {
+        "default_encoder": DEFAULT_VISUAL_ENCODER,
+        "default_version": DINOV2_VISUAL_VERSION,
+        "fallback_encoder": "simple",
+        "fallback_version": SIMPLE_VISUAL_VERSION,
+        "dinov2": dinov2_dependency_status(),
+    }
 
 
 def reset_library_payload() -> dict:

@@ -25,7 +25,10 @@ let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
-const visualEmbeddingVersion = "canvas-rgb-8x8-v1";
+const visualDefaultEncoder = "dinov2";
+const visualEmbeddingVersion = "dinov2-small-cls-v1";
+const visualFallbackEncoder = "simple";
+const visualFallbackVersion = "canvas-rgb-8x8-v1";
 const visualGridSize = 8;
 const visualMaxSampleImages = 10;
 const visualMaxConcurrent = 2;
@@ -79,6 +82,17 @@ function visualImageSources(item) {
   return sources;
 }
 
+function visualImageUrls(item) {
+  const urls = [];
+  if (item.thumb_url) {
+    urls.push(item.thumb_url);
+  }
+  for (const thumb of (item.samples || []).slice(0, visualMaxSampleImages)) {
+    urls.push(thumb);
+  }
+  return urls;
+}
+
 function queueVisualEmbedding(item) {
   if (!item || !item.url || visualQueuedUrls.has(item.url) || visualSavedUrls.has(item.url)) {
     return;
@@ -88,11 +102,12 @@ function queueVisualEmbedding(item) {
     return;
   }
   const sources = visualImageSources(item);
-  if (!sources.length) {
+  const imageUrls = visualImageUrls(item);
+  if (!sources.length && !imageUrls.length) {
     return;
   }
   visualQueuedUrls.add(item.url);
-  visualQueue.push({ galleryUrl: item.url, sources });
+  visualQueue.push({ galleryUrl: item.url, sources, imageUrls });
   runVisualQueue();
 }
 
@@ -110,6 +125,12 @@ function runVisualQueue() {
 }
 
 async function saveVisualEmbedding(task) {
+  const dinov2Saved = await saveDinov2Embedding(task);
+  if (dinov2Saved) {
+    visualSavedUrls.add(task.galleryUrl);
+    scheduleVisualRefresh();
+    return;
+  }
   const vectors = [];
   for (const source of task.sources) {
     try {
@@ -126,12 +147,32 @@ async function saveVisualEmbedding(task) {
     method: "POST",
     body: JSON.stringify({
       gallery_url: task.galleryUrl,
-      version: visualEmbeddingVersion,
+      encoder: visualFallbackEncoder,
+      version: visualFallbackVersion,
       embedding,
     }),
   });
   visualSavedUrls.add(task.galleryUrl);
   scheduleVisualRefresh();
+}
+
+async function saveDinov2Embedding(task) {
+  if (visualDefaultEncoder !== "dinov2" || !task.imageUrls.length) {
+    return false;
+  }
+  try {
+    const payload = await api("/api/visual", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: task.galleryUrl,
+        encoder: "dinov2",
+        image_urls: task.imageUrls,
+      }),
+    });
+    return Boolean(payload.ok && payload.version === visualEmbeddingVersion);
+  } catch (_) {
+    return false;
+  }
 }
 
 async function imageEmbedding(source) {
