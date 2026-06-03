@@ -311,11 +311,20 @@ def parse_gallery_pages(page_html: str) -> tuple[int | None, list[str]]:
     page_count = parse_page_count(page_html)
     block = gdt_block(page_html)
     thumbs: list[str] = []
-    candidates = [match.group(0) for match in SAMPLE_THUMB_RE.finditer(block)]
-    candidates.extend(IMG_RE.findall(block))
-    candidates.extend(CSS_URL_RE.findall(block))
-    for candidate in candidates:
+    for match in SAMPLE_THUMB_RE.finditer(block):
+        if css_url_looks_like_sprite(block, match):
+            continue
+        url = normalize_sample_thumb(match.group(0))
+        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
+            thumbs.append(url)
+    for candidate in IMG_RE.findall(block):
         url = normalize_sample_thumb(candidate)
+        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
+            thumbs.append(url)
+    for match in CSS_URL_RE.finditer(block):
+        if css_url_looks_like_sprite(block, match):
+            continue
+        url = normalize_sample_thumb(match.group(1))
         if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
             thumbs.append(url)
     return page_count, thumbs
@@ -332,11 +341,23 @@ def parse_page_count(page_html: str) -> int | None:
 
 
 def gdt_block(page_html: str) -> str:
-    start_match = GDT_START_RE.search(page_html)
+    return id_block(page_html, "gdt", end_ids=("gdb", "gtb", "cdiv", "chd"))
+
+
+def id_block(page_html: str, element_id: str, end_ids: tuple[str, ...] = ()) -> str:
+    start_re = re.compile(rf"<div[^>]*\bid=[\"']{re.escape(element_id)}[\"']", re.I)
+    start_match = GDT_START_RE.search(page_html) if element_id == "gdt" else start_re.search(page_html)
     if not start_match:
         return ""
     start = start_match.start()
-    end_match = GDT_END_RE.search(page_html, start_match.end())
+    if end_ids:
+        end_re = re.compile(rf"<div[^>]*\bid=[\"'](?:{'|'.join(re.escape(item) for item in end_ids)})[\"']", re.I)
+        end_match = end_re.search(page_html, start_match.end())
+    else:
+        end_match = re.search(r"</div>", page_html[start_match.end() :], re.I)
+        if end_match:
+            end = start_match.end() + end_match.end()
+            return page_html[start:end]
     end = end_match.start() if end_match else len(page_html)
     return page_html[start:end]
 
@@ -397,7 +418,7 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
     rating_match = DETAIL_AVERAGE_RE.search(html.unescape(page_html)) or RATING_RE.search(html.unescape(page_html))
     rating = float(rating_match.group(1)) if rating_match else None
     page_count, sample_thumbs = parse_gallery_pages(page_html)
-    thumb_url = usable_thumb(extract_thumb(page_html)) or (sample_thumbs[0] if sample_thumbs else None)
+    thumb_url = usable_thumb(extract_thumb(id_block(page_html, "gd1"))) or (sample_thumbs[0] if sample_thumbs else None)
     return Gallery(
         url=gallery_url,
         gid=gid,
@@ -500,11 +521,22 @@ def extract_thumb(block: str) -> str | None:
         url = usable_thumb(html.unescape(img))
         if url:
             return url
-    for css_url in CSS_URL_RE.findall(block):
-        url = usable_thumb(html.unescape(css_url))
+    for match in CSS_URL_RE.finditer(block):
+        if css_url_looks_like_sprite(block, match):
+            continue
+        url = usable_thumb(html.unescape(match.group(1)))
         if url:
             return url
     return None
+
+
+def css_url_looks_like_sprite(block: str, match: re.Match[str]) -> bool:
+    """Reject CSS sprite sheets that need background-position cropping to match one gallery."""
+    style_start = block.rfind("style=", 0, match.start())
+    style_end = block.find(">", match.end())
+    style = block[style_start : style_end if style_end >= 0 else min(len(block), match.end() + 160)]
+    after_url = block[match.end() : min(len(block), match.end() + 120)]
+    return bool(re.search(r"(?<![\w.])-\d+(?:\.\d+)?(?:px|em|rem|%)?", style + after_url, re.I))
 
 
 def sample_thumb_host(url: str) -> bool:

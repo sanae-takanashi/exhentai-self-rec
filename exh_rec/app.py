@@ -39,6 +39,7 @@ from .recommender import (
     record_feedback,
     reset_library,
     retrain_model,
+    clear_shared_thumbnail_metadata,
     score_gallery,
     store_galleries,
     store_gallery_samples,
@@ -1446,6 +1447,7 @@ def main() -> None:
     with db.connect() as conn:
         apply_proxy_environment(network_proxy(conn))
         finish_interrupted_fetch_runs(conn)
+        clear_shared_thumbnail_metadata(conn)
         retrain_model(conn)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop = threading.Event()

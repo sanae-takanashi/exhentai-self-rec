@@ -6,6 +6,7 @@ from exh_rec.exhentai import Gallery
 from exh_rec.recommender import (
     LEARNING_RATE,
     clear_feedback,
+    clear_shared_thumbnail_metadata,
     bootstrap_search_text,
     export_preferences,
     feedback_history,
@@ -221,6 +222,51 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn("artist:detail", row["tags_json"])
         self.assertIsNotNone(row["detail_fetched_at"])
         self.assertEqual(row["last_seen_at"], "2026-06-01 12:00:00")
+
+    def test_store_galleries_list_fetch_does_not_overwrite_detail_thumbnail(self):
+        gallery_url = "https://exhentai.org/g/4b/d/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4b", token="d", title="Detail Seen", thumb_url="https://s.exhentai.org/w/detail.webp")],
+            detail_fetched=True,
+        )
+
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4b", token="d", title="List Seen", thumb_url="https://s.exhentai.org/w/sprite.webp")],
+            detail_fetched=False,
+        )
+
+        row = self.conn.execute("SELECT title, thumb_url FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        self.assertEqual(row["title"], "List Seen")
+        self.assertEqual(row["thumb_url"], "https://s.exhentai.org/w/detail.webp")
+
+    def test_clear_shared_thumbnail_metadata_removes_duplicate_cover_urls(self):
+        shared = "https://s.exhentai.org/w/shared-sprite.webp"
+        first_url = "https://exhentai.org/g/4s/a/"
+        second_url = "https://exhentai.org/g/4s/b/"
+        unique_url = "https://exhentai.org/g/4s/c/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=first_url, gid="4s", token="a", title="First", thumb_url=shared),
+                Gallery(url=second_url, gid="4s", token="b", title="Second", thumb_url=shared),
+                Gallery(url=unique_url, gid="4s", token="c", title="Unique", thumb_url="https://s.exhentai.org/w/unique.webp"),
+            ],
+        )
+        store_visual_embedding(self.conn, first_url, [1, 0, 0, 0] * 16)
+
+        cleared = clear_shared_thumbnail_metadata(self.conn)
+
+        self.assertEqual(cleared, 2)
+        rows = {
+            row["url"]: row
+            for row in self.conn.execute("SELECT url, thumb_url, visual_embedding_json FROM galleries")
+        }
+        self.assertIsNone(rows[first_url]["thumb_url"])
+        self.assertIsNone(rows[first_url]["visual_embedding_json"])
+        self.assertIsNone(rows[second_url]["thumb_url"])
+        self.assertEqual(rows[unique_url]["thumb_url"], "https://s.exhentai.org/w/unique.webp")
 
     def test_store_galleries_list_fetch_updates_existing_last_seen(self):
         gallery_url = "https://exhentai.org/g/4c/d/"

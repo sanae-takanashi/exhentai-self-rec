@@ -145,7 +145,10 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 category = COALESCE(excluded.category, galleries.category),
                 uploader = COALESCE(excluded.uploader, galleries.uploader),
                 posted_at = COALESCE(excluded.posted_at, galleries.posted_at),
-                thumb_url = COALESCE(excluded.thumb_url, galleries.thumb_url),
+                thumb_url = CASE
+                    WHEN excluded.detail_fetched_at IS NULL AND galleries.detail_fetched_at IS NOT NULL THEN galleries.thumb_url
+                    ELSE COALESCE(excluded.thumb_url, galleries.thumb_url)
+                END,
                 rating = COALESCE(excluded.rating, galleries.rating),
                 tags_json = CASE
                     WHEN excluded.tags_json != '[]' THEN excluded.tags_json
@@ -197,6 +200,27 @@ def store_gallery_samples(
         """,
         (page_count, json.dumps(samples, ensure_ascii=True), url),
     )
+
+
+def clear_shared_thumbnail_metadata(conn: sqlite3.Connection) -> int:
+    """Clear likely CSS-sprite cover URLs shared by multiple galleries."""
+    cursor = conn.execute(
+        """
+        UPDATE galleries
+        SET thumb_url = NULL,
+            visual_embedding_json = NULL,
+            visual_embedding_version = NULL,
+            visual_embedding_at = NULL
+        WHERE thumb_url IN (
+            SELECT thumb_url
+            FROM galleries
+            WHERE thumb_url LIKE 'https://s.exhentai.org/w/%'
+            GROUP BY thumb_url
+            HAVING COUNT(*) > 1
+        )
+        """
+    )
+    return int(cursor.rowcount or 0)
 
 
 def store_visual_embedding(
