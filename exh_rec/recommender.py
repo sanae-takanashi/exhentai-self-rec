@@ -146,7 +146,10 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
-                last_seen_at = CURRENT_TIMESTAMP
+                last_seen_at = CASE
+                    WHEN ? THEN galleries.last_seen_at
+                    ELSE CURRENT_TIMESTAMP
+                END
             """,
             (
                 gallery.url,
@@ -161,6 +164,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 json.dumps(gallery.tags, ensure_ascii=True),
                 gallery.source_query,
                 None,
+                1 if detail_fetched else 0,
             ),
         )
         if detail_fetched:

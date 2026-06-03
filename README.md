@@ -104,6 +104,8 @@ Use `Enrich` to open detail pages for the best currently recommended galleries t
 
 Fetch and Enrich retrain the learned model after successfully saving new detail pages, so any existing feedback on those galleries starts using the fuller metadata right away.
 
+Detail enrichment preserves the gallery's original listing freshness, so opening metadata for an older gallery does not make it look newly fetched in the recent queue.
+
 Use `Clear` on a rated card to remove that gallery's feedback history, retrain the model, and put it back into the unrated queue.
 
 Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.

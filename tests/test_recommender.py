@@ -196,6 +196,45 @@ class RecommenderTest(unittest.TestCase):
         row = self.conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         self.assertIsNotNone(row["detail_fetched_at"])
 
+    def test_store_galleries_detail_fetch_preserves_existing_last_seen(self):
+        gallery_url = "https://exhentai.org/g/4a/d/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4a", token="d", title="List Seen")],
+        )
+        self.conn.execute("UPDATE galleries SET last_seen_at = '2026-06-01 12:00:00' WHERE url = ?", (gallery_url,))
+
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4a", token="d", title="Detail Seen", tags=["artist:detail"])],
+            detail_fetched=True,
+        )
+
+        row = self.conn.execute(
+            "SELECT title, tags_json, detail_fetched_at, last_seen_at FROM galleries WHERE url = ?",
+            (gallery_url,),
+        ).fetchone()
+        self.assertEqual(row["title"], "Detail Seen")
+        self.assertIn("artist:detail", row["tags_json"])
+        self.assertIsNotNone(row["detail_fetched_at"])
+        self.assertEqual(row["last_seen_at"], "2026-06-01 12:00:00")
+
+    def test_store_galleries_list_fetch_updates_existing_last_seen(self):
+        gallery_url = "https://exhentai.org/g/4c/d/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4c", token="d", title="Old List Seen")],
+        )
+        self.conn.execute("UPDATE galleries SET last_seen_at = '2026-06-01 12:00:00' WHERE url = ?", (gallery_url,))
+
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4c", token="d", title="New List Seen")],
+        )
+
+        row = self.conn.execute("SELECT last_seen_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        self.assertNotEqual(row["last_seen_at"], "2026-06-01 12:00:00")
+
     def test_store_galleries_counts_only_new_urls(self):
         gallery_url = "https://exhentai.org/g/4b/d/"
         first_count = store_galleries(
