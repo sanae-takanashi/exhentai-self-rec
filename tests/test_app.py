@@ -423,6 +423,38 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["model_retrained"])
                 self.assertIn("artist:fetchdetail", learned)
 
+    def test_fetch_and_store_marks_running_run_failed_on_unexpected_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery = Gallery(url="https://exhentai.org/g/36/a/", gid="36", token="a", title="Unexpected Fetch")
+                detailed = Gallery(
+                    url=gallery.url,
+                    gid="36",
+                    token="a",
+                    title="Unexpected Fetch",
+                    tags=["artist:unexpectedfetch"],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[gallery]), patch(
+                    "exh_rec.app.fetch_gallery_detail", return_value=detailed
+                ), patch("exh_rec.app.retrain_model", side_effect=RuntimeError("retrain exploded")):
+                    with self.assertRaises(RuntimeError):
+                        fetch_and_store()
+
+                with db.connect() as conn:
+                    history = fetch_runs(conn, limit=1)
+
+                self.assertEqual(history[0]["status"], "failed")
+                self.assertEqual(history[0]["fetched_count"], 1)
+                self.assertEqual(history[0]["stored_count"], 1)
+                self.assertEqual(history[0]["enriched_count"], 1)
+                self.assertIn("internal: retrain exploded", history[0]["errors"])
+                self.assertIsNotNone(history[0]["finished_at"])
+
     def test_enrich_recommendations_retrains_after_detail_enrichment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
@@ -473,6 +505,29 @@ class AppTest(unittest.TestCase):
 
                 self.assertEqual(result["enriched"], 1)
                 fetch_detail.assert_called_once()
+
+    def test_enrich_recommendations_marks_running_run_failed_on_unexpected_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                with patch(
+                    "exh_rec.app.select_recommendation_detail_candidates",
+                    side_effect=RuntimeError("selection exploded"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        enrich_recommendations(limit=1)
+
+                with db.connect() as conn:
+                    history = fetch_runs(conn, limit=1)
+
+                self.assertEqual(history[0]["status"], "failed")
+                self.assertEqual(history[0]["enriched_count"], 0)
+                self.assertIn("internal: selection exploded", history[0]["errors"])
+                self.assertIsNotNone(history[0]["finished_at"])
 
     def test_save_settings_clear_cookie_removes_access_check(self):
         with tempfile.TemporaryDirectory() as tmpdir:

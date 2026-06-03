@@ -510,6 +510,13 @@ def fetch_and_store(
             "last_fetch": last_fetch,
             **page,
         }
+    except Exception as exc:
+        if run_id is not None:
+            errors.append(f"internal: {exc}")
+            FETCH_STATE["errors"] = list(errors)
+            with db.connect() as conn:
+                finish_running_fetch_run(conn, run_id, "failed", fetched, stored, enriched, errors)
+        raise
     finally:
         if run_id is not None:
             with db.connect() as conn:
@@ -554,6 +561,8 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 ("enrich", "running", json.dumps(["recommendation details"], ensure_ascii=True)),
             )
             run_id = int(cursor.lastrowid)
+
+        with db.connect() as conn:
             candidates = select_recommendation_detail_candidates(
                 conn,
                 limit=requested_limit,
@@ -602,6 +611,13 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             "last_fetch": last_fetch,
             **page,
         }
+    except Exception as exc:
+        if run_id is not None:
+            errors.append(f"internal: {exc}")
+            FETCH_STATE["errors"] = list(errors)
+            with db.connect() as conn:
+                finish_running_fetch_run(conn, run_id, "failed", 0, 0, enriched, errors)
+        raise
     finally:
         if run_id is not None:
             with db.connect() as conn:
@@ -920,6 +936,25 @@ def current_timestamp() -> str:
 def last_fetch_run(conn) -> dict | None:
     runs = fetch_runs(conn, limit=1)
     return runs[0] if runs else None
+
+
+def finish_running_fetch_run(
+    conn,
+    run_id: int,
+    status: str,
+    fetched: int,
+    stored: int,
+    enriched: int,
+    errors: list[str],
+) -> None:
+    conn.execute(
+        """
+        UPDATE fetch_runs
+        SET status = ?, fetched_count = ?, stored_count = ?, enriched_count = ?, errors_json = ?, finished_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'running'
+        """,
+        (status, fetched, stored, enriched, json.dumps(errors, ensure_ascii=True), run_id),
+    )
 
 
 def fetch_runs(conn, limit: int = 10) -> list[dict]:
