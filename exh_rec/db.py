@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS galleries (
     tags_json TEXT NOT NULL DEFAULT '[]',
     source_query TEXT,
     detail_fetched_at TEXT,
+    page_count INTEGER,
+    samples_json TEXT NOT NULL DEFAULT '[]',
+    samples_fetched_at TEXT,
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -98,6 +101,9 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         ensure_column(conn, "feedback", "score", "INTEGER")
         ensure_column(conn, "galleries", "detail_fetched_at", "TEXT")
+        ensure_column(conn, "galleries", "page_count", "INTEGER")
+        ensure_column(conn, "galleries", "samples_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "galleries", "samples_fetched_at", "TEXT")
         ensure_column(conn, "fetch_runs", "enriched_count", "INTEGER NOT NULL DEFAULT 0")
         defaults = {
             "auto_refresh": "1",
@@ -106,6 +112,7 @@ def init_db() -> None:
             "detail_fetch_limit": "8",
             "learned_query_limit": "6",
             "recommend_candidate_limit": "2000",
+            "sample_extra_pages": "2",
         }
         for key, value in defaults.items():
             conn.execute(
@@ -142,4 +149,9 @@ def row_to_dict(row: sqlite3.Row) -> dict:
             data["tags"] = json.loads(data.pop("tags_json") or "[]")
         except json.JSONDecodeError:
             data["tags"] = []
+    if "samples_json" in data:
+        try:
+            data["samples"] = json.loads(data.pop("samples_json") or "[]")
+        except json.JSONDecodeError:
+            data["samples"] = []
     return data

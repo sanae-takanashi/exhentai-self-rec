@@ -6,6 +6,7 @@ const pagesEl = document.querySelector("#pages");
 const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
+const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const minutesEl = document.querySelector("#minutes");
 const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
@@ -50,6 +51,14 @@ function thumbnailSrc(item) {
   return `/thumb?${params.toString()}`;
 }
 
+function sampleSrc(galleryUrl, thumbUrl) {
+  const params = new URLSearchParams({
+    url: thumbUrl,
+    gallery_url: galleryUrl,
+  });
+  return `/thumb?${params.toString()}`;
+}
+
 function bootstrapText(tags) {
   return tags.map((item) => `${item.tag}:${item.weight}`).join("\n");
 }
@@ -62,6 +71,7 @@ async function loadSettings() {
   detailLimitEl.value = settings.detail_fetch_limit;
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
+  sampleExtraPagesEl.value = settings.sample_extra_pages;
   minutesEl.value = settings.refresh_interval_minutes;
   autoRefreshEl.checked = settings.auto_refresh;
 }
@@ -89,6 +99,7 @@ async function saveSettings() {
     detail_fetch_limit: Number(detailLimitEl.value),
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
+    sample_extra_pages: Number(sampleExtraPagesEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
     auto_refresh: autoRefreshEl.checked,
   };
@@ -346,15 +357,27 @@ function renderRecommendations(items, append = false) {
       ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}">History</button>`
       : "";
     const feedbackActions = item.rated ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
+    const samples = item.samples || [];
+    const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
+    const samplesBlock = samples.length
+      ? `
+        <button class="samples-toggle" type="button" data-samples="1" data-url="${escapeAttr(item.url)}">Samples (${samples.length})</button>
+        <div class="samples" hidden>
+          ${samples
+            .map((thumb) => `<img src="${escapeAttr(sampleSrc(item.url, thumb))}" alt="" loading="lazy">`)
+            .join("")}
+        </div>`
+      : "";
     card.innerHTML = `
       <div class="thumb">${thumb}</div>
       <div class="body">
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
-        <div class="meta">${escapeHtml(item.category || "Unknown")} · score ${item.score}</div>
+        <div class="meta">${escapeHtml(item.category || "Unknown")} · score ${item.score}${escapeHtml(pageCount)}</div>
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
         <div class="meta">${escapeHtml(userFeedback)}</div>
         <div class="pillrow">${tags}</div>
+        ${samplesBlock}
         <div class="reason">${reasons}</div>
         <div class="votes">
           <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
@@ -550,6 +573,14 @@ recommendationsEl.addEventListener("click", (event) => {
   const historyButton = event.target.closest("button[data-history]");
   if (historyButton) {
     showFeedbackHistory(historyButton.dataset.url).catch((error) => setStatus(error.message, true));
+    return;
+  }
+  const samplesButton = event.target.closest("button[data-samples]");
+  if (samplesButton) {
+    const grid = samplesButton.nextElementSibling;
+    if (grid && grid.classList.contains("samples")) {
+      grid.hidden = !grid.hidden;
+    }
   }
 });
 

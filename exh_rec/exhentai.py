@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import random
 import re
 import time
 import urllib.error
@@ -27,6 +28,11 @@ DETAIL_CATEGORY_RE = re.compile(r"id=[\"']gdc[\"'][^>]*>.*?class=[\"'][^\"']*\bc
 DETAIL_UPLOADER_RE = re.compile(r"id=[\"']gdn[\"'][^>]*>(.*?)</", re.I | re.S)
 DETAIL_POSTED_RE = re.compile(r"<td[^>]*>\s*Posted:\s*</td>\s*<td[^>]*>(.*?)</td>", re.I | re.S)
 DETAIL_AVERAGE_RE = re.compile(r"Average:\s*([0-9.]+)", re.I)
+DETAIL_LENGTH_RE = re.compile(r"Length:\s*</td>\s*<td[^>]*>\s*([\d,]+)", re.I)
+DETAIL_LENGTH_FALLBACK_RE = re.compile(r"([\d,]+)\s*pages", re.I)
+GDT_START_RE = re.compile(r"<div[^>]*\bid=[\"']gdt[\"']", re.I)
+GDT_END_RE = re.compile(r"<div[^>]*\bid=[\"'](?:gdb|gtb|cdiv|chd)[\"']", re.I)
+SAMPLE_THUMB_RE = re.compile(r"(https?:)?//[a-z0-9.-]*\bs\.exhentai\.org/[^\"')\s]+", re.I)
 
 
 @dataclass
@@ -42,6 +48,8 @@ class Gallery:
     rating: float | None = None
     tags: list[str] = field(default_factory=list)
     source_query: str | None = None
+    page_count: int | None = None
+    sample_thumbs: list[str] = field(default_factory=list)
 
 
 class LinkTitleParser(HTMLParser):
@@ -251,6 +259,83 @@ def fetch_gallery_detail(cookie_header: str, gallery: Gallery, delay: float = 1.
     return merge_gallery(gallery, detail)
 
 
+def fetch_gallery_sample_pages(
+    cookie_header: str,
+    gallery: Gallery,
+    extra_pages: int,
+    delay: float = 1.0,
+) -> list[str]:
+    """Fetch up to ``extra_pages`` additional image-list pages and return their thumbnails.
+
+    Only used when a gallery spans more list pages than the detail page (``p=0``)
+    already covers, so samples can be drawn from across the whole gallery.
+    """
+    if extra_pages <= 0 or not gallery.page_count or not gallery.sample_thumbs:
+        return []
+    per_page = len(gallery.sample_thumbs)
+    if per_page <= 0:
+        return []
+    total_pages = (gallery.page_count + per_page - 1) // per_page
+    candidate_pages = list(range(1, total_pages))
+    if not candidate_pages:
+        return []
+    chosen = sorted(random.sample(candidate_pages, min(extra_pages, len(candidate_pages))))
+    thumbs: list[str] = []
+    for page in chosen:
+        if delay:
+            time.sleep(delay)
+        page_html = fetch_page(cookie_header, sample_page_url(gallery.url, page))
+        _, page_thumbs = parse_gallery_pages(page_html)
+        thumbs.extend(page_thumbs)
+    return thumbs
+
+
+def sample_page_url(gallery_url: str, page: int) -> str:
+    if page <= 0:
+        return gallery_url
+    separator = "&" if "?" in gallery_url else "?"
+    return f"{gallery_url}{separator}p={page}"
+
+
+def parse_gallery_pages(page_html: str) -> tuple[int | None, list[str]]:
+    """Extract the page count and per-page thumbnail URLs from a gallery image-list page."""
+    page_count = parse_page_count(page_html)
+    block = gdt_block(page_html)
+    thumbs: list[str] = []
+    for match in SAMPLE_THUMB_RE.finditer(block):
+        url = normalize_sample_thumb(match.group(0))
+        if url and url not in thumbs:
+            thumbs.append(url)
+    return page_count, thumbs
+
+
+def parse_page_count(page_html: str) -> int | None:
+    match = DETAIL_LENGTH_RE.search(page_html) or DETAIL_LENGTH_FALLBACK_RE.search(page_html)
+    if not match:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def gdt_block(page_html: str) -> str:
+    start_match = GDT_START_RE.search(page_html)
+    if not start_match:
+        return ""
+    start = start_match.start()
+    end_match = GDT_END_RE.search(page_html, start_match.end())
+    end = end_match.start() if end_match else len(page_html)
+    return page_html[start:end]
+
+
+def normalize_sample_thumb(url: str) -> str:
+    url = html.unescape(url).strip()
+    if url.startswith("//"):
+        url = f"https:{url}"
+    return url
+
+
 def parse_gallery_list(page_html: str, source_query: str | None = None) -> list[Gallery]:
     parser = LinkTitleParser()
     parser.feed(page_html)
@@ -299,6 +384,7 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
     title = strip_html_match(DETAIL_TITLE_RE.search(page_html))
     rating_match = DETAIL_AVERAGE_RE.search(html.unescape(page_html)) or RATING_RE.search(html.unescape(page_html))
     rating = float(rating_match.group(1)) if rating_match else None
+    page_count, sample_thumbs = parse_gallery_pages(page_html)
     return Gallery(
         url=gallery_url,
         gid=gid,
@@ -310,6 +396,8 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
         thumb_url=extract_thumb(page_html),
         rating=rating,
         tags=extract_tags(page_html),
+        page_count=page_count,
+        sample_thumbs=sample_thumbs,
     )
 
 
@@ -330,6 +418,8 @@ def merge_gallery(base: Gallery, detail: Gallery) -> Gallery:
         rating=detail.rating if detail.rating is not None else base.rating,
         tags=tags,
         source_query=base.source_query,
+        page_count=detail.page_count if detail.page_count is not None else base.page_count,
+        sample_thumbs=detail.sample_thumbs or base.sample_thumbs,
     )
 
 

@@ -7,6 +7,8 @@ from exh_rec.exhentai import (
     normalize_cookie_header,
     parse_gallery_detail,
     parse_gallery_list,
+    parse_gallery_pages,
+    sample_page_url,
     valid_cookie_header,
 )
 
@@ -129,6 +131,51 @@ class ParserTest(unittest.TestCase):
         self.assertIn("artist:taglist artist", gallery.tags)
         self.assertIn("female:big breasts", gallery.tags)
         self.assertIn("parody:space title", gallery.tags)
+
+    def test_parse_gallery_pages_reads_length_and_thumbnails(self):
+        html = """
+        <html>
+          <div id="gd1"><img src="https://t.example/cover.jpg"></div>
+          <table><tr><td class="gdt1">Length:</td><td class="gdt2">1,312 pages</td></tr></table>
+          <div id="gdt">
+            <div class="gdtl"><a href="https://exhentai.org/s/aa/1-1"><img src="https://s.exhentai.org/t/aa/1.jpg"></a></div>
+            <div class="gdtl"><a href="https://exhentai.org/s/bb/1-2"><img src="//s.exhentai.org/t/bb/2.jpg"></a></div>
+          </div>
+          <div id="gdb"><a href="https://exhentai.org/g/1/a/?p=1"><img src="https://s.exhentai.org/img/should_not_count.jpg"></a></div>
+        </html>
+        """
+
+        page_count, thumbs = parse_gallery_pages(html)
+
+        self.assertEqual(page_count, 1312)
+        self.assertEqual(
+            thumbs,
+            ["https://s.exhentai.org/t/aa/1.jpg", "https://s.exhentai.org/t/bb/2.jpg"],
+        )
+
+    def test_parse_gallery_detail_populates_page_count_and_samples(self):
+        html = """
+        <html>
+          <h1 id="gn">Sampled Gallery</h1>
+          <table><tr><td>Length:</td><td>42 pages</td></tr></table>
+          <div id="gdt">
+            <div class="gdtl"><a href="https://exhentai.org/s/aa/9-1"><img src="https://s.exhentai.org/t/aa/9-1.jpg"></a></div>
+          </div>
+          <div id="gdb">nav</div>
+        </html>
+        """
+
+        gallery = parse_gallery_detail(html, "https://exhentai.org/g/9/abc/")
+
+        self.assertEqual(gallery.page_count, 42)
+        self.assertEqual(gallery.sample_thumbs, ["https://s.exhentai.org/t/aa/9-1.jpg"])
+
+    def test_sample_page_url_appends_page_param(self):
+        self.assertEqual(
+            sample_page_url("https://exhentai.org/g/1/abc/", 3),
+            "https://exhentai.org/g/1/abc/?p=3",
+        )
+        self.assertEqual(sample_page_url("https://exhentai.org/g/1/abc/", 0), "https://exhentai.org/g/1/abc/")
 
     def test_merge_gallery_keeps_source_query_and_combines_tags(self):
         base = parse_gallery_list(

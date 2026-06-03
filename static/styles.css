@@ -257,6 +257,31 @@ button.primary,
   overflow-wrap: anywhere;
 }
 
+.samples-toggle {
+  align-self: flex-start;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.samples {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+  gap: 6px;
+}
+
+.samples[hidden] {
+  display: none;
+}
+
+.samples img {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: #0a0b0d;
+}
+
 .votes {
   display: flex;
   gap: 8px;

@@ -174,6 +174,24 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
     return count
 
 
+def store_gallery_samples(
+    conn: sqlite3.Connection,
+    url: str,
+    page_count: int | None,
+    samples: list[str],
+) -> None:
+    conn.execute(
+        """
+        UPDATE galleries
+        SET page_count = COALESCE(?, page_count),
+            samples_json = ?,
+            samples_fetched_at = CURRENT_TIMESTAMP
+        WHERE url = ?
+        """,
+        (page_count, json.dumps(samples, ensure_ascii=True), url),
+    )
+
+
 def gallery_features(gallery: dict) -> list[str]:
     features: list[str] = []
     category = (gallery.get("category") or "").strip().lower()
@@ -584,6 +602,7 @@ def recommend_page(
     for idx, row in enumerate(rows):
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
         score, reasons = score_gallery(gallery, bootstrap, weights)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = gallery.get("feedback_id") is not None

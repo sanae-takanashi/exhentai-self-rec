@@ -15,6 +15,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Online learning from thumbs up/down or 1-5 scores using title tokens, categories, uploaders, and parsed tags, with namespace-aware weighting for stronger identity tags.
 - Repeated same-direction feedback on the same gallery adds a small capped confidence boost, while a later opposite vote resets that direction.
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
+- Random page-sample previews per gallery so you can judge content beyond the cover. Each enriched gallery stores `5 + (pages // 100)` random page thumbnails (proxied via `/thumb`), revealed by a per-card `Samples` toggle. The first list page comes free from the detail fetch; the `Sample pages` setting (`sample_extra_pages`, default 2) caps how many extra list pages are fetched to widen the sample spread for large galleries. Accounts using ExHentai's large-thumbnail preference get clean per-page samples; the compact sprite layout yields combined sprite strips.
 - Fetch and enrichment runs retrain the model whenever they add detail metadata, so feedback on an already-rated gallery can immediately learn from the fuller tag set.
 - Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
 - List/detail parsing reads thumbnails from normal image tags and inline CSS background URLs.

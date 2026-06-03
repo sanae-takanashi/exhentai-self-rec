@@ -17,6 +17,7 @@ from exh_rec.app import (
     build_queries,
     build_query_plan,
     cached_thumbnail,
+    collect_gallery_samples,
     enrich_feedback_gallery,
     enrich_recommendations,
     ensure_gallery_exists,
@@ -35,6 +36,7 @@ from exh_rec.app import (
     recommend_candidate_limit,
     recommendation_payload,
     refresh_summary,
+    sample_count_for,
     save_settings,
     select_detail_candidates,
     select_recommendation_detail_candidates,
@@ -520,6 +522,78 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
                 self.assertIsNotNone(row["detail_fetched_at"])
                 self.assertIn("artist:detailfav", learned)
+
+    def test_sample_count_for_uses_five_plus_one_per_hundred_pages(self):
+        self.assertEqual(sample_count_for(None), 5)
+        self.assertEqual(sample_count_for(0), 5)
+        self.assertEqual(sample_count_for(40), 5)
+        self.assertEqual(sample_count_for(99), 5)
+        self.assertEqual(sample_count_for(150), 6)
+        self.assertEqual(sample_count_for(320), 8)
+
+    def test_collect_gallery_samples_uses_first_page_without_extra_fetch(self):
+        detailed = Gallery(
+            url="https://exhentai.org/g/40/a/",
+            gid="40",
+            token="a",
+            title="Small Gallery",
+            page_count=30,
+            sample_thumbs=[f"https://s.exhentai.org/t/{i}.jpg" for i in range(30)],
+        )
+        with patch("exh_rec.app.fetch_gallery_sample_pages") as extra:
+            samples = collect_gallery_samples("cookie", detailed, extra_pages=2)
+        extra.assert_not_called()
+        self.assertEqual(len(samples), 5)
+        self.assertTrue(set(samples).issubset(set(detailed.sample_thumbs)))
+
+    def test_collect_gallery_samples_fetches_extra_pages_for_large_galleries(self):
+        detailed = Gallery(
+            url="https://exhentai.org/g/41/a/",
+            gid="41",
+            token="a",
+            title="Large Gallery",
+            page_count=320,
+            sample_thumbs=["https://s.exhentai.org/t/0.jpg", "https://s.exhentai.org/t/1.jpg", "https://s.exhentai.org/t/2.jpg"],
+        )
+        extra_thumbs = [f"https://s.exhentai.org/t/extra-{i}.jpg" for i in range(20)]
+        with patch("exh_rec.app.fetch_gallery_sample_pages", return_value=extra_thumbs) as extra:
+            samples = collect_gallery_samples("cookie", detailed, extra_pages=2)
+        extra.assert_called_once()
+        self.assertEqual(len(samples), 8)
+        pool = set(detailed.sample_thumbs) | set(extra_thumbs)
+        self.assertTrue(set(samples).issubset(pool))
+
+    def test_fetch_and_store_stores_gallery_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/42/a/"
+                gallery = Gallery(url=gallery_url, gid="42", token="a", title="Sampled")
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="42",
+                    token="a",
+                    title="Sampled",
+                    tags=["artist:sampled"],
+                    page_count=40,
+                    sample_thumbs=[f"https://s.exhentai.org/t/{i}.jpg" for i in range(40)],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[gallery]), patch(
+                    "exh_rec.app.fetch_gallery_detail", return_value=detailed
+                ), patch("exh_rec.app.fetch_gallery_sample_pages") as extra:
+                    fetch_and_store()
+
+                extra.assert_not_called()
+                with db.connect() as conn:
+                    payload = recommendation_payload(conn, include_rated=True)
+                item = next(entry for entry in payload["items"] if entry["url"] == gallery_url)
+                self.assertEqual(item["page_count"], 40)
+                self.assertEqual(len(item["samples"]), 5)
+                self.assertTrue(set(item["samples"]).issubset(set(detailed.sample_thumbs)))
 
     def test_fetch_and_store_retrains_after_detail_enrichment(self):
         with tempfile.TemporaryDirectory() as tmpdir:

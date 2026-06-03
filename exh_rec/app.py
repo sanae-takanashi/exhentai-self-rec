@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import threading
 import time
 import urllib.error
@@ -15,7 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .exhentai import Gallery, check_access, fetch_galleries, fetch_gallery_detail, normalize_cookie_header, valid_cookie_header
+from .exhentai import (
+    Gallery,
+    check_access,
+    fetch_galleries,
+    fetch_gallery_detail,
+    fetch_gallery_sample_pages,
+    normalize_cookie_header,
+    valid_cookie_header,
+)
 from .recommender import (
     clear_feedback,
     export_preferences,
@@ -30,6 +39,7 @@ from .recommender import (
     retrain_model,
     score_gallery,
     store_galleries,
+    store_gallery_samples,
     upsert_bootstrap_tags,
 )
 
@@ -286,6 +296,7 @@ def get_settings() -> dict:
             "detail_fetch_limit": detail_fetch_limit(conn),
             "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
+            "sample_extra_pages": sample_extra_pages(conn),
             "last_access_check": get_access_check(conn),
             "bootstrap_tags": get_bootstrap_tags(conn),
         }
@@ -350,6 +361,10 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "recommend_candidate_limit" in payload:
             limit = bounded_int(payload["recommend_candidate_limit"], default=2000, lower=100, upper=10000)
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
+        if "sample_extra_pages" in payload:
+            extra = bounded_int(payload["sample_extra_pages"], default=2, lower=0, upper=10)
+            db.set_setting(conn, "sample_extra_pages", str(extra))
+            refresh_relevant_change = True
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
             refresh_relevant_change = True
@@ -453,6 +468,7 @@ def fetch_and_store(
         pages = fetch_pages(conn)
         detail_limit = detail_fetch_limit(conn)
         learned_limit = learned_query_limit(conn)
+        extra_pages = sample_extra_pages(conn)
         tags = get_bootstrap_tags(conn)
         learned_tags = learned_query_tags(conn, learned_limit)
     if not cookie:
@@ -507,8 +523,10 @@ def fetch_and_store(
         for gallery in selected_for_detail:
             try:
                 detailed = fetch_gallery_detail(cookie, gallery)
+                samples = collect_gallery_samples(cookie, detailed, extra_pages)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
+                    store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
                 FETCH_STATE.update({"enriched": enriched})
             except Exception as exc:
@@ -575,6 +593,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         detail_limit = detail_fetch_limit(conn)
+        extra_pages = sample_extra_pages(conn)
     if not cookie:
         FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
@@ -615,8 +634,10 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         for gallery in candidates:
             try:
                 detailed = fetch_gallery_detail(cookie, gallery)
+                samples = collect_gallery_samples(cookie, detailed, extra_pages)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
+                    store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
                 FETCH_STATE.update({"enriched": enriched})
             except Exception as exc:
@@ -670,9 +691,35 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         FETCH_LOCK.release()
 
 
+SAMPLE_BASE_COUNT = 5
+
+
+def sample_count_for(page_count: int | None) -> int:
+    return SAMPLE_BASE_COUNT + (page_count or 0) // 100
+
+
+def collect_gallery_samples(
+    cookie: str,
+    detailed: Gallery,
+    extra_pages: int,
+    delay: float = 1.0,
+) -> list[str]:
+    """Pick a random spread of page thumbnails for ``detailed`` (5 + pages//100)."""
+    pool = list(dict.fromkeys(detailed.sample_thumbs))
+    count = sample_count_for(detailed.page_count)
+    if len(pool) < count and extra_pages > 0:
+        for thumb in fetch_gallery_sample_pages(cookie, detailed, extra_pages, delay=delay):
+            if thumb not in pool:
+                pool.append(thumb)
+    if len(pool) <= count:
+        return pool
+    return random.sample(pool, count)
+
+
 def enrich_feedback_gallery(gallery_url: str) -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
+        extra_pages = sample_extra_pages(conn)
         row = conn.execute("SELECT * FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         if not row:
             return {"status": "skipped", "reason": "gallery not found"}
@@ -685,11 +732,13 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
 
     try:
         detailed = fetch_gallery_detail(cookie, gallery, delay=0)
+        samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0)
     except Exception as exc:
         return {"status": "failed", "reason": str(exc)}
 
     with db.connect() as conn:
         store_galleries(conn, [detailed], detail_fetched=True)
+        store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
         retrain_model(conn)
     return {"status": "success", "gallery_url": gallery_url}
 
@@ -920,6 +969,10 @@ def refresh_interval_minutes(conn) -> int:
 
 def recommend_candidate_limit(conn) -> int:
     return bounded_int(db.get_setting(conn, "recommend_candidate_limit", "2000"), default=2000, lower=100, upper=10000)
+
+
+def sample_extra_pages(conn) -> int:
+    return bounded_int(db.get_setting(conn, "sample_extra_pages", "2"), default=2, lower=0, upper=10)
 
 
 def recommendation_payload(
