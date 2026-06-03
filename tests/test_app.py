@@ -30,6 +30,7 @@ from exh_rec.app import (
     get_access_check,
     get_settings,
     import_preferences_payload,
+    is_allowed_thumbnail_url,
     is_remote_search_preference,
     missing_common_cookie_keys,
     parse_bool,
@@ -245,6 +246,10 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status.value, 400)
         self.assertEqual(ctx.exception.message, "unsupported thumbnail host")
+
+    def test_thumbnail_proxy_allows_hath_sample_hosts(self):
+        self.assertTrue(is_allowed_thumbnail_url("https://abc123.hath.network/c2/a/1.webp"))
+        self.assertFalse(is_allowed_thumbnail_url("https://hath.network/c2/a/1.webp"))
 
     def test_save_visual_embedding_payload_stores_gallery_vector(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -533,7 +538,13 @@ class AppTest(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(db.SCHEMA)
-        enriched = Gallery(url="https://exhentai.org/g/1/a/", gid="1", token="a", title="Enriched")
+        enriched = Gallery(
+            url="https://exhentai.org/g/1/a/",
+            gid="1",
+            token="a",
+            title="Enriched",
+            thumb_url="https://s.exhentai.org/t/1.jpg",
+        )
         plain = Gallery(url="https://exhentai.org/g/2/b/", gid="2", token="b", title="Plain")
         second_plain = Gallery(url="https://exhentai.org/g/3/c/", gid="3", token="c", title="Second Plain")
         store_galleries(conn, [enriched], detail_fetched=True)
@@ -542,6 +553,20 @@ class AppTest(unittest.TestCase):
         selected = select_detail_candidates(conn, [enriched, plain, second_plain], remaining_limit=1)
 
         self.assertEqual([gallery.url for gallery in selected], [plain.url])
+        conn.close()
+
+    def test_select_detail_candidates_retries_enriched_gallery_missing_images(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        missing_images = Gallery(url="https://exhentai.org/g/1m/a/", gid="1m", token="a", title="Missing Images")
+        plain = Gallery(url="https://exhentai.org/g/2m/b/", gid="2m", token="b", title="Plain")
+        store_galleries(conn, [missing_images], detail_fetched=True)
+        store_galleries(conn, [plain])
+
+        selected = select_detail_candidates(conn, [missing_images, plain], remaining_limit=1)
+
+        self.assertEqual([gallery.url for gallery in selected], [missing_images.url])
         conn.close()
 
     def test_select_detail_candidates_prefers_current_model_match(self):
@@ -583,6 +608,7 @@ class AppTest(unittest.TestCase):
             tags=["artist:favored"],
         )
         plain = Gallery(url="https://exhentai.org/g/8/c/", gid="8", token="c", title="Plain Candidate")
+        enriched.thumb_url = "https://s.exhentai.org/t/6.jpg"
         store_galleries(conn, [enriched], detail_fetched=True)
         store_galleries(conn, [plain, matched])
         upsert_bootstrap_tags(conn, [("artist:favored", 2.0)])

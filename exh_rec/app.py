@@ -834,7 +834,7 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         if not row:
             return {"status": "skipped", "reason": "gallery not found"}
         item = db.row_to_dict(row)
-        if item.get("detail_fetched_at"):
+        if item.get("detail_fetched_at") and has_visible_images(item):
             return {"status": "skipped", "reason": "already enriched"}
         if not cookie:
             return {"status": "skipped", "reason": "no cookie"}
@@ -870,8 +870,8 @@ def select_detail_candidates(conn, galleries, remaining_limit: int) -> list:
         if gallery.url in seen:
             continue
         seen.add(gallery.url)
-        row = conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
-        if row and row["detail_fetched_at"]:
+        row = conn.execute("SELECT detail_fetched_at, thumb_url, samples_json FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
+        if row and row["detail_fetched_at"] and has_visible_images(dict(row)):
             continue
         score, _ = score_gallery(
             {
@@ -906,12 +906,24 @@ def select_recommendation_detail_candidates(
     )
     candidates: list[Gallery] = []
     for item in page["items"]:
-        if item.get("detail_fetched_at"):
+        if item.get("detail_fetched_at") and has_visible_images(item):
             continue
         candidates.append(gallery_from_item(item))
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def has_visible_images(item: dict) -> bool:
+    if item.get("thumb_url"):
+        return True
+    samples = item.get("samples")
+    if samples is None and "samples_json" in item:
+        try:
+            samples = json.loads(item.get("samples_json") or "[]")
+        except json.JSONDecodeError:
+            samples = []
+    return bool(samples)
 
 
 def gallery_from_item(item: dict) -> Gallery:
@@ -1168,7 +1180,7 @@ def normalize_thumbnail_url(thumb_url: str) -> str:
 def is_allowed_thumbnail_url(thumb_url: str) -> bool:
     parsed = urllib.parse.urlparse(thumb_url)
     hostname = (parsed.hostname or "").lower()
-    return parsed.scheme == "https" and hostname in ALLOWED_THUMB_HOSTS
+    return parsed.scheme == "https" and (hostname in ALLOWED_THUMB_HOSTS or hostname.endswith(".hath.network"))
 
 
 def thumbnail_cache_paths(thumb_url: str) -> tuple[Path, Path]:

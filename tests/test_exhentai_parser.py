@@ -140,6 +140,7 @@ class ParserTest(unittest.TestCase):
           <div id="gdt">
             <div class="gdtl"><a href="https://exhentai.org/s/aa/1-1"><img src="https://s.exhentai.org/t/aa/1.jpg"></a></div>
             <div class="gdtl"><a href="https://exhentai.org/s/bb/1-2"><img src="//s.exhentai.org/t/bb/2.jpg"></a></div>
+            <div class="gdtl"><a href="https://exhentai.org/s/cc/1-3"><div style="background:transparent url(https://abc123.hath.network/c2/a/1.webp) 0 0 no-repeat"></div></a></div>
           </div>
           <div id="gdb"><a href="https://exhentai.org/g/1/a/?p=1"><img src="https://s.exhentai.org/img/should_not_count.jpg"></a></div>
         </html>
@@ -150,8 +151,25 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(page_count, 1312)
         self.assertEqual(
             thumbs,
-            ["https://s.exhentai.org/t/aa/1.jpg", "https://s.exhentai.org/t/bb/2.jpg"],
+            [
+                "https://s.exhentai.org/t/aa/1.jpg",
+                "https://s.exhentai.org/t/bb/2.jpg",
+                "https://abc123.hath.network/c2/a/1.webp",
+            ],
         )
+
+    def test_parse_gallery_detail_reads_css_cover_before_placeholder_images(self):
+        html = """
+        <html>
+          <div id="gd1"><div style="width:250px; height:343px; background:transparent url(https://s.exhentai.org/w/02/428/84948-cover.webp) 0 0 no-repeat"></div></div>
+          <img src="https://exhentai.org/img/blank.gif">
+          <h1 id="gn">CSS Cover Gallery</h1>
+        </html>
+        """
+
+        gallery = parse_gallery_detail(html, "https://exhentai.org/g/9/abc/")
+
+        self.assertEqual(gallery.thumb_url, "https://s.exhentai.org/w/02/428/84948-cover.webp")
 
     def test_parse_gallery_detail_populates_page_count_and_samples(self):
         html = """

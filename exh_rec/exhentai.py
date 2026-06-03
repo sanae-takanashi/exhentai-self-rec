@@ -32,7 +32,7 @@ DETAIL_LENGTH_RE = re.compile(r"Length:\s*</td>\s*<td[^>]*>\s*([\d,]+)", re.I)
 DETAIL_LENGTH_FALLBACK_RE = re.compile(r"([\d,]+)\s*pages", re.I)
 GDT_START_RE = re.compile(r"<div[^>]*\bid=[\"']gdt[\"']", re.I)
 GDT_END_RE = re.compile(r"<div[^>]*\bid=[\"'](?:gdb|gtb|cdiv|chd)[\"']", re.I)
-SAMPLE_THUMB_RE = re.compile(r"(https?:)?//[a-z0-9.-]*\bs\.exhentai\.org/[^\"')\s]+", re.I)
+SAMPLE_THUMB_RE = re.compile(r"(https?:)?//(?:[a-z0-9.-]*\bs\.exhentai\.org|[a-z0-9.-]+\.hath\.network)/[^\"')\s]+", re.I)
 
 
 @dataclass
@@ -302,9 +302,12 @@ def parse_gallery_pages(page_html: str) -> tuple[int | None, list[str]]:
     page_count = parse_page_count(page_html)
     block = gdt_block(page_html)
     thumbs: list[str] = []
-    for match in SAMPLE_THUMB_RE.finditer(block):
-        url = normalize_sample_thumb(match.group(0))
-        if url and url not in thumbs:
+    candidates = [match.group(0) for match in SAMPLE_THUMB_RE.finditer(block)]
+    candidates.extend(IMG_RE.findall(block))
+    candidates.extend(CSS_URL_RE.findall(block))
+    for candidate in candidates:
+        url = normalize_sample_thumb(candidate)
+        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
             thumbs.append(url)
     return page_count, thumbs
 
@@ -477,19 +480,28 @@ def usable_thumb(url: str | None) -> str | None:
     """Drop placeholder cover images (e.g. the lazy-load ``blank.gif``) so callers fall back to a real page image."""
     if not url:
         return None
-    if "blank.gif" in url.lower():
+    lower = url.lower()
+    if "blank.gif" in lower or lower.endswith("/mr.gif") or lower.endswith("/roller.gif"):
         return None
     return url
 
 
 def extract_thumb(block: str) -> str | None:
-    img = IMG_RE.search(block)
-    if img:
-        return html.unescape(img.group(1))
-    css_url = CSS_URL_RE.search(block)
-    if css_url:
-        return html.unescape(css_url.group(1))
+    for img in IMG_RE.findall(block):
+        url = usable_thumb(html.unescape(img))
+        if url:
+            return url
+    for css_url in CSS_URL_RE.findall(block):
+        url = usable_thumb(html.unescape(css_url))
+        if url:
+            return url
     return None
+
+
+def sample_thumb_host(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    return hostname == "s.exhentai.org" or hostname.endswith(".hath.network")
 
 
 def strip_html_match(match: re.Match[str] | None) -> str | None:
