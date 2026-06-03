@@ -41,6 +41,7 @@ from .recommender import (
     score_gallery,
     store_galleries,
     store_gallery_samples,
+    store_visual_embedding,
     upsert_bootstrap_tags,
 )
 
@@ -221,6 +222,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "data must be an exported preferences object")
                 self.send_json(import_preferences_payload(data, replace=replace))
+            elif path == "/api/visual":
+                payload = self.read_json()
+                self.send_json(save_visual_embedding_payload(payload))
             elif path == "/api/reset":
                 self.read_json()
                 self.send_json(reset_library_payload())
@@ -402,6 +406,20 @@ def import_preferences_payload(data: dict, replace: bool = False) -> dict:
             return {"ok": True, "imported": result, "model": model_snapshot(conn)}
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+
+def save_visual_embedding_payload(payload: dict[str, Any]) -> dict:
+    gallery_url = str(payload.get("gallery_url") or "").strip()
+    if not gallery_url:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+    embedding = payload.get("embedding")
+    version = str(payload.get("version") or "").strip() or "unknown"
+    try:
+        with db.connect() as conn:
+            store_visual_embedding(conn, gallery_url, embedding, version=version)
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    return {"ok": True, "gallery_url": gallery_url, "visual_ready": True}
 
 
 def reset_library_payload() -> dict:

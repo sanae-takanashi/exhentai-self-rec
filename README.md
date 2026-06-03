@@ -13,6 +13,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Bootstrap preferences with positive/negative weights across tags, title text, category, and uploader metadata.
 - SQLite storage for galleries, settings, votes, and learned feature weights.
 - Online learning from thumbs up/down or 1-5 scores using title tokens, categories, uploaders, and parsed tags, with namespace-aware weighting for stronger identity tags.
+- Visual learning from cover thumbnails and stored random page samples. The browser decodes proxied images into compact `8x8` RGB embeddings, saves one aggregate vector per gallery, and the ranker scores candidates by similarity to your liked-minus-disliked visual preference direction.
 - Repeated same-direction feedback on the same gallery adds a small capped confidence boost, while a later opposite vote resets that direction.
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
 - Random page-sample previews per gallery so you can judge content beyond the cover. Each enriched gallery stores `5 + (pages // 100)` random page thumbnails (proxied via `/thumb`), revealed by a per-card `Samples` toggle. The first list page comes free from the detail fetch; the `Sample pages` setting (`sample_extra_pages`, default 2) caps how many extra list pages are fetched to widen the sample spread for large galleries. Accounts using ExHentai's large-thumbnail preference get clean per-page samples; the compact sprite layout yields combined sprite strips.
@@ -124,6 +125,8 @@ Use `Clear` on a rated card to remove that gallery's feedback history, retrain t
 Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.
 
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
+
+Visual embeddings are generated in the browser from same-origin `/thumb` images, so no heavyweight image model is required on the server. A gallery's vector averages its cover thumbnail with up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
 
 If you rate the same gallery more than once in the same direction, the latest signal gets a small capped confidence boost during retraining. A later opposite vote changes the learned direction instead of preserving the older streak.
 

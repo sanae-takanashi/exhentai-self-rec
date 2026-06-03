@@ -39,6 +39,7 @@ from exh_rec.app import (
     refresh_summary,
     reset_library_payload,
     sample_count_for,
+    save_visual_embedding_payload,
     save_settings,
     select_detail_candidates,
     select_recommendation_detail_candidates,
@@ -242,6 +243,45 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status.value, 400)
         self.assertEqual(ctx.exception.message, "unsupported thumbnail host")
+
+    def test_save_visual_embedding_payload_stores_gallery_vector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/40/a/"
+                with db.connect() as conn:
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="40", token="a", title="Visual Save")])
+
+                result = save_visual_embedding_payload(
+                    {
+                        "gallery_url": gallery_url,
+                        "version": "canvas-rgb-8x8-v1",
+                        "embedding": [1, 0, 0, 0] * 16,
+                    }
+                )
+
+                with db.connect() as conn:
+                    row = conn.execute(
+                        "SELECT visual_embedding_json, visual_embedding_version, visual_embedding_at FROM galleries WHERE url = ?",
+                        (gallery_url,),
+                    ).fetchone()
+
+        self.assertTrue(result["visual_ready"])
+        self.assertIsNotNone(row["visual_embedding_json"])
+        self.assertEqual(row["visual_embedding_version"], "canvas-rgb-8x8-v1")
+        self.assertIsNotNone(row["visual_embedding_at"])
+
+    def test_save_visual_embedding_payload_rejects_bad_embedding(self):
+        with self.assertRaises(ApiError) as ctx:
+            save_visual_embedding_payload(
+                {
+                    "gallery_url": "https://exhentai.org/g/missing/a/",
+                    "embedding": ["bad"],
+                }
+            )
+
+        self.assertEqual(ctx.exception.status.value, 400)
 
     def test_parse_feedback_request_validates_bad_numeric_values(self):
         self.assertEqual(parse_feedback_request({"vote": "1"}), (1, None))

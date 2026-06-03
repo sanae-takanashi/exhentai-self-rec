@@ -18,6 +18,10 @@ FEEDBACK_CONFIDENCE_STEP = 0.15
 MAX_FEEDBACK_CONFIDENCE_BOOST = 0.45
 MAX_FEEDBACK_CONFIDENCE_HISTORY = 5
 DIVERSITY_PENALTY = 0.45
+VISUAL_EMBEDDING_VERSION = "canvas-rgb-8x8-v1"
+VISUAL_SCORE_SCALE = 1.35
+VISUAL_MIN_DIMS = 16
+VISUAL_MAX_DIMS = 512
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -190,6 +194,63 @@ def store_gallery_samples(
         """,
         (page_count, json.dumps(samples, ensure_ascii=True), url),
     )
+
+
+def store_visual_embedding(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    embedding: list[object],
+    version: str = VISUAL_EMBEDDING_VERSION,
+) -> None:
+    normalized = normalize_visual_embedding(embedding)
+    exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+    if not exists:
+        raise ValueError("Gallery not found")
+    conn.execute(
+        """
+        UPDATE galleries
+        SET visual_embedding_json = ?,
+            visual_embedding_version = ?,
+            visual_embedding_at = CURRENT_TIMESTAMP
+        WHERE url = ?
+        """,
+        (json.dumps(normalized, ensure_ascii=True), version, gallery_url),
+    )
+
+
+def normalize_visual_embedding(embedding: list[object]) -> list[float]:
+    if not isinstance(embedding, list):
+        raise ValueError("embedding must be a list")
+    if len(embedding) < VISUAL_MIN_DIMS or len(embedding) > VISUAL_MAX_DIMS:
+        raise ValueError(f"embedding must have {VISUAL_MIN_DIMS} to {VISUAL_MAX_DIMS} values")
+    values: list[float] = []
+    for value in embedding:
+        parsed = optional_float(value)
+        if parsed is None:
+            raise ValueError("embedding values must be finite numbers")
+        values.append(parsed)
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 0:
+        raise ValueError("embedding must not be all zero")
+    return [round(value / norm, 6) for value in values]
+
+
+def parse_visual_embedding(raw: object) -> list[float] | None:
+    if not raw:
+        return None
+    if isinstance(raw, list):
+        values = raw
+    else:
+        try:
+            values = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(values, list):
+        return None
+    try:
+        return normalize_visual_embedding(values)
+    except ValueError:
+        return None
 
 
 def gallery_features(gallery: dict) -> list[str]:
@@ -489,6 +550,58 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         apply_feedback_features(conn, gallery, signal)
 
 
+def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
+    rows = conn.execute(
+        """
+        SELECT g.url, g.visual_embedding_json, f.id AS feedback_id, f.vote AS feedback_signal
+        FROM feedback f
+        JOIN galleries g ON g.url = f.gallery_url
+        JOIN (
+            SELECT gallery_url, MAX(id) AS latest_id
+            FROM feedback
+            GROUP BY gallery_url
+        ) latest ON latest.gallery_url = f.gallery_url AND latest.latest_id = f.id
+        WHERE f.vote != 0
+          AND g.visual_embedding_json IS NOT NULL
+          AND g.visual_embedding_json != ''
+        """
+    ).fetchall()
+    vector_sum: list[float] | None = None
+    positive_count = 0
+    negative_count = 0
+    total_weight = 0.0
+    for row in rows:
+        embedding = parse_visual_embedding(row["visual_embedding_json"])
+        if not embedding:
+            continue
+        signal = float(row["feedback_signal"] or 0)
+        signal *= feedback_confidence(conn, row["url"], int(row["feedback_id"]), signal)
+        if signal > 0:
+            positive_count += 1
+        elif signal < 0:
+            negative_count += 1
+        if vector_sum is None:
+            vector_sum = [0.0] * len(embedding)
+        if len(embedding) != len(vector_sum):
+            continue
+        for index, value in enumerate(embedding):
+            vector_sum[index] += value * signal
+        total_weight += abs(signal)
+    if not vector_sum or total_weight <= 0:
+        return None
+    norm = math.sqrt(sum(value * value for value in vector_sum))
+    if norm <= 0:
+        return None
+    return {
+        "version": VISUAL_EMBEDDING_VERSION,
+        "vector": [value / norm for value in vector_sum],
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "rated_count": positive_count + negative_count,
+        "total_weight": round(total_weight, 3),
+    }
+
+
 def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id: int, signal: float) -> float:
     if signal == 0:
         return 0.0
@@ -592,6 +705,7 @@ def recommend_page(
     candidate_limit = max(limit + offset, candidate_limit)
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(conn)
     rows = conn.execute(
         """
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote
@@ -616,7 +730,10 @@ def recommend_page(
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
-        score, reasons = score_gallery(gallery, bootstrap, weights)
+        gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
+        gallery["visual_ready"] = bool(gallery["visual_embedding"])
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
+        gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = gallery.get("feedback_id") is not None
         if gallery["rated"] and not include_rated:
@@ -716,7 +833,12 @@ def freshness_bonus(index: int, candidate_limit: int) -> float:
     return max(0.0, 1.0 - index / candidate_limit) * 0.25
 
 
-def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str, float]) -> tuple[float, list[str]]:
+def score_gallery(
+    gallery: dict,
+    bootstrap: dict[str, float],
+    weights: dict[str, float],
+    visual_model: dict | None = None,
+) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
     searchable = bootstrap_search_text(gallery)
@@ -738,6 +860,11 @@ def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str,
     for feature, weight in feature_hits[:3]:
         reasons.append(f"learned {feature} {weight:+.2f}")
 
+    visual_score = score_visual_similarity(gallery, visual_model)
+    if visual_score:
+        score += visual_score
+        reasons.append(f"visual {visual_score:+.2f}")
+
     rating = gallery.get("rating")
     if isinstance(rating, (int, float)) and not math.isnan(rating):
         bonus = min(max((float(rating) - 3.0) * 0.2, -0.3), 0.4)
@@ -748,6 +875,20 @@ def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str,
     if not reasons:
         reasons.append("recent")
     return score, reasons
+
+
+def score_visual_similarity(gallery: dict, visual_model: dict | None) -> float:
+    if not visual_model:
+        return 0.0
+    embedding = gallery.get("visual_embedding")
+    if not embedding:
+        embedding = parse_visual_embedding(gallery.get("visual_embedding_json"))
+    model_vector = visual_model.get("vector") if isinstance(visual_model, dict) else None
+    if not isinstance(embedding, list) or not isinstance(model_vector, list) or len(embedding) != len(model_vector):
+        return 0.0
+    similarity = sum(float(left) * float(right) for left, right in zip(embedding, model_vector))
+    confidence = min(1.0, max(0.35, float(visual_model.get("total_weight") or 0) / 3.0))
+    return round(similarity * VISUAL_SCORE_SCALE * confidence, 3)
 
 
 def bootstrap_matches(tag: str, searchable: str, exact_values: set[str]) -> bool:
@@ -792,6 +933,7 @@ def bootstrap_search_text(gallery: dict) -> str:
 
 
 def model_snapshot(conn: sqlite3.Connection) -> dict:
+    visual_model = visual_preference_model(conn)
     return {
         "bootstrap_tags": get_bootstrap_tags(conn),
         "learned_queries": learned_query_tags(conn, limit=12),
@@ -808,6 +950,20 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
         ],
         "positive_weights": model_weight_rows(conn, "weight > 0", "weight DESC"),
         "negative_weights": model_weight_rows(conn, "weight < 0", "weight ASC"),
+        "visual": {
+            "version": VISUAL_EMBEDDING_VERSION,
+            "embedded_galleries": conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM galleries
+                WHERE visual_embedding_json IS NOT NULL AND visual_embedding_json != ''
+                """
+            ).fetchone()["c"],
+            "rated_embedded_galleries": 0 if not visual_model else visual_model["rated_count"],
+            "positive_count": 0 if not visual_model else visual_model["positive_count"],
+            "negative_count": 0 if not visual_model else visual_model["negative_count"],
+            "ready": bool(visual_model),
+        },
         "counts": {
             "galleries": conn.execute("SELECT COUNT(*) AS c FROM galleries").fetchone()["c"],
             "feedback_events": conn.execute("SELECT COUNT(*) AS c FROM feedback").fetchone()["c"],

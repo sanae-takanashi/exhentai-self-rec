@@ -22,8 +22,10 @@ from exh_rec.recommender import (
     record_feedback,
     retrain_model,
     score_gallery,
+    store_visual_embedding,
     store_galleries,
     upsert_bootstrap_tags,
+    visual_preference_model,
 )
 
 
@@ -304,6 +306,51 @@ class RecommenderTest(unittest.TestCase):
         self.assertGreater(weights["tag:artist:strong"], weights["tag:language:english"])
         self.assertGreater(weights["uploader:uploadername"], weights["category:manga"])
         self.assertGreater(weights["category:manga"], weights["title:generic"])
+
+    def test_visual_feedback_changes_ranking_from_image_embeddings(self):
+        liked_url = "https://exhentai.org/g/5v/a/"
+        similar_url = "https://exhentai.org/g/5v/b/"
+        different_url = "https://exhentai.org/g/5v/c/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=liked_url, gid="5v", token="a", title="Liked Visual"),
+                Gallery(url=similar_url, gid="5v", token="b", title="Similar Visual"),
+                Gallery(url=different_url, gid="5v", token="c", title="Different Visual"),
+            ],
+        )
+        store_visual_embedding(self.conn, liked_url, [1, 1, 0, 0] * 16)
+        store_visual_embedding(self.conn, similar_url, [0.9, 1, 0, 0] * 16)
+        store_visual_embedding(self.conn, different_url, [0, 0, 1, 1] * 16)
+
+        record_feedback(self.conn, liked_url, vote=1)
+        items = recommend(self.conn)
+
+        self.assertEqual(items[0]["url"], similar_url)
+        self.assertIn("visual", " ".join(items[0]["reasons"]))
+
+    def test_visual_preference_model_uses_negative_feedback_direction(self):
+        liked_url = "https://exhentai.org/g/5vp/a/"
+        disliked_url = "https://exhentai.org/g/5vp/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=liked_url, gid="5vp", token="a", title="Liked Visual Direction"),
+                Gallery(url=disliked_url, gid="5vp", token="b", title="Disliked Visual Direction"),
+            ],
+        )
+        store_visual_embedding(self.conn, liked_url, [1, 0, 0, 0] * 16)
+        store_visual_embedding(self.conn, disliked_url, [0, 1, 0, 0] * 16)
+
+        record_feedback(self.conn, liked_url, vote=1)
+        record_feedback(self.conn, disliked_url, vote=-1)
+        model = visual_preference_model(self.conn)
+
+        self.assertIsNotNone(model)
+        self.assertEqual(model["positive_count"], 1)
+        self.assertEqual(model["negative_count"], 1)
+        self.assertGreater(model["vector"][0], 0)
+        self.assertLess(model["vector"][1], 0)
 
     def test_score_gallery_reports_rating_adjustment_reason(self):
         score, reasons = score_gallery({"title": "Rated", "rating": 4.5, "tags": []}, {}, {})

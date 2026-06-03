@@ -25,6 +25,15 @@ let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
+const visualEmbeddingVersion = "canvas-rgb-8x8-v1";
+const visualGridSize = 8;
+const visualMaxSampleImages = 10;
+const visualMaxConcurrent = 2;
+const visualQueuedUrls = new Set();
+const visualSavedUrls = new Set();
+const visualQueue = [];
+let visualActive = 0;
+let visualRefreshTimer = null;
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
@@ -57,6 +66,139 @@ function sampleSrc(galleryUrl, thumbUrl) {
     gallery_url: galleryUrl,
   });
   return `/thumb?${params.toString()}`;
+}
+
+function visualImageSources(item) {
+  const sources = [];
+  if (item.thumb_url) {
+    sources.push(thumbnailSrc(item));
+  }
+  for (const thumb of (item.samples || []).slice(0, visualMaxSampleImages)) {
+    sources.push(sampleSrc(item.url, thumb));
+  }
+  return sources;
+}
+
+function queueVisualEmbedding(item) {
+  if (!item || !item.url || visualQueuedUrls.has(item.url) || visualSavedUrls.has(item.url)) {
+    return;
+  }
+  if (item.visual_embedding_version === visualEmbeddingVersion && item.visual_embedding_at) {
+    visualSavedUrls.add(item.url);
+    return;
+  }
+  const sources = visualImageSources(item);
+  if (!sources.length) {
+    return;
+  }
+  visualQueuedUrls.add(item.url);
+  visualQueue.push({ galleryUrl: item.url, sources });
+  runVisualQueue();
+}
+
+function runVisualQueue() {
+  while (visualActive < visualMaxConcurrent && visualQueue.length) {
+    const task = visualQueue.shift();
+    visualActive += 1;
+    saveVisualEmbedding(task)
+      .catch(() => {})
+      .finally(() => {
+        visualActive -= 1;
+        runVisualQueue();
+      });
+  }
+}
+
+async function saveVisualEmbedding(task) {
+  const vectors = [];
+  for (const source of task.sources) {
+    try {
+      vectors.push(await imageEmbedding(source));
+    } catch (_) {
+      // Some image hosts return occasional broken thumbnails; one usable image is enough.
+    }
+  }
+  const embedding = averageVectors(vectors);
+  if (!embedding) {
+    return;
+  }
+  await api("/api/visual", {
+    method: "POST",
+    body: JSON.stringify({
+      gallery_url: task.galleryUrl,
+      version: visualEmbeddingVersion,
+      embedding,
+    }),
+  });
+  visualSavedUrls.add(task.galleryUrl);
+  scheduleVisualRefresh();
+}
+
+async function imageEmbedding(source) {
+  const image = await loadImage(source);
+  const canvas = imageEmbedding.canvas || document.createElement("canvas");
+  imageEmbedding.canvas = canvas;
+  canvas.width = visualGridSize;
+  canvas.height = visualGridSize;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.clearRect(0, 0, visualGridSize, visualGridSize);
+  context.drawImage(image, 0, 0, visualGridSize, visualGridSize);
+  const pixels = context.getImageData(0, 0, visualGridSize, visualGridSize).data;
+  const vector = [];
+  for (let index = 0; index < pixels.length; index += 4) {
+    vector.push(pixels[index] / 255, pixels[index + 1] / 255, pixels[index + 2] / 255);
+  }
+  return normalizeVector(vector);
+}
+
+function loadImage(source) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = reject;
+    image.src = source;
+  });
+}
+
+function averageVectors(vectors) {
+  if (!vectors.length) {
+    return null;
+  }
+  const length = vectors[0].length;
+  const sum = new Array(length).fill(0);
+  let count = 0;
+  for (const vector of vectors) {
+    if (vector.length !== length) {
+      continue;
+    }
+    for (let index = 0; index < length; index += 1) {
+      sum[index] += vector[index];
+    }
+    count += 1;
+  }
+  if (!count) {
+    return null;
+  }
+  return normalizeVector(sum.map((value) => value / count));
+}
+
+function normalizeVector(vector) {
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+  if (!norm) {
+    return vector;
+  }
+  return vector.map((value) => Number((value / norm).toFixed(6)));
+}
+
+function scheduleVisualRefresh() {
+  if (visualRefreshTimer) {
+    return;
+  }
+  visualRefreshTimer = setTimeout(() => {
+    visualRefreshTimer = null;
+    loadRecommendations().catch(() => {});
+  }, 5000);
 }
 
 function bootstrapText(tags) {
@@ -412,6 +554,7 @@ function renderRecommendations(items, append = false) {
       </div>
     `;
     recommendationsEl.appendChild(card);
+    queueVisualEmbedding(item);
   }
 }
 

@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS galleries (
     page_count INTEGER,
     samples_json TEXT NOT NULL DEFAULT '[]',
     samples_fetched_at TEXT,
+    visual_embedding_json TEXT,
+    visual_embedding_version TEXT,
+    visual_embedding_at TEXT,
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -104,6 +107,9 @@ def init_db() -> None:
         ensure_column(conn, "galleries", "page_count", "INTEGER")
         ensure_column(conn, "galleries", "samples_json", "TEXT NOT NULL DEFAULT '[]'")
         ensure_column(conn, "galleries", "samples_fetched_at", "TEXT")
+        ensure_column(conn, "galleries", "visual_embedding_json", "TEXT")
+        ensure_column(conn, "galleries", "visual_embedding_version", "TEXT")
+        ensure_column(conn, "galleries", "visual_embedding_at", "TEXT")
         ensure_column(conn, "fetch_runs", "enriched_count", "INTEGER NOT NULL DEFAULT 0")
         defaults = {
             "auto_refresh": "1",
