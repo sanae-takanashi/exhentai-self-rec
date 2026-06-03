@@ -94,6 +94,8 @@ When you vote or score a gallery that still has only list metadata, the app uses
 
 Rated galleries are hidden from the main queue by default after you vote, score, or skip them. A neutral score of `3` also hides the gallery but does not add positive or negative learned weight. Enable `Rated` in the toolbar to review already-rated galleries.
 
+While a vote, score, skip, or clear action is being saved, the affected gallery's feedback buttons are temporarily disabled so accidental double-clicks do not submit duplicate in-flight feedback.
+
 Rated cards include `History` so you can inspect the exact vote/score events currently feeding the learned model.
 
 Use `Load More` below the recommendation grid to page through additional scored candidates from the local gallery pool.

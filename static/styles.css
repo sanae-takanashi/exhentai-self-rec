@@ -154,6 +154,11 @@ button:hover {
   border-color: var(--accent);
 }
 
+button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 button.primary,
 #saveBtn,
 #fetchBtn {
@@ -192,11 +197,6 @@ button.primary,
 
 .loadbar button {
   min-width: 160px;
-}
-
-.loadbar button:disabled {
-  cursor: default;
-  opacity: 0.55;
 }
 
 .card {

@@ -23,6 +23,7 @@ let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 const recommendationLimit = 40;
+const pendingFeedbackUrls = new Set();
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
@@ -178,62 +179,70 @@ async function clearCookie() {
 }
 
 async function vote(galleryUrl, voteValue) {
-  setStatus(voteValue > 0 ? "Recording upvote" : "Recording downvote");
-  const payload = await api("/api/feedback", {
-    method: "POST",
-    body: JSON.stringify({
-      gallery_url: galleryUrl,
-      vote: voteValue,
-      include_rated: includeRatedEl.checked,
-      filter_text: localFilterEl.value.trim(),
-    }),
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus(voteValue > 0 ? "Recording upvote" : "Recording downvote");
+    const payload = await api("/api/feedback", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        vote: voteValue,
+        include_rated: includeRatedEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyRecommendationPage(payload);
+    setStatus(feedbackStatusMessage("Vote recorded", payload));
   });
-  applyRecommendationPage(payload);
-  setStatus(feedbackStatusMessage("Vote recorded", payload));
 }
 
 async function score(galleryUrl, scoreValue) {
-  setStatus(`Recording score ${scoreValue}`);
-  const payload = await api("/api/feedback", {
-    method: "POST",
-    body: JSON.stringify({
-      gallery_url: galleryUrl,
-      score: scoreValue,
-      include_rated: includeRatedEl.checked,
-      filter_text: localFilterEl.value.trim(),
-    }),
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus(`Recording score ${scoreValue}`);
+    const payload = await api("/api/feedback", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        score: scoreValue,
+        include_rated: includeRatedEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyRecommendationPage(payload);
+    setStatus(feedbackStatusMessage("Score recorded", payload));
   });
-  applyRecommendationPage(payload);
-  setStatus(feedbackStatusMessage("Score recorded", payload));
 }
 
 async function skip(galleryUrl) {
-  setStatus("Skipping gallery");
-  const payload = await api("/api/feedback", {
-    method: "POST",
-    body: JSON.stringify({
-      gallery_url: galleryUrl,
-      score: 3,
-      include_rated: includeRatedEl.checked,
-      filter_text: localFilterEl.value.trim(),
-    }),
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus("Skipping gallery");
+    const payload = await api("/api/feedback", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        score: 3,
+        include_rated: includeRatedEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyRecommendationPage(payload);
+    setStatus(feedbackStatusMessage("Gallery skipped", payload));
   });
-  applyRecommendationPage(payload);
-  setStatus(feedbackStatusMessage("Gallery skipped", payload));
 }
 
 async function clearRating(galleryUrl) {
-  setStatus("Clearing rating");
-  const payload = await api("/api/feedback/clear", {
-    method: "POST",
-    body: JSON.stringify({
-      gallery_url: galleryUrl,
-      include_rated: includeRatedEl.checked,
-      filter_text: localFilterEl.value.trim(),
-    }),
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus("Clearing rating");
+    const payload = await api("/api/feedback/clear", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        include_rated: includeRatedEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyRecommendationPage(payload);
+    setStatus(payload.removed ? "Rating cleared" : "No rating to clear");
   });
-  applyRecommendationPage(payload);
-  setStatus(payload.removed ? "Rating cleared" : "No rating to clear");
 }
 
 async function showModel() {
@@ -358,6 +367,31 @@ function feedbackStatusMessage(base, payload) {
     return `${base}; detail fetch failed`;
   }
   return base;
+}
+
+async function withPendingFeedback(galleryUrl, action) {
+  if (pendingFeedbackUrls.has(galleryUrl)) {
+    return;
+  }
+  pendingFeedbackUrls.add(galleryUrl);
+  setGalleryFeedbackButtonsDisabled(galleryUrl, true);
+  try {
+    await action();
+  } finally {
+    pendingFeedbackUrls.delete(galleryUrl);
+    setGalleryFeedbackButtonsDisabled(galleryUrl, false);
+  }
+}
+
+function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
+  for (const button of recommendationsEl.querySelectorAll("button[data-url]")) {
+    if (button.dataset.url !== galleryUrl) {
+      continue;
+    }
+    if (button.dataset.vote || button.dataset.score || button.dataset.skip || button.dataset.clear) {
+      button.disabled = disabled;
+    }
+  }
 }
 
 function applyRecommendationPage(payload, append = false) {
