@@ -343,7 +343,10 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         if not exists:
             continue
-        vote = import_feedback_vote(item.get("vote", 0))
+        score = import_feedback_score(item.get("score"))
+        vote = import_feedback_vote(item.get("vote")) if "vote" in item else None
+        if vote is None and score is not None:
+            vote = feedback_signal(score=score)
         if vote is None:
             continue
         conn.execute(
@@ -354,7 +357,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             (
                 gallery_url,
                 vote,
-                import_feedback_score(item.get("score")),
+                score,
                 item.get("note"),
                 item.get("created_at"),
             ),

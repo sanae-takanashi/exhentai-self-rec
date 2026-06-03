@@ -479,6 +479,32 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(history[0]["vote"], 0.5)
         self.assertEqual(history[1]["score"], 5)
 
+    def test_import_preferences_derives_vote_from_score_only_feedback(self):
+        liked_url = "https://exhentai.org/g/12f/e/"
+        disliked_url = "https://exhentai.org/g/12g/e/"
+        payload = {
+            "schema": "exh-rec-preferences-v1",
+            "bootstrap_tags": [],
+            "galleries": [
+                {"url": liked_url, "title": "Score Liked", "tags_json": '["artist:scoreliked"]'},
+                {"url": disliked_url, "title": "Score Disliked", "tags_json": '["artist:scoredisliked"]'},
+            ],
+            "feedback": [
+                {"gallery_url": liked_url, "score": 5},
+                {"gallery_url": disliked_url, "score": 1},
+            ],
+        }
+
+        result = import_preferences(self.conn, payload)
+        liked_history = feedback_history(self.conn, liked_url)
+        disliked_history = feedback_history(self.conn, disliked_url)
+
+        self.assertEqual(result["feedback"], 2)
+        self.assertEqual(liked_history[0]["vote"], 1.0)
+        self.assertEqual(disliked_history[0]["vote"], -1.0)
+        self.assertIn("artist:scoreliked", learned_query_tags(self.conn, limit=5))
+        self.assertNotIn("artist:scoredisliked", learned_query_tags(self.conn, limit=5))
+
     def test_import_rejects_unknown_schema(self):
         with self.assertRaises(ValueError):
             import_preferences(self.conn, {"schema": "unknown"})
