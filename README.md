@@ -56,6 +56,8 @@ Generated bootstrap and learned tag queries quote multi-word tag values for ExHe
 
 Positive bootstrap preferences are added to the fetch plan by descending weight, with at most six bootstrap-driven searches per refresh.
 
+Learned query expansion skips tags that exactly match a negative remote-search bootstrap preference, so a disliked tag is not reintroduced as an automatic learned search. Manual one-off searches still run exactly what you type.
+
 The refresh panel also shows whether auto refresh is disabled, waiting for a saved cookie, or ready to run at the configured interval.
 
 Local metadata preferences such as `category:manga` and `uploader:name` affect ranking and detail selection, but are not used as generated remote search queries.

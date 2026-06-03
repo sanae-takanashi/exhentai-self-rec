@@ -748,7 +748,11 @@ def build_query_plan(
                 "weight": item["weight"],
             }
         )
+    blocked_learned_tags = negative_remote_preferences(tags)
     for tag in (learned_tags or [])[:20]:
+        normalized_tag = str(tag).strip().lower()
+        if normalized_tag in blocked_learned_tags:
+            continue
         candidates.append({"query": format_generated_query(tag), "source": "learned", "label": tag})
     entries: list[dict] = []
     seen: set[str | None] = set()
@@ -763,6 +767,14 @@ def build_query_plan(
         entries.append(candidate)
         seen.add(normalized)
     return entries
+
+
+def negative_remote_preferences(tags: list[dict]) -> set[str]:
+    return {
+        str(item["tag"]).strip().lower()
+        for item in tags
+        if float(item["weight"]) < 0 and is_remote_search_preference(item["tag"])
+    }
 
 
 def is_remote_search_preference(tag: str) -> bool:
