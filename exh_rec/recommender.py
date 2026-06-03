@@ -306,7 +306,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 gallery.get("posted_at"),
                 gallery.get("thumb_url"),
                 gallery.get("rating"),
-                gallery.get("tags_json") or "[]",
+                import_tags_json(gallery.get("tags_json")),
                 gallery.get("source_query"),
                 gallery.get("detail_fetched_at"),
                 gallery.get("first_seen_at"),
@@ -320,6 +320,9 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         value = normalize_bootstrap_value(str(tag.get("tag") or "").strip().lower())
         if not value:
             continue
+        weight = optional_float(tag.get("weight", 1.0))
+        if weight is None:
+            continue
         conn.execute(
             """
             INSERT INTO bootstrap_tags(tag, weight, updated_at)
@@ -328,7 +331,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 weight = excluded.weight,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (value, float(tag.get("weight", 1.0))),
+            (value, weight),
         )
         imported_tags += 1
 
@@ -340,6 +343,9 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         if not exists:
             continue
+        vote = optional_float(item.get("vote", 0))
+        if vote is None:
+            continue
         conn.execute(
             """
             INSERT INTO feedback(gallery_url, vote, score, note, created_at)
@@ -347,8 +353,8 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             """,
             (
                 gallery_url,
-                float(item.get("vote", 0)),
-                item.get("score"),
+                vote,
+                optional_int(item.get("score")),
                 item.get("note"),
                 item.get("created_at"),
             ),
@@ -368,6 +374,34 @@ def import_rows(payload: dict, key: str) -> list[dict]:
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
+
+
+def import_tags_json(raw: object) -> str:
+    if not raw:
+        return "[]"
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return "[]"
+    if not isinstance(parsed, list):
+        return "[]"
+    return json.dumps(parsed, ensure_ascii=True)
+
+
+def optional_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def retrain_model(conn: sqlite3.Connection) -> None:

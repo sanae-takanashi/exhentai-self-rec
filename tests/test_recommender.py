@@ -442,6 +442,35 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:valid import", "weight": 2.0}])
         self.assertIn("artist:valid", learned_query_tags(self.conn, limit=5))
 
+    def test_import_preferences_skips_invalid_weights_and_votes(self):
+        valid_url = "https://exhentai.org/g/12c/e/"
+        bad_vote_url = "https://exhentai.org/g/12d/e/"
+        payload = {
+            "schema": "exh-rec-preferences-v1",
+            "bootstrap_tags": [
+                {"tag": "artist:bad_weight", "weight": "not-a-number"},
+                {"tag": "artist:valid_weight", "weight": "2.5"},
+            ],
+            "galleries": [
+                {"url": valid_url, "title": "Valid Vote", "tags_json": "not-json"},
+                {"url": bad_vote_url, "title": "Bad Vote", "tags_json": '{"not": "a list"}'},
+            ],
+            "feedback": [
+                {"gallery_url": valid_url, "vote": "1", "score": "5"},
+                {"gallery_url": bad_vote_url, "vote": "not-a-number", "score": "bad-score"},
+            ],
+        }
+
+        result = import_preferences(self.conn, payload)
+        tags_json = self.conn.execute("SELECT tags_json FROM galleries WHERE url = ?", (valid_url,)).fetchone()["tags_json"]
+
+        self.assertEqual(result["bootstrap_tags"], 1)
+        self.assertEqual(result["galleries"], 2)
+        self.assertEqual(result["feedback"], 1)
+        self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:valid weight", "weight": 2.5}])
+        self.assertEqual(tags_json, "[]")
+        self.assertEqual(feedback_history(self.conn, valid_url)[0]["score"], 5)
+
     def test_import_rejects_unknown_schema(self):
         with self.assertRaises(ValueError):
             import_preferences(self.conn, {"schema": "unknown"})
