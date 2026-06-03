@@ -85,7 +85,7 @@ Rated cards include `History` so you can inspect the exact vote/score events cur
 
 Use `Load More` below the recommendation grid to page through additional scored candidates from the local gallery pool.
 
-Use the local filter field to narrow recommendations already stored in SQLite by title, tag, category, or uploader. This does not fetch a new ExHentai search; use the one-off search field and `Fetch Query` for that.
+Use the local filter field to narrow recommendations already stored in SQLite by title, tag, category, or uploader. Filtered views search the full bounded local pool, even when the normal recommendation pool is smaller. This does not fetch a new ExHentai search; use the one-off search field and `Fetch Query` for that.
 
 Use `Enrich` to open detail pages for the best currently recommended galleries that still have only list metadata. This uses the same `Details` limit and saved cookie, but does not fetch new result pages.
 

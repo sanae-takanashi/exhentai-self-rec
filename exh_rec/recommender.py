@@ -457,8 +457,9 @@ def recommend_page(
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
-    candidate_limit = max(limit + offset, min(10000, max(100, int(candidate_limit))))
     filter_text = (filter_text or "").strip().lower()
+    candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
+    candidate_limit = max(limit + offset, candidate_limit)
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     rows = conn.execute(

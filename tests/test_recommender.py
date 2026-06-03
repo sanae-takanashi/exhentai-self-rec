@@ -510,6 +510,38 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(category_page["total"], 1)
         self.assertEqual(category_page["items"][0]["url"], "https://exhentai.org/g/12/a/")
 
+    def test_local_filter_searches_beyond_normal_candidate_pool(self):
+        recent_galleries = [
+            Gallery(
+                url=f"https://exhentai.org/g/{3000 + idx}/a/",
+                gid=str(3000 + idx),
+                token="a",
+                title=f"Recent Filter Miss {idx}",
+            )
+            for idx in range(100)
+        ]
+        old_match = Gallery(
+            url="https://exhentai.org/g/3999/a/",
+            gid="3999",
+            token="a",
+            title="Older Filter Target",
+            tags=["artist:deepmatch"],
+        )
+        store_galleries(self.conn, [old_match, *recent_galleries])
+        for idx in range(100):
+            self.conn.execute(
+                "UPDATE galleries SET last_seen_at = ? WHERE gid = ?",
+                (f"2026-06-02 00:{59 - idx // 2:02d}:{59 - idx % 2:02d}", str(3000 + idx)),
+            )
+        self.conn.execute("UPDATE galleries SET last_seen_at = '2026-06-01 20:00:00' WHERE gid = '3999'")
+
+        unfiltered = recommend_page(self.conn, limit=5, candidate_limit=100)
+        filtered = recommend_page(self.conn, limit=5, candidate_limit=100, filter_text="deepmatch")
+
+        self.assertNotIn(old_match.url, [item["url"] for item in unfiltered["items"]])
+        self.assertEqual([item["url"] for item in filtered["items"]], [old_match.url])
+        self.assertEqual(filtered["candidate_limit"], 10000)
+
     def test_recommendation_diversity_surfaces_nearby_alternatives(self):
         favored_urls = [f"https://exhentai.org/g/30{idx}/a/" for idx in range(3)]
         alternative_url = "https://exhentai.org/g/309/a/"
