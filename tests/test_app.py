@@ -458,6 +458,43 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["model_retrained"])
                 self.assertIn("artist:fetchdetail", learned)
 
+    def test_fetch_and_store_marks_empty_recent_fetch_failed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[]):
+                    result = fetch_and_store()
+
+                with db.connect() as conn:
+                    history = fetch_runs(conn, limit=1)
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["fetched"], 0)
+                self.assertIn("check the saved cookie or ExHentai access", result["errors"][0])
+                self.assertEqual(history[0]["status"], "failed")
+                self.assertEqual(history[0]["fetched_count"], 0)
+                self.assertEqual(history[0]["errors"], result["errors"])
+
+    def test_fetch_and_store_empty_manual_query_mentions_search_terms(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[]):
+                    result = fetch_and_store(force_query="artist:no_results")
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("search terms", result["errors"][0])
+
     def test_fetch_and_store_marks_running_run_failed_on_unexpected_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)

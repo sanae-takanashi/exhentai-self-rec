@@ -76,6 +76,8 @@ The refresh panel also shows recent fetch history in `status:fetched/enriched` f
 
 Fetch history counts `fetched` as galleries seen on fetched pages and `stored` as newly discovered gallery URLs, so repeated refreshes make duplicate-heavy runs obvious.
 
+Refreshes that return zero galleries are marked failed with a message to check the cookie, access, or search terms instead of being shown as successful empty runs.
+
 When a background refresh finishes, the browser reloads the first recommendation page automatically so newly fetched galleries enter the queue without a manual page refresh.
 
 Recommendation page responses include the latest fetch or enrichment summary, so the browser can keep the queue and refresh panel aligned.

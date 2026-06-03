@@ -481,6 +481,10 @@ def fetch_and_store(
                 errors.append(f"detail {gallery.url}: {exc}")
                 FETCH_STATE["errors"] = list(errors)
 
+        if fetched == 0 and not errors:
+            errors.append(empty_fetch_error(queries))
+            FETCH_STATE["errors"] = list(errors)
+
         status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
             if enriched:
@@ -936,6 +940,12 @@ def preview_cookie(cookie: str) -> str:
 
 def current_timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def empty_fetch_error(queries: list[str | None]) -> str:
+    if any(query for query in queries):
+        return "No galleries found; check the saved cookie, access, or search terms"
+    return "No galleries found; check the saved cookie or ExHentai access"
 
 
 def timestamp_after(seconds: int | float) -> str:
