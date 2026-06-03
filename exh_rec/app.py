@@ -530,8 +530,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
-    requested_limit = detail_limit if limit is None else int(limit)
-    requested_limit = max(0, min(50, requested_limit))
+    requested_limit = detail_limit if limit is None else bounded_int(limit, default=detail_limit, lower=0, upper=50)
     run_id: int | None = None
     enriched = 0
     model_retrained = False

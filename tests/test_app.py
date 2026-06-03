@@ -450,6 +450,30 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["model_retrained"])
                 self.assertIn("artist:enrichdetail", learned)
 
+    def test_enrich_recommendations_defaults_invalid_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/35/a/"
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="35",
+                    token="a",
+                    title="Invalid Limit Detail",
+                    tags=["artist:invalidlimit"],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "detail_fetch_limit", "1")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="35", token="a", title="Invalid Limit Detail")])
+
+                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed) as fetch_detail:
+                    result = enrich_recommendations(limit="bad")
+
+                self.assertEqual(result["enriched"], 1)
+                fetch_detail.assert_called_once()
+
     def test_save_settings_clear_cookie_removes_access_check(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
