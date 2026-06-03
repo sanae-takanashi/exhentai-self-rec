@@ -216,7 +216,7 @@ button.danger:hover {
 
 .card {
   display: grid;
-  grid-template-rows: 180px auto;
+  grid-template-rows: auto 1fr;
   min-height: 390px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -224,12 +224,22 @@ button.danger:hover {
   background: var(--panel);
 }
 
+.media-preview {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  background: #0a0b0d;
+}
+
 .thumb {
   display: grid;
   place-items: center;
+  min-height: 210px;
+  aspect-ratio: 4 / 3;
   background: #0a0b0d;
   color: var(--muted);
   overflow: hidden;
+  border-radius: 4px;
 }
 
 .thumb img {
@@ -272,25 +282,18 @@ button.danger:hover {
   overflow-wrap: anywhere;
 }
 
-.samples-toggle {
-  align-self: flex-start;
-  padding: 4px 10px;
-  font-size: 12px;
-}
-
 .samples {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(58px, 1fr));
   gap: 6px;
-}
-
-.samples[hidden] {
-  display: none;
+  max-height: 150px;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .samples img {
   width: 100%;
-  aspect-ratio: 2 / 3;
+  aspect-ratio: 1 / 1.35;
   object-fit: cover;
   border-radius: 4px;
   border: 1px solid var(--line);

@@ -16,7 +16,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Visual learning from cover thumbnails and stored random page samples. DINOv2 is the default visual encoder when optional `torch`, `transformers`, and `Pillow` dependencies are installed; otherwise the browser falls back to compact `8x8` RGB canvas embeddings. The ranker scores candidates by similarity to your liked-minus-disliked visual preference direction.
 - Repeated same-direction feedback on the same gallery adds a small capped confidence boost, while a later opposite vote resets that direction.
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
-- Random page-sample previews per gallery so you can judge content beyond the cover. Each enriched gallery stores `5 + (pages // 100)` random page thumbnails (proxied via `/thumb`), revealed by a per-card `Samples` toggle. The first list page comes free from the detail fetch; the `Sample pages` setting (`sample_extra_pages`, default 2) caps how many extra list pages are fetched to widen the sample spread for large galleries. Accounts using ExHentai's large-thumbnail preference get clean per-page samples; the compact sprite layout yields combined sprite strips.
+- Random page-sample previews per gallery so you can judge content beyond the cover. Each enriched gallery stores `5 + (pages // 100)` random page thumbnails (proxied via `/thumb`) and shows them directly on the recommendation card with the cover thumbnail. The first list page comes free from the detail fetch; the `Sample pages` setting (`sample_extra_pages`, default 2) caps how many extra list pages are fetched to widen the sample spread for large galleries. Accounts using ExHentai's large-thumbnail preference get clean per-page samples; the compact sprite layout yields combined sprite strips.
 - Fetch and enrichment runs retrain the model whenever they add detail metadata, so feedback on an already-rated gallery can immediately learn from the fuller tag set.
 - Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
 - List/detail parsing reads thumbnails from normal image tags and inline CSS background URLs.
@@ -94,7 +94,7 @@ When a background refresh finishes, the browser reloads the first recommendation
 
 Recommendation page responses include the latest fetch or enrichment summary, so the browser can keep the queue and refresh panel aligned.
 
-Recommendation cards show the model score, uploader metadata when available, and the current feedback signal you have given that gallery. Thumbs are strong positive/negative signals. A 1-5 score maps to a softer signal: 1 is negative, 3 is neutral, and 5 is positive. `Skip` records a neutral score of `3`.
+Recommendation cards show the cover thumbnail, visible page-sample previews when available, model score, uploader metadata, and the current feedback signal you have given that gallery. Thumbs are strong positive/negative signals. A 1-5 score maps to a softer signal: 1 is negative, 3 is neutral, and 5 is positive. `Skip` records a neutral score of `3`.
 
 Invalid API query numbers fall back to safe defaults, while invalid feedback vote/score values return clear bad-request errors.
 

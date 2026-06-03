@@ -544,6 +544,12 @@ function renderRecommendations(items, append = false) {
     const thumb = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
+    const samples = item.samples || [];
+    const samplesPreview = samples.length
+      ? `<div class="samples">${samples
+          .map((thumb) => `<img src="${escapeAttr(sampleSrc(item.url, thumb))}" alt="" loading="lazy">`)
+          .join("")}</div>`
+      : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
     const userFeedback = item.user_score
@@ -559,19 +565,12 @@ function renderRecommendations(items, append = false) {
       ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}">History</button>`
       : "";
     const feedbackActions = item.rated ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
-    const samples = item.samples || [];
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
-    const samplesBlock = samples.length
-      ? `
-        <button class="samples-toggle" type="button" data-samples="1" data-url="${escapeAttr(item.url)}">Samples (${samples.length})</button>
-        <div class="samples" hidden>
-          ${samples
-            .map((thumb) => `<img src="${escapeAttr(sampleSrc(item.url, thumb))}" alt="" loading="lazy">`)
-            .join("")}
-        </div>`
-      : "";
     card.innerHTML = `
-      <div class="thumb">${thumb}</div>
+      <div class="media-preview">
+        <div class="thumb">${thumb}</div>
+        ${samplesPreview}
+      </div>
       <div class="body">
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
         <div class="meta">${escapeHtml(item.category || "Unknown")} · score ${item.score}${escapeHtml(pageCount)}</div>
@@ -579,7 +578,6 @@ function renderRecommendations(items, append = false) {
         <div class="meta">${escapeHtml(detailStatus)}</div>
         <div class="meta">${escapeHtml(userFeedback)}</div>
         <div class="pillrow">${tags}</div>
-        ${samplesBlock}
         <div class="reason">${reasons}</div>
         <div class="votes">
           <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
@@ -778,13 +776,6 @@ recommendationsEl.addEventListener("click", (event) => {
   if (historyButton) {
     showFeedbackHistory(historyButton.dataset.url).catch((error) => setStatus(error.message, true));
     return;
-  }
-  const samplesButton = event.target.closest("button[data-samples]");
-  if (samplesButton) {
-    const grid = samplesButton.nextElementSibling;
-    if (grid && grid.classList.contains("samples")) {
-      grid.hidden = !grid.hidden;
-    }
   }
 });
 
