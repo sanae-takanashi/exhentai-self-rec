@@ -21,6 +21,7 @@ from exh_rec.recommender import (
     recommend_page,
     record_feedback,
     retrain_model,
+    score_gallery,
     store_galleries,
     upsert_bootstrap_tags,
 )
@@ -264,6 +265,25 @@ class RecommenderTest(unittest.TestCase):
         self.assertGreater(weights["tag:artist:strong"], weights["tag:language:english"])
         self.assertGreater(weights["uploader:uploadername"], weights["category:manga"])
         self.assertGreater(weights["category:manga"], weights["title:generic"])
+
+    def test_score_gallery_reports_rating_adjustment_reason(self):
+        score, reasons = score_gallery({"title": "Rated", "rating": 4.5, "tags": []}, {}, {})
+
+        self.assertGreater(score, 0)
+        self.assertIn("rating +0.30", reasons)
+
+    def test_recommendation_reasons_include_freshness_for_scored_items(self):
+        gallery_url = "https://exhentai.org/g/5c/e/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="5c", token="e", title="Fresh Match", tags=["artist:fresh"])],
+        )
+        upsert_bootstrap_tags(self.conn, [("artist:fresh", 1.0)])
+
+        item = recommend(self.conn)[0]
+
+        self.assertIn("bootstrap artist:fresh +1", item["reasons"])
+        self.assertIn("fresh +0.25", item["reasons"])
 
     def test_latest_feedback_retrain_replaces_old_signal(self):
         gallery_url = "https://exhentai.org/g/6/f/"

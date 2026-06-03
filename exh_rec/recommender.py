@@ -586,7 +586,10 @@ def recommend_page(
         elif gallery["user_vote"] > 0:
             score += 0.5
             reasons.append("previous upvote")
-        score += max(0.0, 1.0 - idx / candidate_limit) * 0.25
+        freshness = freshness_bonus(idx, candidate_limit)
+        score += freshness
+        if freshness and reasons != ["recent"]:
+            reasons.append(f"fresh {freshness:+.2f}")
         gallery["score"] = round(score, 3)
         gallery["reasons"] = reasons[:5]
         scored.append(gallery)
@@ -666,6 +669,10 @@ def gallery_matches_filter(gallery: dict, filter_text: str) -> bool:
     return all(part in haystack for part in filter_text.split())
 
 
+def freshness_bonus(index: int, candidate_limit: int) -> float:
+    return max(0.0, 1.0 - index / candidate_limit) * 0.25
+
+
 def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str, float]) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
@@ -690,7 +697,10 @@ def score_gallery(gallery: dict, bootstrap: dict[str, float], weights: dict[str,
 
     rating = gallery.get("rating")
     if isinstance(rating, (int, float)) and not math.isnan(rating):
-        score += min(max((float(rating) - 3.0) * 0.2, -0.3), 0.4)
+        bonus = min(max((float(rating) - 3.0) * 0.2, -0.3), 0.4)
+        score += bonus
+        if bonus:
+            reasons.append(f"rating {bonus:+.2f}")
 
     if not reasons:
         reasons.append("recent")

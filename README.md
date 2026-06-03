@@ -84,6 +84,8 @@ Recommendation cards show the model score, uploader metadata when available, and
 
 Invalid API query numbers fall back to safe defaults, while invalid feedback vote/score values return clear bad-request errors.
 
+Recommendation reasons include bootstrap matches, learned feature hits, rating adjustments, and freshness boosts when those factors affect the score.
+
 The ranked queue applies a small diversity penalty to repeated artists, groups, parodies, characters, and uploaders so one learned preference does not completely crowd out nearby alternatives.
 
 When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background of the same action and retrains from the fuller tag set. If no cookie is saved or the detail request fails, the feedback still records normally.
