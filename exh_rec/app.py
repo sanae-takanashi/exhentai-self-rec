@@ -304,6 +304,7 @@ def save_settings(payload: dict[str, Any]) -> None:
             cookie_header = normalize_cookie_header(str(payload["cookie_header"]))
             if cookie_header:
                 db.set_setting(conn, "cookie_header", cookie_header)
+                db.set_setting(conn, "last_access_check", "")
                 refresh_relevant_change = True
         if "auto_refresh" in payload:
             db.set_setting(conn, "auto_refresh", "1" if payload["auto_refresh"] else "0")

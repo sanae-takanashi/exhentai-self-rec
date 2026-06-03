@@ -441,6 +441,20 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(db.get_setting(conn, "cookie_header", ""), "")
                     self.assertIsNone(get_access_check(conn))
 
+    def test_save_settings_new_cookie_clears_stale_access_check(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "last_access_check", '{"ok": true, "message": "old check"}')
+
+                save_settings({"cookie_header": "ipb_member_id=456; ipb_pass_hash=def"})
+
+                with db.connect() as conn:
+                    self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=456; ipb_pass_hash=def")
+                    self.assertIsNone(get_access_check(conn))
+
     def test_save_settings_clamps_recommend_candidate_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)

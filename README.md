@@ -42,6 +42,7 @@ In the settings panel:
 
 - Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste copied browser cookie-table rows, with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
 - Click `Check Login` to verify the stored cookie can see gallery listings before running a full fetch.
+- Saving a new non-empty cookie clears the previous login-check result so stale verification is not shown for a replaced cookie.
 - Use `Clear Cookie` if you want to remove the stored login cookie while keeping bootstrap tags, feedback, and fetched galleries.
 - Add bootstrap preferences, one per line or comma-separated. Tags like `artist:name`, metadata like `category:manga` or `uploader:name`, and plain title terms are supported. Underscore tag input such as `artist:some_name` is normalized to match parsed ExHentai tags. Use `-tag` or `tag:-2` for negative preferences. Numeric namespaced values like `parody:1984` are preserved; add an extra suffix such as `parody:1984:2` to weight them.
 - Namespaced bootstrap preferences such as `artist:name` and `female:tag` match exact parsed tags or metadata. Plain preferences without a namespace match title/tag text on term boundaries.
