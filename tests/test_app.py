@@ -9,6 +9,7 @@ from unittest.mock import patch
 from exh_rec import db
 from exh_rec.app import (
     ApiError,
+    REFRESH_STATE,
     REFRESH_WAKE,
     background_refresh,
     build_queries,
@@ -253,6 +254,32 @@ class AppTest(unittest.TestCase):
         self.assertFalse(disabled["ready"])
         self.assertEqual(disabled["message"], "Auto refresh disabled")
         conn.close()
+
+    def test_refresh_summary_includes_worker_schedule_metadata(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        previous = dict(REFRESH_STATE)
+        try:
+            db.set_setting(conn, "auto_refresh", "1")
+            db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+            REFRESH_STATE.update(
+                {
+                    "last_checked_at": "2026-06-03 01:00:00",
+                    "next_check_at": "2026-06-03 01:30:00",
+                    "last_error": "temporary failure",
+                }
+            )
+
+            summary = refresh_summary(conn)
+
+            self.assertEqual(summary["last_checked_at"], "2026-06-03 01:00:00")
+            self.assertEqual(summary["next_check_at"], "2026-06-03 01:30:00")
+            self.assertEqual(summary["last_error"], "temporary failure")
+        finally:
+            REFRESH_STATE.clear()
+            REFRESH_STATE.update(previous)
+            conn.close()
 
     def test_feedback_history_payload_includes_gallery_and_latest_signal(self):
         conn = sqlite3.connect(":memory:")

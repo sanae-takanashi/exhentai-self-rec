@@ -423,6 +423,15 @@ function renderStatus(payload) {
   }
   if (payload.refresh) {
     rows.push(["Auto", payload.refresh.message]);
+    if (payload.refresh.last_checked_at) {
+      rows.push(["Checked", payload.refresh.last_checked_at]);
+    }
+    if (payload.refresh.next_check_at) {
+      rows.push(["Next", payload.refresh.next_check_at]);
+    }
+    if (payload.refresh.last_error) {
+      rows.push(["Auto Error", payload.refresh.last_error]);
+    }
   }
   const access = payload.settings && payload.settings.last_access_check;
   if (access) {

@@ -36,6 +36,7 @@ PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
+REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
 
 
@@ -389,6 +390,9 @@ def refresh_summary(conn) -> dict:
         "ready": enabled and has_cookie,
         "interval_minutes": interval,
         "message": message,
+        "last_checked_at": REFRESH_STATE.get("last_checked_at"),
+        "next_check_at": REFRESH_STATE.get("next_check_at") if enabled else None,
+        "last_error": REFRESH_STATE.get("last_error"),
     }
 
 
@@ -933,6 +937,10 @@ def current_timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
+def timestamp_after(seconds: int | float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + max(0, seconds)))
+
+
 def last_fetch_run(conn) -> dict | None:
     runs = fetch_runs(conn, limit=1)
     return runs[0] if runs else None
@@ -990,6 +998,7 @@ def safe_json_list(raw: str | None) -> list:
 def background_refresh(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
+            REFRESH_STATE.update({"last_checked_at": current_timestamp(), "last_error": None})
             with db.connect() as conn:
                 enabled = db.get_setting(conn, "auto_refresh", "1") == "1"
                 interval = refresh_interval_minutes(conn)
@@ -999,18 +1008,23 @@ def background_refresh(stop: threading.Event) -> None:
             wait_for_refresh_wake(stop, max(300, interval * 60))
         except Exception as exc:
             print(f"background refresh failed: {exc}")
+            REFRESH_STATE.update({"last_error": str(exc)})
             wait_for_refresh_wake(stop, 300)
 
 
 def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
+    REFRESH_STATE["next_check_at"] = timestamp_after(timeout)
     deadline = time.monotonic() + max(0, timeout)
     while not stop.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            REFRESH_STATE["next_check_at"] = None
             return
         if REFRESH_WAKE.wait(min(remaining, 1.0)):
             REFRESH_WAKE.clear()
+            REFRESH_STATE["next_check_at"] = None
             return
+    REFRESH_STATE["next_check_at"] = None
 
 
 def main() -> None:

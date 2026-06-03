@@ -29,6 +29,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Fetch-plan preview showing recent, bootstrap, learned, or manual queries before a refresh.
 - Fetch status history so you can see recent refreshes, queries, counts, and errors.
 - Background refresh while the server is running, with the browser queue reloading after completed refreshes.
+- Refresh status shows the background worker's last check, next scheduled check, and latest loop error when available.
 - Auto-refresh wakes promptly when you save cookies, bootstrap tags, or refresh settings instead of waiting for the previous sleep window.
 
 ## Quick start
@@ -62,6 +63,8 @@ Positive bootstrap preferences are added to the fetch plan by descending weight,
 Learned query expansion skips tags that exactly match a negative remote-search bootstrap preference, so a disliked tag is not reintroduced as an automatic learned search. Manual one-off searches still run exactly what you type.
 
 The refresh panel also shows whether auto refresh is disabled, waiting for a saved cookie, or ready to run at the configured interval.
+
+When auto refresh is running, the refresh panel shows the worker's latest check time and next scheduled check time. If the background loop hits an unexpected error before a normal fetch run is recorded, the latest loop error is shown there too.
 
 Local metadata preferences such as `category:manga` and `uploader:name` affect ranking and detail selection, but are not used as generated remote search queries.
 
