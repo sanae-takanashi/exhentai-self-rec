@@ -269,7 +269,11 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         conn.execute("DELETE FROM bootstrap_tags")
 
     galleries = payload.get("galleries") or []
+    imported_galleries = 0
     for gallery in galleries:
+        gallery_url = str(gallery.get("url") or "").strip()
+        if not gallery_url:
+            continue
         conn.execute(
             """
             INSERT INTO galleries(
@@ -293,7 +297,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 last_seen_at = COALESCE(excluded.last_seen_at, galleries.last_seen_at)
             """,
             (
-                gallery.get("url"),
+                gallery_url,
                 gallery.get("gid"),
                 gallery.get("token"),
                 gallery.get("title") or "Imported gallery",
@@ -309,6 +313,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 gallery.get("last_seen_at"),
             ),
         )
+        imported_galleries += 1
 
     imported_tags = 0
     for tag in payload.get("bootstrap_tags") or []:
@@ -353,7 +358,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
     retrain_model(conn)
     return {
         "bootstrap_tags": imported_tags,
-        "galleries": len(galleries),
+        "galleries": imported_galleries,
         "feedback": imported_feedback,
     }
 

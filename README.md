@@ -99,6 +99,8 @@ Learned feature weights are intentionally simple and inspectable. The model view
 
 Use `Export` and `Import` in the backup panel to move bootstrap tags and feedback history between local installs. `Replace data` clears existing local bootstrap tags and feedback before import. Exports intentionally do not include your ExHentai cookie.
 
+Import skips malformed gallery rows without URLs and only reports galleries and feedback that could be applied to the local database.
+
 Data is stored in `data/recommender.sqlite3` by default. Override with:
 
 ```bash

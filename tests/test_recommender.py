@@ -407,6 +407,21 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(result["bootstrap_tags"], 1)
         self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:import value", "weight": 3.0}])
 
+    def test_import_preferences_skips_galleries_without_urls(self):
+        payload = {
+            "schema": "exh-rec-preferences-v1",
+            "bootstrap_tags": [],
+            "galleries": [{"title": "Broken Import", "tags_json": '["artist:broken"]'}],
+            "feedback": [{"gallery_url": "", "vote": 1.0}],
+        }
+
+        result = import_preferences(self.conn, payload)
+        count = self.conn.execute("SELECT COUNT(*) AS c FROM galleries").fetchone()["c"]
+
+        self.assertEqual(result["galleries"], 0)
+        self.assertEqual(result["feedback"], 0)
+        self.assertEqual(count, 0)
+
     def test_import_rejects_unknown_schema(self):
         with self.assertRaises(ValueError):
             import_preferences(self.conn, {"schema": "unknown"})
