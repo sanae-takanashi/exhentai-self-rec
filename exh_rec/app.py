@@ -699,6 +699,7 @@ def fetch_and_store(
 
         status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
+            clear_shared_thumbnail_metadata(conn)
             if enriched:
                 retrain_model(conn)
                 model_retrained = True
@@ -807,6 +808,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
 
         status = "failed" if errors and enriched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
+            clear_shared_thumbnail_metadata(conn)
             if enriched:
                 retrain_model(conn)
                 model_retrained = True
