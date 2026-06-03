@@ -13,6 +13,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Bootstrap preferences with positive/negative weights across tags, title text, category, and uploader metadata.
 - SQLite storage for galleries, settings, votes, and learned feature weights.
 - Online learning from thumbs up/down or 1-5 scores using title tokens, categories, uploaders, and parsed tags, with namespace-aware weighting for stronger identity tags.
+- Repeated same-direction feedback on the same gallery adds a small capped confidence boost, while a later opposite vote resets that direction.
 - Conservative gallery-detail enrichment so recommendations learn from full gallery tags, not only titles. Refreshes prefer promising galleries that have not already been detail-enriched.
 - Fetch and enrichment runs retrain the model whenever they add detail metadata, so feedback on an already-rated gallery can immediately learn from the fuller tag set.
 - Detail parsing reads normal tag links and ExHentai taglist attributes, including `artist:`, `female:`, `parody:`, and related namespaces.
@@ -99,6 +100,8 @@ Use `Clear` on a rated card to remove that gallery's feedback history, retrain t
 Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.
 
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
+
+If you rate the same gallery more than once in the same direction, the latest signal gets a small capped confidence boost during retraining. A later opposite vote changes the learned direction instead of preserving the older streak.
 
 Use `Export` and `Import` in the backup panel to move bootstrap tags and feedback history between local installs. `Replace data` clears existing local bootstrap tags and feedback before import. Exports intentionally do not include your ExHentai cookie.
 

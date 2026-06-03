@@ -14,6 +14,9 @@ from .exhentai import Gallery
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
 LEARNING_RATE = 0.35
 MAX_FEEDBACK_SIGNAL = 1.0
+FEEDBACK_CONFIDENCE_STEP = 0.15
+MAX_FEEDBACK_CONFIDENCE_BOOST = 0.45
+MAX_FEEDBACK_CONFIDENCE_HISTORY = 5
 DIVERSITY_PENALTY = 0.45
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
@@ -424,7 +427,7 @@ def retrain_model(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM feature_weights")
     rows = conn.execute(
         """
-        SELECT g.*, f.vote AS feedback_signal
+        SELECT g.*, f.id AS feedback_id, f.vote AS feedback_signal
         FROM feedback f
         JOIN galleries g ON g.url = f.gallery_url
         JOIN (
@@ -438,8 +441,36 @@ def retrain_model(conn: sqlite3.Connection) -> None:
     for row in rows:
         gallery = dict(row)
         signal = float(gallery.pop("feedback_signal") or 0)
+        feedback_id = int(gallery.pop("feedback_id"))
+        signal *= feedback_confidence(conn, gallery["url"], feedback_id, signal)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         apply_feedback_features(conn, gallery, signal)
+
+
+def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id: int, signal: float) -> float:
+    if signal == 0:
+        return 0.0
+    direction = 1 if signal > 0 else -1
+    rows = conn.execute(
+        """
+        SELECT vote
+        FROM feedback
+        WHERE gallery_url = ? AND id <= ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (gallery_url, feedback_id, MAX_FEEDBACK_CONFIDENCE_HISTORY),
+    ).fetchall()
+    streak = 0
+    for row in rows:
+        vote = float(row["vote"] or 0)
+        if vote == 0:
+            break
+        if (1 if vote > 0 else -1) != direction:
+            break
+        streak += 1
+    boost = min(MAX_FEEDBACK_CONFIDENCE_BOOST, max(0, streak - 1) * FEEDBACK_CONFIDENCE_STEP)
+    return 1.0 + boost
 
 
 def apply_feedback_features(conn: sqlite3.Connection, gallery: dict, signal: float) -> None:

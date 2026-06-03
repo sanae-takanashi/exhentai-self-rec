@@ -4,6 +4,7 @@ import unittest
 from exh_rec import db
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import (
+    LEARNING_RATE,
     clear_feedback,
     bootstrap_search_text,
     export_preferences,
@@ -282,6 +283,48 @@ class RecommenderTest(unittest.TestCase):
         snapshot = model_snapshot(self.conn)
         self.assertEqual(snapshot["counts"]["feedback_events"], 2)
         self.assertEqual(snapshot["counts"]["rated_galleries"], 1)
+
+    def test_repeated_consistent_feedback_increases_learning_confidence(self):
+        repeated_url = "https://exhentai.org/g/6c/f/"
+        single_url = "https://exhentai.org/g/6d/f/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=repeated_url, gid="6c", token="f", title="Repeated Like", tags=["artist:repeat"]),
+                Gallery(url=single_url, gid="6d", token="f", title="Single Like", tags=["artist:single"]),
+            ],
+        )
+
+        record_feedback(self.conn, repeated_url, vote=1)
+        record_feedback(self.conn, repeated_url, score=5)
+        record_feedback(self.conn, single_url, vote=1)
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute(
+                "SELECT feature, weight FROM feature_weights WHERE feature IN (?, ?)",
+                ("tag:artist:repeat", "tag:artist:single"),
+            )
+        }
+
+        self.assertGreater(weights["tag:artist:repeat"], weights["tag:artist:single"])
+
+    def test_opposite_latest_feedback_resets_confidence_direction(self):
+        changed_url = "https://exhentai.org/g/6e/f/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=changed_url, gid="6e", token="f", title="Confidence Reset", tags=["artist:reset"])],
+        )
+
+        record_feedback(self.conn, changed_url, vote=1)
+        record_feedback(self.conn, changed_url, score=5)
+        record_feedback(self.conn, changed_url, vote=-1)
+        row = self.conn.execute(
+            "SELECT weight FROM feature_weights WHERE feature = ?",
+            ("tag:artist:reset",),
+        ).fetchone()
+
+        self.assertLess(row["weight"], 0)
+        self.assertAlmostEqual(row["weight"], -LEARNING_RATE * feature_learning_multiplier("tag:artist:reset"))
 
     def test_model_snapshot_separates_positive_and_negative_weights(self):
         liked_url = "https://exhentai.org/g/6p/f/"
