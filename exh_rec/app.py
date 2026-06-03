@@ -746,8 +746,9 @@ def build_query_plan(
     learned_tags: list[str] | None = None,
     force_query: str | None = None,
 ) -> list[dict]:
-    if force_query:
-        return [{"query": force_query.strip(), "source": "manual", "label": force_query.strip()}] if force_query.strip() else []
+    manual_query = force_query.strip() if isinstance(force_query, str) else ""
+    if manual_query:
+        return [{"query": manual_query, "source": "manual", "label": manual_query}]
     candidates: list[dict] = [{"query": None, "source": "recent", "label": "Recent galleries"}]
     bootstrap_tags = [
         item

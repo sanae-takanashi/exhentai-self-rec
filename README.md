@@ -56,6 +56,8 @@ In the settings panel:
 
 The refresh panel shows the current fetch plan. Typing an optional one-off search query and leaving the field updates the plan preview to that manual query.
 
+Blank or whitespace-only one-off search input uses the normal recent/bootstrap/learned fetch plan.
+
 Generated bootstrap and learned tag queries quote multi-word tag values for ExHentai search reliability, while keeping the plain tag label visible in the plan.
 
 Positive bootstrap preferences are added to the fetch plan by descending weight, with at most six bootstrap-driven searches per refresh.

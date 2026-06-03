@@ -120,6 +120,14 @@ class AppTest(unittest.TestCase):
         plan = build_query_plan([], ["artist:learned"], force_query=" language:english ")
         self.assertEqual(plan, [{"query": "language:english", "source": "manual", "label": "language:english"}])
 
+    def test_build_query_plan_blank_force_query_uses_normal_plan(self):
+        plan = build_query_plan([{"tag": "artist:seed", "weight": 1.0}], ["female:learned"], force_query="   ")
+
+        self.assertEqual(
+            [(item["query"], item["source"]) for item in plan],
+            [(None, "recent"), ("artist:seed", "bootstrap"), ("female:learned", "learned")],
+        )
+
     def test_build_query_plan_skips_learned_tags_blocked_by_negative_bootstrap(self):
         plan = build_query_plan(
             [
