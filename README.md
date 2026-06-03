@@ -49,6 +49,37 @@ The server binds to `0.0.0.0` by default, so another device on the same network 
 EXH_REC_HOST=127.0.0.1 python3 -m exh_rec.app
 ```
 
+## Windows virtualenv
+
+From PowerShell in the repo root:
+
+```powershell
+.\scripts\setup-venv.ps1
+.\scripts\run.ps1
+```
+
+Open <http://127.0.0.1:8787>. The helper creates `.venv`, installs runtime dependencies from `requirements.txt`, and runs `python -m exh_rec.app` from that virtualenv.
+
+For DINOv2 on CPU:
+
+```powershell
+.\scripts\setup-venv.ps1 -Visual cpu
+.\scripts\run.ps1 -DinoDevice cpu
+```
+
+For DINOv2 with CUDA, install a CUDA-enabled PyTorch build. If your PyTorch/CUDA wheel index is known, pass it explicitly:
+
+```powershell
+.\scripts\setup-venv.ps1 -Visual cuda -TorchIndexUrl "https://download.pytorch.org/whl/cu121"
+.\scripts\run.ps1 -DinoDevice cuda
+```
+
+If your PowerShell policy blocks local scripts, run:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
 In the settings panel:
 
 - Paste your ExHentai cookie header, usually including `ipb_member_id`, `ipb_pass_hash`, and `igneous`. You can also paste multiline `name=value` cookie fragments, copied browser cookie-table rows with or without the header row, or Netscape/curl cookie file rows; the app stores only the cookie name/value pairs.
@@ -126,7 +157,7 @@ Use `Retrain` to rebuild learned weights from stored feedback. This is also done
 
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
 
-Visual embeddings prefer server-side DINOv2 (`facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`). Install the optional stack with your preferred PyTorch build plus `transformers` and `Pillow`; if DINOv2 cannot load, the browser automatically decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
+Visual embeddings prefer server-side DINOv2 (`facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`). Install the optional stack with your preferred PyTorch build plus `transformers`, `torchvision`, and `Pillow`; if DINOv2 cannot load, the browser automatically decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
 
 Set `DINOv2 device` in the settings panel, or use `EXH_REC_DINOV2_DEVICE`, to control where PyTorch runs:
 
@@ -169,6 +200,8 @@ SOCKS5 support requires PySocks:
 ```bash
 python3 -m pip install PySocks
 ```
+
+The Windows venv helper installs PySocks through `requirements.txt`.
 
 When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route.
 
