@@ -191,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
             elif path == "/api/check":
                 result = check_saved_access()
-                self.send_json(result, status=HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST)
+                self.send_json(result)
             elif path == "/api/import":
                 payload = self.read_json()
                 replace = parse_bool(payload.get("replace"))

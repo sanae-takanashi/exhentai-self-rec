@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import time
 import tempfile
+from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from exh_rec.app import (
     ApiError,
     REFRESH_STATE,
     REFRESH_WAKE,
+    Handler,
     background_refresh,
     build_queries,
     build_query_plan,
@@ -204,6 +206,19 @@ class AppTest(unittest.TestCase):
         db.set_setting(conn, "last_access_check", "{bad")
         self.assertIsNone(get_access_check(conn))
         conn.close()
+
+    def test_check_api_returns_failed_access_message_as_json_result(self):
+        sent = []
+        handler = Handler.__new__(Handler)
+        handler.path = "/api/check"
+        handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+        handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+        result = {"ok": False, "gallery_count": 0, "message": "Cookie did not expose gallery listings"}
+
+        with patch("exh_rec.app.check_saved_access", return_value=result):
+            handler.do_POST()
+
+        self.assertEqual(sent, [(result, HTTPStatus.OK)])
 
     def test_fetch_runs_decodes_history_safely(self):
         conn = sqlite3.connect(":memory:")
