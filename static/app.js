@@ -8,6 +8,8 @@ const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const minutesEl = document.querySelector("#minutes");
+const networkProxyEl = document.querySelector("#networkProxy");
+const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
@@ -256,6 +258,8 @@ async function loadSettings() {
   candidateLimitEl.value = settings.recommend_candidate_limit;
   sampleExtraPagesEl.value = settings.sample_extra_pages;
   minutesEl.value = settings.refresh_interval_minutes;
+  networkProxyEl.value = settings.network_proxy || "";
+  dinov2DeviceEl.value = settings.dinov2_device || "auto";
   autoRefreshEl.checked = settings.auto_refresh;
 }
 
@@ -284,6 +288,8 @@ async function saveSettings() {
     recommend_candidate_limit: Number(candidateLimitEl.value),
     sample_extra_pages: Number(sampleExtraPagesEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
+    network_proxy: networkProxyEl.value.trim(),
+    dinov2_device: dinov2DeviceEl.value.trim(),
     auto_refresh: autoRefreshEl.checked,
   };
   const settings = await api("/api/settings", {
@@ -710,6 +716,19 @@ function renderStatus(payload) {
   if (access) {
     rows.push(["Access", `${access.ok ? "OK" : "Failed"} at ${access.checked_at}`]);
     rows.push(["Login", access.message]);
+  }
+  if (payload.settings && payload.settings.network_proxy_preview) {
+    rows.push(["Proxy", payload.settings.network_proxy_preview]);
+  }
+  if (payload.visual && payload.visual.dinov2) {
+    const dino = payload.visual.dinov2;
+    rows.push(["DINOv2", `${dino.available ? "Available" : "Fallback"} on ${dino.device || dino.device_config || "auto"}`]);
+    if (dino.cuda_available) {
+      rows.push(["CUDA", `${dino.cuda_device_count || 0} device(s)${dino.cuda_device_name ? `, ${dino.cuda_device_name}` : ""}`]);
+    }
+    if (dino.error) {
+      rows.push(["DINO Error", dino.error]);
+    }
   }
   refreshStatusEl.innerHTML = rows
     .map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`)

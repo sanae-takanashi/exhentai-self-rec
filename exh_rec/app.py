@@ -25,6 +25,7 @@ from .exhentai import (
     normalize_cookie_header,
     valid_cookie_header,
 )
+from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url, proxy_preview
 from .recommender import (
     clear_feedback,
     export_preferences,
@@ -46,11 +47,13 @@ from .recommender import (
 )
 from .visual import (
     DEFAULT_VISUAL_ENCODER,
+    DEFAULT_DINOV2_DEVICE,
     DINOV2_VISUAL_VERSION,
     SIMPLE_VISUAL_VERSION,
     VisualEncoderUnavailable,
     dinov2_dependency_status,
     dinov2_embedding,
+    normalize_dinov2_device,
 )
 
 
@@ -302,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
 def get_settings() -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
+        proxy_url = network_proxy(conn)
+        dinov2_device = configured_dinov2_device(conn)
         return {
             "has_cookie": bool(cookie),
             "cookie_preview": preview_cookie(cookie),
@@ -313,7 +318,10 @@ def get_settings() -> dict:
             "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
             "sample_extra_pages": sample_extra_pages(conn),
-            "visual": visual_settings(),
+            "network_proxy": proxy_url,
+            "network_proxy_preview": proxy_preview(proxy_url),
+            "dinov2_device": dinov2_device,
+            "visual": visual_settings(dinov2_device),
             "last_access_check": get_access_check(conn),
             "bootstrap_tags": get_bootstrap_tags(conn),
         }
@@ -321,6 +329,8 @@ def get_settings() -> dict:
 
 def get_status() -> dict:
     with db.connect() as conn:
+        proxy_url = network_proxy(conn)
+        dinov2_device = configured_dinov2_device(conn)
         return {
             "fetch": dict(FETCH_STATE),
             "last_fetch": last_fetch_run(conn),
@@ -335,9 +345,12 @@ def get_status() -> dict:
                 "learned_query_limit": learned_query_limit(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
+                "network_proxy": proxy_url,
+                "network_proxy_preview": proxy_preview(proxy_url),
+                "dinov2_device": dinov2_device,
                 "last_access_check": get_access_check(conn),
             },
-            "visual": visual_settings(),
+            "visual": visual_settings(dinov2_device),
         }
 
 
@@ -383,6 +396,20 @@ def save_settings(payload: dict[str, Any]) -> None:
             extra = bounded_int(payload["sample_extra_pages"], default=2, lower=0, upper=10)
             db.set_setting(conn, "sample_extra_pages", str(extra))
             refresh_relevant_change = True
+        if "network_proxy" in payload:
+            try:
+                proxy_url = normalize_proxy_url(payload["network_proxy"])
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            db.set_setting(conn, "network_proxy", proxy_url)
+            apply_proxy_environment(proxy_url)
+            refresh_relevant_change = True
+        if "dinov2_device" in payload:
+            try:
+                device = normalize_dinov2_device(payload["dinov2_device"])
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            db.set_setting(conn, "dinov2_device", device)
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
             refresh_relevant_change = True
@@ -397,16 +424,32 @@ def wake_background_refresh() -> None:
 def check_saved_access() -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
+        proxy_url = network_proxy(conn)
     if not cookie:
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
     try:
-        result = check_access(cookie)
+        result = check_access(cookie, proxy_url=proxy_url)
     except Exception as exc:
         result = {"ok": False, "gallery_count": 0, "message": str(exc)}
     result["checked_at"] = current_timestamp()
     with db.connect() as conn:
         db.set_setting(conn, "last_access_check", json.dumps(result, ensure_ascii=True))
     return result
+
+
+def network_proxy(conn) -> str:
+    raw = db.get_setting(conn, "network_proxy", "")
+    try:
+        return normalize_proxy_url(raw or default_proxy_url())
+    except ValueError:
+        return ""
+
+
+def configured_dinov2_device(conn) -> str:
+    try:
+        return normalize_dinov2_device(db.get_setting(conn, "dinov2_device", DEFAULT_DINOV2_DEVICE))
+    except ValueError:
+        return normalize_dinov2_device(DEFAULT_DINOV2_DEVICE)
 
 
 def import_preferences_payload(data: dict, replace: bool = False) -> dict:
@@ -440,7 +483,11 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     image_urls = payload.get("image_urls") or []
     if not isinstance(image_urls, list):
         raise ApiError(HTTPStatus.BAD_REQUEST, "image_urls must be a list")
-    dinov2_status = dinov2_dependency_status()
+    with db.connect() as conn:
+        proxy_url = network_proxy(conn)
+        dinov2_device = configured_dinov2_device(conn)
+    apply_proxy_environment(proxy_url)
+    dinov2_status = dinov2_dependency_status(dinov2_device)
     if not dinov2_status.get("available"):
         return {
             "ok": False,
@@ -461,7 +508,7 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     if not blobs:
         raise ApiError(HTTPStatus.BAD_REQUEST, "no usable visual images")
     try:
-        embedding = dinov2_embedding(blobs)
+        embedding = dinov2_embedding(blobs, device=dinov2_device)
     except VisualEncoderUnavailable as exc:
         return {
             "ok": False,
@@ -487,13 +534,14 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     }
 
 
-def visual_settings() -> dict:
+def visual_settings(device: str | None = None) -> dict:
+    device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
     return {
         "default_encoder": DEFAULT_VISUAL_ENCODER,
         "default_version": DINOV2_VISUAL_VERSION,
         "fallback_encoder": "simple",
         "fallback_version": SIMPLE_VISUAL_VERSION,
-        "dinov2": dinov2_dependency_status(),
+        "dinov2": dinov2_dependency_status(device),
     }
 
 
@@ -579,6 +627,7 @@ def fetch_and_store(
         detail_limit = detail_fetch_limit(conn)
         learned_limit = learned_query_limit(conn)
         extra_pages = sample_extra_pages(conn)
+        proxy_url = network_proxy(conn)
         tags = get_bootstrap_tags(conn)
         learned_tags = learned_query_tags(conn, learned_limit)
     if not cookie:
@@ -616,7 +665,7 @@ def fetch_and_store(
 
         for query in queries:
             try:
-                galleries = fetch_galleries(cookie, query=query, pages=pages)
+                galleries = fetch_galleries(cookie, query=query, pages=pages, proxy_url=proxy_url)
                 fetched += len(galleries)
                 with db.connect() as conn:
                     stored += store_galleries(conn, galleries)
@@ -632,8 +681,8 @@ def fetch_and_store(
 
         for gallery in selected_for_detail:
             try:
-                detailed = fetch_gallery_detail(cookie, gallery)
-                samples = collect_gallery_samples(cookie, detailed, extra_pages)
+                detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
+                samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
@@ -704,6 +753,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         cookie = db.get_setting(conn, "cookie_header", "")
         detail_limit = detail_fetch_limit(conn)
         extra_pages = sample_extra_pages(conn)
+        proxy_url = network_proxy(conn)
     if not cookie:
         FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
@@ -743,8 +793,8 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
 
         for gallery in candidates:
             try:
-                detailed = fetch_gallery_detail(cookie, gallery)
-                samples = collect_gallery_samples(cookie, detailed, extra_pages)
+                detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
+                samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
@@ -813,12 +863,13 @@ def collect_gallery_samples(
     detailed: Gallery,
     extra_pages: int,
     delay: float = 1.0,
+    proxy_url: str = "",
 ) -> list[str]:
     """Pick a random spread of page thumbnails for ``detailed`` (5 + pages//100)."""
     pool = list(dict.fromkeys(detailed.sample_thumbs))
     count = sample_count_for(detailed.page_count)
     if len(pool) < count and extra_pages > 0:
-        for thumb in fetch_gallery_sample_pages(cookie, detailed, extra_pages, delay=delay):
+        for thumb in fetch_gallery_sample_pages(cookie, detailed, extra_pages, delay=delay, proxy_url=proxy_url):
             if thumb not in pool:
                 pool.append(thumb)
     if len(pool) <= count:
@@ -830,6 +881,7 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         extra_pages = sample_extra_pages(conn)
+        proxy_url = network_proxy(conn)
         row = conn.execute("SELECT * FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         if not row:
             return {"status": "skipped", "reason": "gallery not found"}
@@ -841,8 +893,8 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         gallery = gallery_from_item(item)
 
     try:
-        detailed = fetch_gallery_detail(cookie, gallery, delay=0)
-        samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0)
+        detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+        samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
     except Exception as exc:
         return {"status": "failed", "reason": str(exc)}
 
@@ -1150,10 +1202,11 @@ def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]
 
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
+        proxy_url = network_proxy(conn)
     if not cookie:
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
-    data, content_type = fetch_thumbnail_bytes(cookie, thumb_url, thumbnail_referer(gallery_url))
+    data, content_type = fetch_thumbnail_bytes(cookie, thumb_url, thumbnail_referer(gallery_url), proxy_url=proxy_url)
     data_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.write_bytes(data)
     meta_path.write_text(
@@ -1211,7 +1264,13 @@ def thumbnail_referer(gallery_url: str) -> str:
     return "https://exhentai.org/"
 
 
-def fetch_thumbnail_bytes(cookie_header: str, thumb_url: str, referer: str, timeout: int = 20) -> tuple[bytes, str]:
+def fetch_thumbnail_bytes(
+    cookie_header: str,
+    thumb_url: str,
+    referer: str,
+    timeout: int = 20,
+    proxy_url: str = "",
+) -> tuple[bytes, str]:
     request = urllib.request.Request(
         thumb_url,
         headers={
@@ -1222,7 +1281,7 @@ def fetch_thumbnail_bytes(cookie_header: str, thumb_url: str, referer: str, time
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
             content_type = response_content_type(response.headers)
             data = response.read(THUMB_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -1385,6 +1444,7 @@ def server_display_url(host: str, port: int) -> str:
 def main() -> None:
     db.init_db()
     with db.connect() as conn:
+        apply_proxy_environment(network_proxy(conn))
         finish_interrupted_fetch_runs(conn)
         retrain_model(conn)
     server = ThreadingHTTPServer((HOST, PORT), Handler)

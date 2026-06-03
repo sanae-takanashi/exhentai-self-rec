@@ -18,7 +18,9 @@ from exh_rec.app import (
     build_queries,
     build_query_plan,
     cached_thumbnail,
+    check_saved_access,
     collect_gallery_samples,
+    configured_dinov2_device,
     enrich_feedback_gallery,
     enrich_recommendations,
     ensure_gallery_exists,
@@ -33,6 +35,7 @@ from exh_rec.app import (
     is_allowed_thumbnail_url,
     is_remote_search_preference,
     missing_common_cookie_keys,
+    network_proxy,
     parse_bool,
     parse_feedback_request,
     query_int,
@@ -212,7 +215,7 @@ class AppTest(unittest.TestCase):
 
         calls = []
 
-        def fake_urlopen(request, timeout):
+        def fake_open_url(request, timeout, proxy_url=""):
             calls.append(request)
             return Response()
 
@@ -223,7 +226,7 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
 
-                with patch("exh_rec.app.urllib.request.urlopen", fake_urlopen):
+                with patch("exh_rec.app.open_url", fake_open_url):
                     first = cached_thumbnail(
                         "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
                         "https://exhentai.org/g/123/abcdef/",
@@ -239,6 +242,45 @@ class AppTest(unittest.TestCase):
         self.assertEqual(calls[0].full_url, "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp")
         self.assertEqual(calls[0].get_header("Cookie"), "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
         self.assertEqual(calls[0].get_header("Referer"), "https://exhentai.org/g/123/abcdef/")
+
+    def test_cached_thumbnail_uses_configured_proxy(self):
+        class Headers:
+            def get_content_type(self):
+                return "image/webp"
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, size=-1):
+                return b"thumb-bytes"
+
+        calls = []
+
+        def fake_open_url(request, timeout, proxy_url=""):
+            calls.append(proxy_url)
+            return Response()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
+                    db.set_setting(conn, "network_proxy", "socks5://127.0.0.1:1080")
+
+                with patch("exh_rec.app.open_url", fake_open_url):
+                    cached_thumbnail(
+                        "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
+                        "https://exhentai.org/g/123/abcdef/",
+                    )
+
+        self.assertEqual(calls, ["socks5://127.0.0.1:1080"])
 
     def test_cached_thumbnail_rejects_unsupported_hosts(self):
         with self.assertRaises(ApiError) as ctx:
@@ -967,6 +1009,52 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     self.assertEqual(db.get_setting(conn, "cookie_header", ""), "")
                     self.assertIsNone(get_access_check(conn))
+
+    def test_save_settings_stores_proxy_and_dinov2_device(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+
+                save_settings({"network_proxy": "127.0.0.1:7890", "dinov2_device": "CUDA:0"})
+
+                with db.connect() as conn:
+                    self.assertEqual(network_proxy(conn), "http://127.0.0.1:7890")
+                    self.assertEqual(configured_dinov2_device(conn), "cuda:0")
+                settings = get_settings()
+                self.assertEqual(settings["network_proxy_preview"], "http://127.0.0.1:7890")
+                self.assertEqual(settings["dinov2_device"], "cuda:0")
+
+    def test_save_settings_rejects_invalid_proxy_and_dinov2_device(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+
+                with self.assertRaises(ApiError) as proxy_ctx:
+                    save_settings({"network_proxy": "ftp://127.0.0.1:21"})
+                with self.assertRaises(ApiError) as device_ctx:
+                    save_settings({"dinov2_device": "gpu"})
+
+                self.assertEqual(proxy_ctx.exception.status.value, 400)
+                self.assertIn("Proxy must use", proxy_ctx.exception.message)
+                self.assertEqual(device_ctx.exception.status.value, 400)
+                self.assertIn("DINOv2 device", device_ctx.exception.message)
+
+    def test_check_saved_access_uses_configured_proxy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "network_proxy", "https://proxy.local:8443")
+
+                with patch("exh_rec.app.check_access", return_value={"ok": True, "gallery_count": 1, "message": "ok"}) as check:
+                    result = check_saved_access()
+
+                self.assertTrue(result["ok"])
+                check.assert_called_once_with("ipb_member_id=123; ipb_pass_hash=abc", proxy_url="https://proxy.local:8443")
 
     def test_save_settings_parses_string_false_booleans(self):
         with tempfile.TemporaryDirectory() as tmpdir:

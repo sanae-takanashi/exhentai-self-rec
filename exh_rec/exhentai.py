@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
+from .net import open_url
+
 
 BASE_URL = "https://exhentai.org/"
 GALLERY_RE = re.compile(r"(?:https?:)?(?://(?:exhentai|e-hentai)\.org)?/g/(\d+)/([0-9a-fA-F]+)/?")
@@ -206,7 +208,7 @@ def build_search_url(query: str | None = None, page: int = 0) -> str:
     return BASE_URL + ("?" + urllib.parse.urlencode(params) if params else "")
 
 
-def fetch_page(cookie_header: str, url: str, timeout: int = 30) -> str:
+def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str = "") -> str:
     request = urllib.request.Request(
         url,
         headers={
@@ -216,7 +218,7 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             return response.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
@@ -226,11 +228,17 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30) -> str:
         raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
 
 
-def fetch_galleries(cookie_header: str, query: str | None, pages: int = 1, delay: float = 1.0) -> list[Gallery]:
+def fetch_galleries(
+    cookie_header: str,
+    query: str | None,
+    pages: int = 1,
+    delay: float = 1.0,
+    proxy_url: str = "",
+) -> list[Gallery]:
     galleries: list[Gallery] = []
     seen: set[str] = set()
     for page in range(max(1, pages)):
-        page_html = fetch_page(cookie_header, build_search_url(query, page))
+        page_html = fetch_page(cookie_header, build_search_url(query, page), proxy_url=proxy_url)
         for gallery in parse_gallery_list(page_html, source_query=query):
             if gallery.url not in seen:
                 galleries.append(gallery)
@@ -240,8 +248,8 @@ def fetch_galleries(cookie_header: str, query: str | None, pages: int = 1, delay
     return galleries
 
 
-def check_access(cookie_header: str) -> dict:
-    page_html = fetch_page(cookie_header, BASE_URL, timeout=15)
+def check_access(cookie_header: str, proxy_url: str = "") -> dict:
+    page_html = fetch_page(cookie_header, BASE_URL, timeout=15, proxy_url=proxy_url)
     galleries = parse_gallery_list(page_html)
     lower_html = page_html.lower()
     if galleries:
@@ -251,10 +259,10 @@ def check_access(cookie_header: str) -> dict:
     return {"ok": False, "gallery_count": 0, "message": "Fetched page, but no gallery listings were found"}
 
 
-def fetch_gallery_detail(cookie_header: str, gallery: Gallery, delay: float = 1.0) -> Gallery:
+def fetch_gallery_detail(cookie_header: str, gallery: Gallery, delay: float = 1.0, proxy_url: str = "") -> Gallery:
     if delay:
         time.sleep(delay)
-    page_html = fetch_page(cookie_header, gallery.url)
+    page_html = fetch_page(cookie_header, gallery.url, proxy_url=proxy_url)
     detail = parse_gallery_detail(page_html, gallery.url)
     return merge_gallery(gallery, detail)
 
@@ -264,6 +272,7 @@ def fetch_gallery_sample_pages(
     gallery: Gallery,
     extra_pages: int,
     delay: float = 1.0,
+    proxy_url: str = "",
 ) -> list[str]:
     """Fetch up to ``extra_pages`` additional image-list pages and return their thumbnails.
 
@@ -284,7 +293,7 @@ def fetch_gallery_sample_pages(
     for page in chosen:
         if delay:
             time.sleep(delay)
-        page_html = fetch_page(cookie_header, sample_page_url(gallery.url, page))
+        page_html = fetch_page(cookie_header, sample_page_url(gallery.url, page), proxy_url=proxy_url)
         _, page_thumbs = parse_gallery_pages(page_html)
         thumbs.extend(page_thumbs)
     return thumbs

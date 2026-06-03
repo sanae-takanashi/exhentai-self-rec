@@ -128,6 +128,16 @@ Learned feature weights are intentionally simple and inspectable. The model view
 
 Visual embeddings prefer server-side DINOv2 (`facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`). Install the optional stack with your preferred PyTorch build plus `transformers` and `Pillow`; if DINOv2 cannot load, the browser automatically decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
 
+Set `DINOv2 device` in the settings panel, or use `EXH_REC_DINOV2_DEVICE`, to control where PyTorch runs:
+
+```bash
+EXH_REC_DINOV2_DEVICE=cpu python3 -m exh_rec.app
+EXH_REC_DINOV2_DEVICE=cuda python3 -m exh_rec.app
+EXH_REC_DINOV2_DEVICE=cuda:0 python3 -m exh_rec.app
+```
+
+`auto` is the default and uses CUDA when `torch.cuda.is_available()` is true, then falls back to CPU. Use a CUDA-enabled PyTorch install on your laptop if you want GPU acceleration; CPU-only PyTorch is enough when you want to avoid GPU packages.
+
 If you rate the same gallery more than once in the same direction, the latest signal gets a small capped confidence boost during retraining. A later opposite vote changes the learned direction instead of preserving the older streak.
 
 Use `Export` and `Import` in the backup panel to move bootstrap tags and feedback history between local installs. `Replace data` clears existing local bootstrap tags and feedback before import. Exports intentionally do not include your ExHentai cookie.
@@ -145,6 +155,22 @@ EXH_REC_DATA_DIR=/path/to/private/data python3 -m exh_rec.app
 Thumbnails are served through the local app instead of hotlinked from ExHentai, then cached under `data/thumbs`. This lets the server use the saved cookie and gallery referer when ExHentai's thumbnail host rejects direct browser requests.
 
 Cached thumbnail image bytes live on disk as files, not in SQLite. SQLite holds only metadata (gallery info, settings, votes, feature weights, and sample thumbnail URLs). Each cached thumbnail is stored as two files named by the `sha256` of its source URL under `data/thumbs/`: a `.bin` with the raw image bytes and a `.json` with the source URL, content type, and fetch time. Cover thumbnails and the per-gallery sample previews share this cache. It is permanent (no automatic eviction or TTL) and capped at 5 MB per image; to reclaim space you can safely delete `data/thumbs/` and images will be re-fetched on demand.
+
+Set `Proxy` in the settings panel, or use `EXH_REC_PROXY`, to route ExHentai page fetches, detail enrichment, sample-page fetches, and proxied thumbnails through a local proxy:
+
+```bash
+EXH_REC_PROXY=http://127.0.0.1:7890 python3 -m exh_rec.app
+EXH_REC_PROXY=https://127.0.0.1:7890 python3 -m exh_rec.app
+EXH_REC_PROXY=socks5://127.0.0.1:1080 python3 -m exh_rec.app
+```
+
+SOCKS5 support requires PySocks:
+
+```bash
+python3 -m pip install PySocks
+```
+
+When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route.
 
 Override the bind address or port with:
 
