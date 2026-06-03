@@ -128,14 +128,14 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json()
                 result = fetch_and_store(
                     force_query=payload.get("query"),
-                    include_rated=bool(payload.get("include_rated")),
+                    include_rated=parse_bool(payload.get("include_rated")),
                     filter_text=payload.get("filter_text"),
                 )
                 self.send_json(result)
             elif path == "/api/enrich":
                 payload = self.read_json()
                 result = enrich_recommendations(
-                    include_rated=bool(payload.get("include_rated")),
+                    include_rated=parse_bool(payload.get("include_rated")),
                     filter_text=payload.get("filter_text"),
                     limit=payload.get("limit"),
                 )
@@ -154,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
                     page = recommendation_payload(
                         conn,
                         limit=40,
-                        include_rated=bool(payload.get("include_rated")),
+                        include_rated=parse_bool(payload.get("include_rated")),
                         filter_text=payload.get("filter_text"),
                     )
                 self.send_json({"ok": True, "feedback_enrichment": feedback_enrichment, **page})
@@ -169,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
                     page = recommendation_payload(
                         conn,
                         limit=40,
-                        include_rated=bool(payload.get("include_rated")),
+                        include_rated=parse_bool(payload.get("include_rated")),
                         filter_text=payload.get("filter_text"),
                     )
                 self.send_json({"ok": True, "removed": removed, **page})
@@ -184,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                             **recommendation_payload(
                                 conn,
                                 limit=40,
-                                include_rated=bool(payload.get("include_rated")),
+                                include_rated=parse_bool(payload.get("include_rated")),
                                 filter_text=payload.get("filter_text"),
                             ),
                         }
@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result, status=HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST)
             elif path == "/api/import":
                 payload = self.read_json()
-                replace = bool(payload.get("replace"))
+                replace = parse_bool(payload.get("replace"))
                 data = payload.get("data")
                 if not isinstance(data, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "data must be an exported preferences object")
@@ -284,7 +284,7 @@ def get_status() -> dict:
 def save_settings(payload: dict[str, Any]) -> None:
     refresh_relevant_change = False
     with db.connect() as conn:
-        if payload.get("clear_cookie"):
+        if parse_bool(payload.get("clear_cookie")):
             db.set_setting(conn, "cookie_header", "")
             db.set_setting(conn, "last_access_check", "")
             refresh_relevant_change = True
@@ -298,7 +298,7 @@ def save_settings(payload: dict[str, Any]) -> None:
                 db.set_setting(conn, "last_access_check", "")
                 refresh_relevant_change = True
         if "auto_refresh" in payload:
-            db.set_setting(conn, "auto_refresh", "1" if payload["auto_refresh"] else "0")
+            db.set_setting(conn, "auto_refresh", "1" if parse_bool(payload["auto_refresh"]) else "0")
             refresh_relevant_change = True
         if "refresh_interval_minutes" in payload:
             minutes = bounded_int(payload["refresh_interval_minutes"], default=30, lower=5, upper=240)

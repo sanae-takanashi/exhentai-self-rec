@@ -154,8 +154,12 @@ class AppTest(unittest.TestCase):
     def test_parse_bool(self):
         self.assertTrue(parse_bool("1"))
         self.assertTrue(parse_bool("true"))
+        self.assertTrue(parse_bool("on"))
+        self.assertTrue(parse_bool("yes"))
         self.assertTrue(parse_bool(True))
         self.assertFalse(parse_bool("0"))
+        self.assertFalse(parse_bool("false"))
+        self.assertFalse(parse_bool("off"))
         self.assertFalse(parse_bool(None))
 
     def test_query_int_defaults_invalid_values_and_clamps_bounds(self):
@@ -618,6 +622,20 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     self.assertEqual(db.get_setting(conn, "cookie_header", ""), "")
                     self.assertIsNone(get_access_check(conn))
+
+    def test_save_settings_parses_string_false_booleans(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+
+                save_settings({"clear_cookie": "false", "auto_refresh": "false"})
+
+                with db.connect() as conn:
+                    self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=123; ipb_pass_hash=abc")
+                    self.assertEqual(db.get_setting(conn, "auto_refresh", ""), "0")
 
     def test_save_settings_new_cookie_clears_stale_access_check(self):
         with tempfile.TemporaryDirectory() as tmpdir:
