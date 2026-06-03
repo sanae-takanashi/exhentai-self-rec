@@ -36,6 +36,7 @@ from .recommender import (
     parse_bootstrap_tags,
     recommend_page,
     record_feedback,
+    reset_library,
     retrain_model,
     score_gallery,
     store_galleries,
@@ -220,6 +221,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "data must be an exported preferences object")
                 self.send_json(import_preferences_payload(data, replace=replace))
+            elif path == "/api/reset":
+                self.read_json()
+                self.send_json(reset_library_payload())
             else:
                 raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
@@ -398,6 +402,19 @@ def import_preferences_payload(data: dict, replace: bool = False) -> dict:
             return {"ok": True, "imported": result, "model": model_snapshot(conn)}
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+
+def reset_library_payload() -> dict:
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is running; try again once it finishes")
+    try:
+        with db.connect() as conn:
+            removed = reset_library(conn)
+            page = recommendation_payload(conn, limit=40)
+            model = model_snapshot(conn)
+    finally:
+        FETCH_LOCK.release()
+    return {"ok": True, "removed": removed, "model": model, **page}
 
 
 def plan_fetch(force_query: str | None = None) -> dict:

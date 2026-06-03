@@ -168,6 +168,21 @@ button.primary,
   font-weight: 650;
 }
 
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+button.danger:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #1a0d0e;
+}
+
+.danger-zone h2 {
+  color: var(--danger);
+}
+
 .content {
   min-width: 0;
   padding: 20px;

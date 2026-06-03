@@ -92,6 +92,12 @@
           </label>
           <input id="importFile" class="hidden" type="file" accept="application/json,.json">
         </section>
+
+        <section class="status-panel danger-zone">
+          <h2>Danger zone</h2>
+          <div class="hint">Reset deletes all fetched galleries, your votes, the learned model, and fetch history. Your cookie and bootstrap tags are kept. This cannot be undone &mdash; export a backup first if unsure.</div>
+          <button id="resetBtn" class="danger" type="button">Reset data</button>
+        </section>
       </aside>
 
       <section class="content">

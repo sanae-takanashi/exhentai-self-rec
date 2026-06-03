@@ -296,6 +296,25 @@ async function retrain() {
   setStatus("Model retrained");
 }
 
+async function resetLibrary() {
+  if (
+    !confirm(
+      "Reset data?\n\nThis permanently deletes all fetched galleries, your votes, the learned model, and fetch history.\n\nYour cookie and bootstrap tags are kept. This cannot be undone."
+    )
+  ) {
+    return;
+  }
+  setStatus("Resetting data");
+  const payload = await api("/api/reset", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  applyRecommendationPage(payload);
+  await loadStatus();
+  const removed = payload.removed || {};
+  setStatus(`Data reset; removed ${removed.galleries || 0} galleries and ${removed.feedback || 0} votes`);
+}
+
 async function exportPreferences() {
   setStatus("Exporting preferences");
   const payload = await api("/api/export");
@@ -539,6 +558,7 @@ document.querySelector("#modelBtn").addEventListener("click", () => showModel().
 document.querySelector("#retrainBtn").addEventListener("click", () => retrain().catch((error) => setStatus(error.message, true)));
 document.querySelector("#exportBtn").addEventListener("click", () => exportPreferences().catch((error) => setStatus(error.message, true)));
 document.querySelector("#importBtn").addEventListener("click", () => importFileEl.click());
+document.querySelector("#resetBtn").addEventListener("click", () => resetLibrary().catch((error) => setStatus(error.message, true)));
 loadMoreBtn.addEventListener("click", () => {
   if (!hasMoreRecommendations) return;
   loadRecommendations(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));

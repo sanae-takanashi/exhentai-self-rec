@@ -232,6 +232,19 @@ def clear_feedback(conn: sqlite3.Connection, gallery_url: str) -> int:
     return cursor.rowcount
 
 
+def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
+    """Wipe fetched galleries, votes, learned weights, and fetch history.
+
+    Cookies and tuning live in ``settings`` and bootstrap tags in ``bootstrap_tags``,
+    so both survive untouched.
+    """
+    removed: dict[str, int] = {}
+    for table in ("feedback", "feature_weights", "fetch_runs", "galleries"):
+        cursor = conn.execute(f"DELETE FROM {table}")
+        removed[table] = cursor.rowcount
+    return removed
+
+
 def feedback_history(conn: sqlite3.Connection, gallery_url: str, limit: int = 25) -> list[dict]:
     limit = max(1, min(100, int(limit)))
     return [

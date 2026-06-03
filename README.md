@@ -24,6 +24,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Learned query expansion: positive feedback teaches the fetcher which tags to search next.
 - Deterministic retraining from feedback history using the latest vote/score per gallery.
 - Preference export/import for bootstrap tags and feedback. Cookies are not exported.
+- A settings "Danger zone" `Reset data` button (with a confirmation prompt) wipes fetched galleries, votes, the learned model, and fetch history while keeping your cookie and bootstrap tags. The same reset is available at `POST /api/reset` and is refused while a fetch or enrichment is running.
 - Paginated recommendation browsing with `Load More` once the local gallery pool grows.
 - Local filtering by stored gallery title, tag, category, or uploader.
 - Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
@@ -139,6 +140,8 @@ EXH_REC_DATA_DIR=/path/to/private/data python3 -m exh_rec.app
 ```
 
 Thumbnails are served through the local app instead of hotlinked from ExHentai, then cached under `data/thumbs`. This lets the server use the saved cookie and gallery referer when ExHentai's thumbnail host rejects direct browser requests.
+
+Cached thumbnail image bytes live on disk as files, not in SQLite. SQLite holds only metadata (gallery info, settings, votes, feature weights, and sample thumbnail URLs). Each cached thumbnail is stored as two files named by the `sha256` of its source URL under `data/thumbs/`: a `.bin` with the raw image bytes and a `.json` with the source URL, content type, and fetch time. Cover thumbnails and the per-gallery sample previews share this cache. It is permanent (no automatic eviction or TTL) and capped at 5 MB per image; to reclaim space you can safely delete `data/thumbs/` and images will be re-fetched on demand.
 
 Override the bind address or port with:
 

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from exh_rec import db
 from exh_rec.app import (
     ApiError,
+    FETCH_LOCK,
     REFRESH_STATE,
     REFRESH_WAKE,
     Handler,
@@ -36,6 +37,7 @@ from exh_rec.app import (
     recommend_candidate_limit,
     recommendation_payload,
     refresh_summary,
+    reset_library_payload,
     sample_count_for,
     save_settings,
     select_detail_candidates,
@@ -594,6 +596,46 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(item["page_count"], 40)
                 self.assertEqual(len(item["samples"]), 5)
                 self.assertTrue(set(item["samples"]).issubset(set(detailed.sample_thumbs)))
+
+    def test_reset_library_clears_data_but_keeps_cookie_and_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/50/a/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    upsert_bootstrap_tags(conn, parse_bootstrap_tags("artist:keepme"))
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="50", token="a", title="Legacy")])
+                    record_feedback(conn, gallery_url, vote=1)
+
+                payload = reset_library_payload()
+
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["removed"]["galleries"], 1)
+                self.assertEqual(payload["removed"]["feedback"], 1)
+                self.assertEqual(payload["items"], [])
+                with db.connect() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM galleries").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM fetch_runs").fetchone()[0], 0)
+                    self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=123; ipb_pass_hash=abc")
+                    tags = {row["tag"] for row in conn.execute("SELECT tag FROM bootstrap_tags")}
+                self.assertIn("artist:keepme", tags)
+
+    def test_reset_library_conflicts_while_fetch_running(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                self.assertTrue(FETCH_LOCK.acquire(blocking=False))
+                try:
+                    with self.assertRaises(ApiError) as ctx:
+                        reset_library_payload()
+                    self.assertEqual(ctx.exception.status, HTTPStatus.CONFLICT)
+                finally:
+                    FETCH_LOCK.release()
 
     def test_fetch_and_store_retrains_after_detail_enrichment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
