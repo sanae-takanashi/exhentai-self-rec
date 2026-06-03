@@ -385,6 +385,7 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
     rating_match = DETAIL_AVERAGE_RE.search(html.unescape(page_html)) or RATING_RE.search(html.unescape(page_html))
     rating = float(rating_match.group(1)) if rating_match else None
     page_count, sample_thumbs = parse_gallery_pages(page_html)
+    thumb_url = usable_thumb(extract_thumb(page_html)) or (sample_thumbs[0] if sample_thumbs else None)
     return Gallery(
         url=gallery_url,
         gid=gid,
@@ -393,7 +394,7 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
         category=strip_html_match(DETAIL_CATEGORY_RE.search(page_html)),
         uploader=strip_html_match(DETAIL_UPLOADER_RE.search(page_html)),
         posted_at=strip_html_match(DETAIL_POSTED_RE.search(page_html)),
-        thumb_url=extract_thumb(page_html),
+        thumb_url=thumb_url,
         rating=rating,
         tags=extract_tags(page_html),
         page_count=page_count,
@@ -470,6 +471,15 @@ def normalize_tag(raw: str) -> str:
     tag = urllib.parse.unquote_plus(tag).strip().lower()
     tag = tag.replace("_", " ")
     return " ".join(tag.split())
+
+
+def usable_thumb(url: str | None) -> str | None:
+    """Drop placeholder cover images (e.g. the lazy-load ``blank.gif``) so callers fall back to a real page image."""
+    if not url:
+        return None
+    if "blank.gif" in url.lower():
+        return None
+    return url
 
 
 def extract_thumb(block: str) -> str | None:

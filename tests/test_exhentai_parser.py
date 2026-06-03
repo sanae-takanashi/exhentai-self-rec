@@ -170,6 +170,23 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(gallery.page_count, 42)
         self.assertEqual(gallery.sample_thumbs, ["https://s.exhentai.org/t/aa/9-1.jpg"])
 
+    def test_parse_gallery_detail_falls_back_to_first_page_image_when_cover_missing(self):
+        html = """
+        <html>
+          <h1 id="gn">No Cover Gallery</h1>
+          <div id="gd1"><img src="https://exhentai.org/img/blank.gif"></div>
+          <div id="gdt">
+            <div class="gdtl"><a href="https://exhentai.org/s/aa/9-1"><img src="https://s.exhentai.org/t/aa/first.jpg"></a></div>
+            <div class="gdtl"><a href="https://exhentai.org/s/bb/9-2"><img src="https://s.exhentai.org/t/bb/second.jpg"></a></div>
+          </div>
+          <div id="gdb">nav</div>
+        </html>
+        """
+
+        gallery = parse_gallery_detail(html, "https://exhentai.org/g/9/abc/")
+
+        self.assertEqual(gallery.thumb_url, "https://s.exhentai.org/t/aa/first.jpg")
+
     def test_sample_page_url_appends_page_param(self):
         self.assertEqual(
             sample_page_url("https://exhentai.org/g/1/abc/", 3),
