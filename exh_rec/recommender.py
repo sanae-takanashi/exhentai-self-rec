@@ -312,7 +312,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 gallery.get("uploader"),
                 gallery.get("posted_at"),
                 gallery.get("thumb_url"),
-                gallery.get("rating"),
+                import_gallery_rating(gallery.get("rating")),
                 import_tags_json(gallery.get("tags_json")),
                 gallery.get("source_query"),
                 gallery.get("detail_fetched_at"),
@@ -406,6 +406,13 @@ def optional_float(value: object) -> float | None:
     if math.isnan(parsed) or math.isinf(parsed):
         return None
     return parsed
+
+
+def import_gallery_rating(value: object) -> float | None:
+    rating = optional_float(value)
+    if rating is None or rating < 0 or rating > 5:
+        return None
+    return rating
 
 
 def import_feedback_vote(value: object) -> float | None:

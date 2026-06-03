@@ -531,18 +531,27 @@ class RecommenderTest(unittest.TestCase):
             "bootstrap_tags": ["broken", {"tag": "artist:valid_import", "weight": 2.0}],
             "galleries": [
                 "broken",
-                {"url": valid_url, "gid": "12b", "token": "e", "title": "Valid Import", "tags_json": '["artist:valid"]'},
+                {
+                    "url": valid_url,
+                    "gid": "12b",
+                    "token": "e",
+                    "title": "Valid Import",
+                    "rating": "4.5",
+                    "tags_json": '["artist:valid"]',
+                },
             ],
             "feedback": ["broken", {"gallery_url": valid_url, "vote": 1.0}],
         }
 
         result = import_preferences(self.conn, payload)
+        rating = self.conn.execute("SELECT rating FROM galleries WHERE url = ?", (valid_url,)).fetchone()["rating"]
 
         self.assertEqual(result["bootstrap_tags"], 1)
         self.assertEqual(result["galleries"], 1)
         self.assertEqual(result["feedback"], 1)
         self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:valid import", "weight": 2.0}])
         self.assertIn("artist:valid", learned_query_tags(self.conn, limit=5))
+        self.assertEqual(rating, 4.5)
 
     def test_import_preferences_skips_invalid_weights_and_votes(self):
         valid_url = "https://exhentai.org/g/12c/e/"
@@ -557,8 +566,8 @@ class RecommenderTest(unittest.TestCase):
             ],
             "galleries": [
                 {"url": valid_url, "title": "Valid Vote", "tags_json": "not-json"},
-                {"url": bad_vote_url, "title": "Bad Vote", "tags_json": '{"not": "a list"}'},
-                {"url": out_of_range_vote_url, "title": "Out Of Range Vote"},
+                {"url": bad_vote_url, "title": "Bad Vote", "rating": "not-a-number", "tags_json": '{"not": "a list"}'},
+                {"url": out_of_range_vote_url, "title": "Out Of Range Vote", "rating": "99"},
             ],
             "feedback": [
                 {"gallery_url": valid_url, "vote": "1", "score": "5"},
@@ -570,6 +579,11 @@ class RecommenderTest(unittest.TestCase):
 
         result = import_preferences(self.conn, payload)
         tags_json = self.conn.execute("SELECT tags_json FROM galleries WHERE url = ?", (valid_url,)).fetchone()["tags_json"]
+        invalid_rating = self.conn.execute("SELECT rating FROM galleries WHERE url = ?", (bad_vote_url,)).fetchone()["rating"]
+        out_of_range_rating = self.conn.execute(
+            "SELECT rating FROM galleries WHERE url = ?",
+            (out_of_range_vote_url,),
+        ).fetchone()["rating"]
         history = feedback_history(self.conn, valid_url)
 
         self.assertEqual(result["bootstrap_tags"], 1)
@@ -577,6 +591,8 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(result["feedback"], 2)
         self.assertEqual(get_bootstrap_tags(self.conn), [{"tag": "artist:valid weight", "weight": 2.5}])
         self.assertEqual(tags_json, "[]")
+        self.assertIsNone(invalid_rating)
+        self.assertIsNone(out_of_range_rating)
         self.assertIsNone(history[0]["score"])
         self.assertEqual(history[0]["vote"], 0.5)
         self.assertEqual(history[1]["score"], 5)

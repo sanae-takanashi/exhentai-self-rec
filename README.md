@@ -122,7 +122,7 @@ Use `Export` and `Import` in the backup panel to move bootstrap tags and feedbac
 
 Imports require the `exh-rec-preferences-v1` export schema; unsupported files are rejected before changing local preferences.
 
-Import skips malformed rows, including non-object entries, gallery rows without URLs, invalid tag JSON, invalid bootstrap weights, and feedback votes outside `-1` to `1`. Imported scores outside `1` to `5` are ignored; valid score-only feedback derives its learning signal from the score. Import only reports galleries and feedback that could be applied to the local database.
+Import skips malformed rows, including non-object entries, gallery rows without URLs, invalid tag JSON, invalid gallery ratings, invalid bootstrap weights, and feedback votes outside `-1` to `1`. Imported scores outside `1` to `5` are ignored; valid score-only feedback derives its learning signal from the score. Import only reports galleries and feedback that could be applied to the local database.
 
 Data is stored in `data/recommender.sqlite3` by default. Override with:
 
