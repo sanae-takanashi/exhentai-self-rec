@@ -22,6 +22,7 @@ from exh_rec.app import (
     format_generated_query,
     get_access_check,
     get_settings,
+    import_preferences_payload,
     is_remote_search_preference,
     parse_bool,
     recommend_candidate_limit,
@@ -539,6 +540,36 @@ class AppTest(unittest.TestCase):
                     REFRESH_WAKE.set()
                     worker.join(2)
                     REFRESH_WAKE.clear()
+
+    def test_import_preferences_payload_rejects_unknown_schema_as_bad_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+
+                with self.assertRaises(ApiError) as ctx:
+                    import_preferences_payload({"schema": "unknown"})
+
+                self.assertEqual(ctx.exception.status.value, 400)
+                self.assertEqual(ctx.exception.message, "Unsupported preference export schema")
+
+    def test_import_preferences_payload_returns_model_for_valid_import(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                payload = {
+                    "schema": "exh-rec-preferences-v1",
+                    "bootstrap_tags": [{"tag": "artist:payload", "weight": 2.0}],
+                    "galleries": [],
+                    "feedback": [],
+                }
+
+                result = import_preferences_payload(payload)
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["imported"]["bootstrap_tags"], 1)
+                self.assertIn("model", result)
 
 
 if __name__ == "__main__":

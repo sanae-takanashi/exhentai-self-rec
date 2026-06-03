@@ -208,9 +208,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = payload.get("data")
                 if not isinstance(data, dict):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "data must be an exported preferences object")
-                with db.connect() as conn:
-                    result = import_preferences(conn, data, replace=replace)
-                    self.send_json({"ok": True, "imported": result, "model": model_snapshot(conn)})
+                self.send_json(import_preferences_payload(data, replace=replace))
             else:
                 raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
@@ -352,6 +350,15 @@ def check_saved_access() -> dict:
     with db.connect() as conn:
         db.set_setting(conn, "last_access_check", json.dumps(result, ensure_ascii=True))
     return result
+
+
+def import_preferences_payload(data: dict, replace: bool = False) -> dict:
+    try:
+        with db.connect() as conn:
+            result = import_preferences(conn, data, replace=replace)
+            return {"ok": True, "imported": result, "model": model_snapshot(conn)}
+    except ValueError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
 
 def plan_fetch(force_query: str | None = None) -> dict:
