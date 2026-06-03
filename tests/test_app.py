@@ -25,6 +25,8 @@ from exh_rec.app import (
     import_preferences_payload,
     is_remote_search_preference,
     parse_bool,
+    parse_feedback_request,
+    query_int,
     recommend_candidate_limit,
     recommendation_payload,
     refresh_summary,
@@ -146,6 +148,29 @@ class AppTest(unittest.TestCase):
         self.assertTrue(parse_bool(True))
         self.assertFalse(parse_bool("0"))
         self.assertFalse(parse_bool(None))
+
+    def test_query_int_defaults_invalid_values_and_clamps_bounds(self):
+        self.assertEqual(query_int({"limit": ["bad"]}, "limit", default=40, lower=1, upper=100), 40)
+        self.assertEqual(query_int({"limit": ["500"]}, "limit", default=40, lower=1, upper=100), 100)
+        self.assertEqual(query_int({"offset": ["-5"]}, "offset", default=0, lower=0, upper=10000), 0)
+        self.assertEqual(query_int({}, "limit", default=40, lower=1, upper=100), 40)
+
+    def test_parse_feedback_request_validates_bad_numeric_values(self):
+        self.assertEqual(parse_feedback_request({"vote": "1"}), (1, None))
+        self.assertEqual(parse_feedback_request({"score": "5"}), (None, 5))
+
+        for payload, message in [
+            ({"score": "bad"}, "score must be between 1 and 5"),
+            ({"score": 1.5}, "score must be between 1 and 5"),
+            ({"score": True}, "score must be between 1 and 5"),
+            ({"vote": "bad"}, "vote must be 1 or -1"),
+            ({"vote": 0}, "vote must be 1 or -1"),
+            ({}, "vote or score is required"),
+        ]:
+            with self.assertRaises(ApiError) as ctx:
+                parse_feedback_request(payload)
+            self.assertEqual(ctx.exception.status.value, 400)
+            self.assertEqual(ctx.exception.message, message)
 
     def test_format_generated_query(self):
         self.assertEqual(format_generated_query("artist:one"), "artist:one")

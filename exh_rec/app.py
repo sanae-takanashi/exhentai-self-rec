@@ -74,7 +74,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_status())
             elif path == "/api/fetch-runs":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                limit = int(query.get("limit", ["10"])[0])
+                limit = query_int(query, "limit", default=10, lower=1, upper=100)
                 with db.connect() as conn:
                     self.send_json({"items": fetch_runs(conn, limit=limit)})
             elif path == "/api/plan":
@@ -83,8 +83,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(plan_fetch(force_query=force_query))
             elif path == "/api/recommendations":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                limit = int(query.get("limit", ["40"])[0])
-                offset = int(query.get("offset", ["0"])[0])
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
                 include_rated = parse_bool(query.get("include_rated", ["0"])[0])
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
@@ -100,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/feedback":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 gallery_url = str(query.get("gallery_url", [""])[0])
-                limit = int(query.get("limit", ["25"])[0])
+                limit = query_int(query, "limit", default=25, lower=1, upper=100)
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
                 with db.connect() as conn:
@@ -144,18 +144,7 @@ class Handler(BaseHTTPRequestHandler):
                 gallery_url = str(payload.get("gallery_url") or "")
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
-                score = payload.get("score")
-                vote = payload.get("vote")
-                if score is not None:
-                    score = int(score)
-                    if score < 1 or score > 5:
-                        raise ApiError(HTTPStatus.BAD_REQUEST, "score must be between 1 and 5")
-                elif vote is not None:
-                    vote = int(vote)
-                    if vote not in (-1, 1):
-                        raise ApiError(HTTPStatus.BAD_REQUEST, "vote must be 1 or -1")
-                else:
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "vote or score is required")
+                vote, score = parse_feedback_request(payload)
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
                     record_feedback(conn, gallery_url, vote=vote, score=score, note=payload.get("note"))
@@ -814,6 +803,37 @@ def parse_bool(value: str | int | bool | None) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def query_int(query: dict[str, list[str]], key: str, default: int, lower: int, upper: int) -> int:
+    return bounded_int((query.get(key) or [default])[0], default=default, lower=lower, upper=upper)
+
+
+def parse_feedback_request(payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    score = payload.get("score")
+    vote = payload.get("vote")
+    if score is not None:
+        parsed_score = strict_int(score)
+        if parsed_score is None or parsed_score < 1 or parsed_score > 5:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "score must be between 1 and 5")
+        return None, parsed_score
+    if vote is not None:
+        parsed_vote = strict_int(vote)
+        if parsed_vote not in (-1, 1):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "vote must be 1 or -1")
+        return parsed_vote, None
+    raise ApiError(HTTPStatus.BAD_REQUEST, "vote or score is required")
+
+
+def strict_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def bounded_int(value: Any, default: int, lower: int, upper: int) -> int:

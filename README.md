@@ -76,6 +76,8 @@ Recommendation page responses include the latest fetch or enrichment summary, so
 
 Recommendation cards show the model score, uploader metadata when available, and the current feedback signal you have given that gallery. Thumbs are strong positive/negative signals. A 1-5 score maps to a softer signal: 1 is negative, 3 is neutral, and 5 is positive. `Skip` records a neutral score of `3`.
 
+Invalid API query numbers fall back to safe defaults, while invalid feedback vote/score values return clear bad-request errors.
+
 The ranked queue applies a small diversity penalty to repeated artists, groups, parodies, characters, and uploaders so one learned preference does not completely crowd out nearby alternatives.
 
 When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background of the same action and retrains from the fuller tag set. If no cookie is saved or the detail request fails, the feedback still records normally.
