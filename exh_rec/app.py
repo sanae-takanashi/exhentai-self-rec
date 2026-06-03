@@ -440,6 +440,16 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     image_urls = payload.get("image_urls") or []
     if not isinstance(image_urls, list):
         raise ApiError(HTTPStatus.BAD_REQUEST, "image_urls must be a list")
+    dinov2_status = dinov2_dependency_status()
+    if not dinov2_status.get("available"):
+        return {
+            "ok": False,
+            "gallery_url": gallery_url,
+            "encoder": "dinov2",
+            "fallback_required": True,
+            "fallback_encoder": "simple",
+            "reason": dinov2_status.get("error") or "DINOv2 is unavailable",
+        }
     blobs = []
     errors = []
     for raw_url in image_urls[:12]:

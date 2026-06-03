@@ -48,7 +48,7 @@ from exh_rec.app import (
 )
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import learned_query_tags, parse_bootstrap_tags, record_feedback, store_galleries, upsert_bootstrap_tags
-from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, VisualEncoderUnavailable
+from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION
 
 
 class AppTest(unittest.TestCase):
@@ -282,7 +282,10 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     store_galleries(conn, [Gallery(url=gallery_url, gid="41", token="a", title="DINO Save")])
 
-                with patch("exh_rec.app.cached_thumbnail", return_value=(b"image", "image/webp")) as cached, patch(
+                with patch("exh_rec.app.dinov2_dependency_status", return_value={"available": True}), patch(
+                    "exh_rec.app.cached_thumbnail",
+                    return_value=(b"image", "image/webp"),
+                ) as cached, patch(
                     "exh_rec.app.dinov2_embedding",
                     return_value=[1, 0, 0, 0] * 16,
                 ):
@@ -305,10 +308,10 @@ class AppTest(unittest.TestCase):
         cached.assert_called_once()
 
     def test_save_visual_embedding_payload_reports_simple_fallback_when_dinov2_unavailable(self):
-        with patch("exh_rec.app.cached_thumbnail", return_value=(b"image", "image/webp")), patch(
-            "exh_rec.app.dinov2_embedding",
-            side_effect=VisualEncoderUnavailable("missing torch"),
-        ):
+        with patch(
+            "exh_rec.app.dinov2_dependency_status",
+            return_value={"available": False, "error": "missing torch"},
+        ), patch("exh_rec.app.cached_thumbnail") as cached:
             result = save_visual_embedding_payload(
                 {
                     "gallery_url": "https://exhentai.org/g/42/a/",
@@ -320,6 +323,7 @@ class AppTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["fallback_required"])
         self.assertEqual(result["fallback_encoder"], "simple")
+        cached.assert_not_called()
 
     def test_save_visual_embedding_payload_rejects_bad_embedding(self):
         with self.assertRaises(ApiError) as ctx:
