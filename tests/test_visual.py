@@ -71,5 +71,51 @@ class VisualTest(unittest.TestCase):
         self.assertIn("deps_error", visual._DINO_STATE)
 
 
+    def test_download_dinov2_reports_missing_dependencies(self):
+        # Without the optional ML stack installed, the download must fail fast with a
+        # clear dependency message instead of attempting a network call.
+        visual.reset_dinov2_state_for_tests()
+        self.addCleanup(visual.reset_dinov2_state_for_tests)
+
+        def fake_find_spec(name):
+            return None if name in {"torch", "transformers", "huggingface_hub", "PIL"} else object()
+
+        original = visual.importlib.util.find_spec
+        visual.importlib.util.find_spec = fake_find_spec
+        self.addCleanup(lambda: setattr(visual.importlib.util, "find_spec", original))
+
+        with self.assertRaises(VisualEncoderUnavailable) as ctx:
+            visual.download_dinov2("cpu")
+
+        self.assertIn("dependencies are unavailable", str(ctx.exception))
+        self.assertIn("deps_error", visual._DINO_STATE)
+
+    def test_download_dinov2_records_retryable_download_failure(self):
+        # A network failure during download is reported but left retryable so a later
+        # attempt can still succeed once connectivity is restored.
+        visual.reset_dinov2_state_for_tests()
+        self.addCleanup(visual.reset_dinov2_state_for_tests)
+
+        original_find_spec = visual.importlib.util.find_spec
+        visual.importlib.util.find_spec = lambda name: object()
+        self.addCleanup(lambda: setattr(visual.importlib.util, "find_spec", original_find_spec))
+
+        def boom():
+            raise RuntimeError("network down")
+
+        original_download = visual._snapshot_download_dinov2
+        visual._snapshot_download_dinov2 = boom
+        self.addCleanup(lambda: setattr(visual, "_snapshot_download_dinov2", original_download))
+
+        with self.assertRaises(VisualEncoderUnavailable) as ctx:
+            visual.download_dinov2("cpu")
+
+        self.assertIn("download failed", str(ctx.exception))
+        self.assertIn("network down", str(ctx.exception))
+        self.assertEqual(visual._DINO_STATE.get("device_config"), "cpu")
+        self.assertIn("load_error", visual._DINO_STATE)
+        self.assertNotIn("deps_error", visual._DINO_STATE)
+
+
 if __name__ == "__main__":
     unittest.main()

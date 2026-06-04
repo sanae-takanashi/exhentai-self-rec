@@ -210,9 +210,19 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
             raise VisualEncoderUnavailable(_DINO_STATE["deps_error"]) from exc
 
         try:
-            processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME)
-            model = AutoModel.from_pretrained(DINOV2_MODEL_NAME)
             resolved_device = resolve_dinov2_device(torch, requested_device)
+            try:
+                processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME)
+                model = AutoModel.from_pretrained(DINOV2_MODEL_NAME)
+            except Exception:
+                # The first attempt commonly fails because the cache is missing a
+                # file (for example preprocessor_config.json after a network hiccup),
+                # which transformers reports as the cryptic "Can't load image
+                # processor" error. Re-download the model files once and retry so a
+                # transient failure self-heals without manual intervention.
+                _snapshot_download_dinov2()
+                processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME)
+                model = AutoModel.from_pretrained(DINOV2_MODEL_NAME)
             model.to(resolved_device)
             model.eval()
         except Exception as exc:
@@ -248,6 +258,67 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
             }
         )
         return processor, model, torch, Image
+
+
+def _snapshot_download_dinov2() -> str:
+    # Pull the full model repo (config + image-processor config + weights) into the
+    # local Hugging Face cache. transformers' from_pretrained downloads the same
+    # files lazily, but fetching them up front gives a single, clear failure point
+    # instead of the misleading "Can't load image processor" message it raises when
+    # an individual file (such as preprocessor_config.json) is missing.
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        DINOV2_MODEL_NAME,
+        allow_patterns=["*.json", "*.txt", "*.safetensors", "*.bin", "*.model"],
+    )
+
+
+def download_dinov2(device: str | None = None) -> dict:
+    """Ensure the DINOv2 model and image-processor files are present in the local
+    cache, downloading them through the configured proxy if necessary.
+
+    Returns a status dict on success. Raises VisualEncoderUnavailable with a clear
+    message if the dependencies or network are unavailable, while leaving the
+    in-memory state retryable so a later attempt can still succeed.
+    """
+    requested_device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
+    missing = [
+        name
+        for name, module in {
+            "torch": "torch",
+            "transformers": "transformers",
+            "huggingface_hub": "huggingface_hub",
+            "Pillow": "PIL",
+        }.items()
+        if importlib.util.find_spec(module) is None
+    ]
+    if missing:
+        message = f"DINOv2 dependencies are unavailable: missing {', '.join(missing)}"
+        with _DINO_LOCK:
+            _DINO_STATE.clear()
+            _DINO_STATE["device_config"] = requested_device
+            _DINO_STATE["deps_error"] = message
+        raise VisualEncoderUnavailable(message)
+    try:
+        path = _snapshot_download_dinov2()
+    except Exception as exc:
+        message = f"DINOv2 model download failed: {exc}"
+        with _DINO_LOCK:
+            if _DINO_STATE.get("device_config") != requested_device:
+                _DINO_STATE.clear()
+                _DINO_STATE["device_config"] = requested_device
+            _DINO_STATE["load_error"] = message
+        raise VisualEncoderUnavailable(message) from exc
+    with _DINO_LOCK:
+        if _DINO_STATE.get("device_config") == requested_device:
+            _DINO_STATE.pop("load_error", None)
+    return {
+        "ok": True,
+        "model": DINOV2_MODEL_NAME,
+        "path": path,
+        "device_config": requested_device,
+    }
 
 
 def resolve_dinov2_device(torch: Any, requested_device: str) -> str:

@@ -84,6 +84,10 @@
           DINOv2 device
           <input id="dinov2Device" type="text" autocomplete="off" spellcheck="false" placeholder="auto, cpu, cuda, cuda:0">
         </label>
+        <div class="actions stacked">
+          <button id="downloadDinov2Btn" type="button">Download DINOv2 Model</button>
+        </div>
+        <div class="hint">Pre-fetches the DINOv2 model and image processor into the local cache through the configured proxy. Use this if DINOv2 reports it cannot load the image processor.</div>
 
         <label class="check">
           <input id="autoRefresh" type="checkbox">

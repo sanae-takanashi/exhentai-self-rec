@@ -406,6 +406,21 @@ async function refreshThumbnails() {
   }
 }
 
+async function downloadDinov2Model() {
+  setStatus("Downloading DINOv2 model (this can take a while)");
+  const payload = await api("/api/visual/download", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  applyVisualSettings(payload.visual);
+  await loadStatus();
+  if (payload.ok) {
+    setStatus(`DINOv2 model ready (${payload.model})`);
+  } else {
+    setStatus(payload.reason || "DINOv2 model download failed", true);
+  }
+}
+
 async function checkLogin() {
   setStatus("Checking ExHentai access");
   const payload = await api("/api/check", {
@@ -802,6 +817,7 @@ document.querySelector("#saveBtn").addEventListener("click", () => saveSettings(
 document.querySelector("#fetchBtn").addEventListener("click", () => fetchNew().catch((error) => setStatus(error.message, true)));
 document.querySelector("#enrichBtn").addEventListener("click", () => enrichTopRecommendations().catch((error) => setStatus(error.message, true)));
 document.querySelector("#refreshThumbsBtn").addEventListener("click", () => refreshThumbnails().catch((error) => setStatus(error.message, true)));
+document.querySelector("#downloadDinov2Btn").addEventListener("click", () => downloadDinov2Model().catch((error) => setStatus(error.message, true)));
 document.querySelector("#checkBtn").addEventListener("click", () => checkLogin().catch((error) => setStatus(error.message, true)));
 document.querySelector("#clearCookieBtn").addEventListener("click", () => clearCookie().catch((error) => setStatus(error.message, true)));
 document.querySelector("#searchFetchBtn").addEventListener("click", () => fetchNew(queryEl.value).catch((error) => setStatus(error.message, true)));

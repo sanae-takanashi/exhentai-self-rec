@@ -50,11 +50,13 @@ from .recommender import (
 from .visual import (
     DEFAULT_VISUAL_ENCODER,
     DEFAULT_DINOV2_DEVICE,
+    DINOV2_MODEL_NAME,
     DINOV2_VISUAL_VERSION,
     SIMPLE_VISUAL_VERSION,
     VisualEncoderUnavailable,
     dinov2_dependency_status,
     dinov2_embedding,
+    download_dinov2,
     normalize_dinov2_device,
     normalize_visual_encoder,
 )
@@ -251,6 +253,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/visual":
                 payload = self.read_json()
                 self.send_json(save_visual_embedding_payload(payload))
+            elif path == "/api/visual/download":
+                self.read_json()
+                self.send_json(download_dinov2_payload())
             elif path == "/api/reset":
                 self.read_json()
                 self.send_json(reset_library_payload())
@@ -579,6 +584,30 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
         "visual_ready": True,
         "image_count": len(blobs),
         "errors": errors,
+    }
+
+
+def download_dinov2_payload() -> dict:
+    with db.connect() as conn:
+        proxy_url = network_proxy(conn)
+        dinov2_device = configured_dinov2_device(conn)
+        visual_encoder = configured_visual_encoder(conn)
+    apply_proxy_environment(proxy_url)
+    ok = True
+    reason = None
+    path = None
+    try:
+        result = download_dinov2(dinov2_device)
+        path = result.get("path")
+    except VisualEncoderUnavailable as exc:
+        ok = False
+        reason = str(exc)
+    return {
+        "ok": ok,
+        "model": DINOV2_MODEL_NAME,
+        "path": path,
+        "reason": reason,
+        "visual": visual_settings(visual_encoder, dinov2_device),
     }
 
 
