@@ -40,6 +40,7 @@ from .recommender import (
     learned_query_tags,
     model_snapshot,
     parse_bootstrap_tags,
+    reaction_history_page,
     recommend_page,
     record_feedback,
     reset_library,
@@ -145,6 +146,13 @@ class Handler(BaseHTTPRequestHandler):
                             filter_text=filter_text,
                         )
                     )
+            elif path == "/api/reactions":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(reaction_history_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
             elif path == "/api/feedback":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 gallery_url = str(query.get("gallery_url", [""])[0])
@@ -1388,6 +1396,17 @@ def recommendation_payload(
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
     )
+    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def reaction_history_payload(
+    conn,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    page = reaction_history_page(conn, limit=limit, offset=offset, filter_text=filter_text)
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}
 

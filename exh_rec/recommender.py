@@ -813,6 +813,70 @@ def recommend_page(
     }
 
 
+def reaction_history_page(
+    conn: sqlite3.Connection,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    filter_text = (filter_text or "").strip().lower()
+    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(conn)
+    rows = conn.execute(
+        """
+        SELECT g.*, f.id AS feedback_id, f.vote AS user_vote, f.score AS user_score,
+               f.note AS feedback_note, f.created_at AS feedback_created_at
+        FROM feedback f
+        JOIN (
+            SELECT gallery_url, MAX(id) AS latest_id
+            FROM feedback
+            GROUP BY gallery_url
+        ) latest ON latest.gallery_url = f.gallery_url AND latest.latest_id = f.id
+        JOIN galleries g ON g.url = f.gallery_url
+        ORDER BY f.id DESC
+        LIMIT 10000
+        """
+    ).fetchall()
+
+    items = []
+    for row in rows:
+        gallery = dict(row)
+        gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
+        gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
+        gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
+        gallery["visual_ready"] = bool(gallery["visual_embedding"])
+        if filter_text and not gallery_matches_filter(gallery, filter_text):
+            continue
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
+        gallery.pop("visual_embedding", None)
+        gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
+        gallery["rated"] = True
+        if gallery["user_vote"] < 0:
+            score -= 2.0
+            reasons.append("previous downvote")
+        elif gallery["user_vote"] > 0:
+            score += 0.5
+            reasons.append("previous upvote")
+        gallery["score"] = round(score, 3)
+        gallery["reasons"] = reasons[:5]
+        items.append(gallery)
+
+    page_items = items[offset : offset + limit]
+    next_offset = offset + len(page_items)
+    return {
+        "items": page_items,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(items),
+        "has_more": next_offset < len(items),
+    }
+
+
 def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if len(scored) <= 2:
         return scored

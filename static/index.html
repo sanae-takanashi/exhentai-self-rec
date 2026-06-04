@@ -124,14 +124,19 @@
       </aside>
 
       <section class="content">
+        <div class="view-tabs" role="tablist" aria-label="Gallery views">
+          <button id="reviewTab" class="active" type="button" data-view="review">Review</button>
+          <button id="historyTab" type="button" data-view="history">History</button>
+          <button id="previewTab" type="button" data-view="preview">Preview</button>
+        </div>
+        <div class="view-heading">
+          <h2 id="viewTitle">Review Queue</h2>
+          <p id="viewSubtitle">Unrated galleries ready for feedback.</p>
+        </div>
         <div class="toolbar">
           <input id="query" type="search" placeholder="Optional one-off search query">
           <button id="searchFetchBtn" type="button">Fetch Query</button>
           <input id="localFilter" type="search" placeholder="Filter local title, tag, category, uploader">
-          <label class="check inline">
-            <input id="includeRated" type="checkbox">
-            Rated
-          </label>
         </div>
         <div id="recommendations" class="grid"></div>
         <div class="loadbar">

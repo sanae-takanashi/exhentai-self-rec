@@ -15,7 +15,6 @@ const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const localFilterEl = document.querySelector("#localFilter");
-const includeRatedEl = document.querySelector("#includeRated");
 const importFileEl = document.querySelector("#importFile");
 const replaceImportEl = document.querySelector("#replaceImport");
 const loadMoreBtn = document.querySelector("#loadMoreBtn");
@@ -23,9 +22,13 @@ const modelDialog = document.querySelector("#modelDialog");
 const dialogTitle = document.querySelector("#dialogTitle");
 const modelBody = document.querySelector("#modelBody");
 const refreshStatusEl = document.querySelector("#refreshStatus");
+const viewTitleEl = document.querySelector("#viewTitle");
+const viewSubtitleEl = document.querySelector("#viewSubtitle");
+const viewTabs = [...document.querySelectorAll("[data-view]")];
 let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
+let currentView = "review";
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
 let renderedGalleryUrls = [];
@@ -246,7 +249,9 @@ function scheduleVisualRefresh() {
   }
   visualRefreshTimer = setTimeout(() => {
     visualRefreshTimer = null;
-    loadRecommendations().catch(() => {});
+    if (currentView !== "preview") {
+      loadCurrentPage().catch(() => {});
+    }
   }, 5000);
 }
 
@@ -336,13 +341,66 @@ function cookiePreviewText(settings) {
   return text;
 }
 
+function viewCopy(view) {
+  if (view === "history") {
+    return {
+      title: "Reaction History",
+      subtitle: "Galleries you already reacted to, newest reaction first.",
+      empty: "No reaction history yet.",
+      loaded: "history items loaded",
+    };
+  }
+  if (view === "preview") {
+    return {
+      title: "Model Preview",
+      subtitle: "Read-only model ranking for unrated galleries.",
+      empty: "No model recommendations yet.",
+      loaded: "preview recommendations loaded",
+    };
+  }
+  return {
+    title: "Review Queue",
+    subtitle: "Unrated galleries ready for feedback.",
+    empty: "No unrated galleries yet. Save cookies and bootstrap tags, then fetch.",
+    loaded: "review recommendations loaded",
+  };
+}
+
+function setActiveView(view) {
+  currentView = view;
+  for (const tab of viewTabs) {
+    const active = tab.dataset.view === view;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  const copy = viewCopy(view);
+  viewTitleEl.textContent = copy.title;
+  viewSubtitleEl.textContent = copy.subtitle;
+}
+
+async function loadCurrentPage(offset = 0, append = false) {
+  if (currentView === "history") {
+    return loadReactionHistory(offset, append);
+  }
+  return loadRecommendations(offset, append);
+}
+
+async function loadReactionHistory(offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const payload = await api(
+    `/api/reactions?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
 async function loadRecommendations(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRatedEl.checked ? "1" : "0"}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=0&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
-  applyRecommendationPage(payload, append);
-  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} recommendations loaded`);
+  applyGalleryPage(payload, append);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
 
 async function fetchNew(query = "") {
@@ -351,11 +409,11 @@ async function fetchNew(query = "") {
     method: "POST",
     body: JSON.stringify({
       query,
-      include_rated: includeRatedEl.checked,
+      include_rated: false,
       filter_text: localFilterEl.value.trim(),
     }),
   });
-  applyRecommendationPage(payload);
+  await loadCurrentPage();
   if (payload.last_fetch) {
     renderStatus({ fetch: { running: false }, last_fetch: payload.last_fetch, settings: {} });
   }
@@ -371,12 +429,12 @@ async function enrichTopRecommendations() {
   const payload = await api("/api/enrich", {
     method: "POST",
     body: JSON.stringify({
-      include_rated: includeRatedEl.checked,
+      include_rated: false,
       filter_text: localFilterEl.value.trim(),
       limit: Number(detailLimitEl.value),
     }),
   });
-  applyRecommendationPage(payload);
+  await loadCurrentPage();
   if (payload.last_fetch) {
     renderStatus({ fetch: { running: false }, last_fetch: payload.last_fetch, settings: {} });
   }
@@ -398,11 +456,11 @@ async function refreshThumbnails() {
     method: "POST",
     body: JSON.stringify({
       gallery_urls: galleryUrls,
-      include_rated: includeRatedEl.checked,
+      include_rated: false,
       filter_text: localFilterEl.value.trim(),
     }),
   });
-  applyRecommendationPage(payload);
+  await loadCurrentPage();
   if (payload.errors.length) {
     setStatus(`Refreshed ${payload.updated} thumbnails; errors: ${payload.errors.join(" | ")}`, true);
   } else {
@@ -459,11 +517,11 @@ async function vote(galleryUrl, voteValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         vote: voteValue,
-        include_rated: includeRatedEl.checked,
+        include_rated: false,
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    applyRecommendationPage(payload);
+    await applyFeedbackResult(payload);
     setStatus(feedbackStatusMessage("Vote recorded", payload));
   });
 }
@@ -476,11 +534,11 @@ async function score(galleryUrl, scoreValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: scoreValue,
-        include_rated: includeRatedEl.checked,
+        include_rated: false,
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    applyRecommendationPage(payload);
+    await applyFeedbackResult(payload);
     setStatus(feedbackStatusMessage("Score recorded", payload));
   });
 }
@@ -493,11 +551,11 @@ async function skip(galleryUrl) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: 3,
-        include_rated: includeRatedEl.checked,
+        include_rated: false,
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    applyRecommendationPage(payload);
+    await applyFeedbackResult(payload);
     setStatus(feedbackStatusMessage("Gallery skipped", payload));
   });
 }
@@ -509,13 +567,21 @@ async function clearRating(galleryUrl) {
       method: "POST",
       body: JSON.stringify({
         gallery_url: galleryUrl,
-        include_rated: includeRatedEl.checked,
+        include_rated: false,
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    applyRecommendationPage(payload);
+    await applyFeedbackResult(payload);
     setStatus(payload.removed ? "Rating cleared" : "No rating to clear");
   });
+}
+
+async function applyFeedbackResult(payload) {
+  if (currentView === "history") {
+    await loadReactionHistory();
+  } else {
+    applyGalleryPage(payload);
+  }
 }
 
 async function showModel() {
@@ -536,9 +602,9 @@ async function retrain() {
   setStatus("Retraining model");
   const payload = await api("/api/retrain", {
     method: "POST",
-    body: JSON.stringify({ include_rated: includeRatedEl.checked, filter_text: localFilterEl.value.trim() }),
+    body: JSON.stringify({ include_rated: false, filter_text: localFilterEl.value.trim() }),
   });
-  applyRecommendationPage(payload);
+  await loadCurrentPage();
   modelBody.textContent = JSON.stringify(payload.model, null, 2);
   setStatus("Model retrained");
 }
@@ -556,7 +622,7 @@ async function resetLibrary() {
     method: "POST",
     body: JSON.stringify({}),
   });
-  applyRecommendationPage(payload);
+  applyGalleryPage(payload);
   await loadStatus();
   const removed = payload.removed || {};
   setStatus(`Data reset; removed ${removed.galleries || 0} galleries and ${removed.feedback || 0} votes`);
@@ -587,14 +653,15 @@ async function importPreferences(file) {
     body: JSON.stringify({ data, replace: replaceImportEl.checked }),
   });
   await loadSettings();
-  await loadRecommendations();
+  await loadCurrentPage();
   modelBody.textContent = JSON.stringify(payload.model, null, 2);
   setStatus(
     `Imported ${payload.imported.feedback} feedback, ${payload.imported.bootstrap_tags} bootstrap tags`
   );
 }
 
-function renderRecommendations(items, append = false) {
+function renderGalleryCards(items, append = false) {
+  const mode = currentView;
   if (!append) {
     renderedGalleryUrls = [];
   }
@@ -604,7 +671,7 @@ function renderRecommendations(items, append = false) {
     }
   }
   if (!append && !items.length) {
-    recommendationsEl.innerHTML = `<div class="hint">No galleries yet. Save cookies and bootstrap tags, then fetch.</div>`;
+    recommendationsEl.innerHTML = `<div class="hint">${escapeHtml(viewCopy(mode).empty)}</div>`;
     return;
   }
   if (!append) {
@@ -624,19 +691,35 @@ function renderRecommendations(items, append = false) {
       : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
-    const userFeedback = item.user_score
-      ? `Your score ${item.user_score}`
-      : `Your signal ${item.user_vote || 0}`;
+    const userFeedback = item.rated
+      ? item.user_score
+        ? `Your score ${item.user_score}`
+        : `Your signal ${item.user_vote || 0}`
+      : "No reaction";
     const detailStatus = item.detail_fetched_at ? "Full metadata" : "List metadata";
     const uploader = item.uploader ? `Uploader ${item.uploader}` : "Uploader unknown";
     const postedAt = item.posted_at ? `Posted ${item.posted_at}` : "";
-    const clearButton = item.rated
+    const reactionAt = item.feedback_created_at ? `Reacted ${item.feedback_created_at}` : "";
+    const clearButton = item.rated && mode !== "preview"
       ? `<button class="clear" type="button" data-clear="1" data-url="${escapeAttr(item.url)}">Clear</button>`
       : "";
-    const historyButton = item.rated
+    const historyButton = item.rated && mode !== "preview"
       ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}">History</button>`
       : "";
-    const feedbackActions = item.rated ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
+    const feedbackActions = historyButton || clearButton ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
+    const feedbackControls = mode === "preview"
+      ? ""
+      : `<div class="votes">
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
+          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}">Skip</button>
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}">Thumb down</button>
+        </div>
+        <div class="scorebar" aria-label="Score">
+          ${[1, 2, 3, 4, 5]
+            .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}">${value}</button>`)
+            .join("")}
+        </div>
+        ${feedbackActions}`;
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
     card.innerHTML = `
       <div class="media-preview">
@@ -649,23 +732,16 @@ function renderRecommendations(items, append = false) {
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
         <div class="meta">${escapeHtml(userFeedback)}</div>
+        ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
         <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
-        <div class="votes">
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
-          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}">Skip</button>
-          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}">Thumb down</button>
-        </div>
-        <div class="scorebar" aria-label="Score">
-          ${[1, 2, 3, 4, 5]
-            .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}">${value}</button>`)
-            .join("")}
-        </div>
-        ${feedbackActions}
+        ${feedbackControls}
       </div>
     `;
     recommendationsEl.appendChild(card);
-    queueVisualEmbedding(item);
+    if (mode !== "preview") {
+      queueVisualEmbedding(item);
+    }
   }
 }
 
@@ -705,8 +781,8 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
   }
 }
 
-function applyRecommendationPage(payload, append = false) {
-  renderRecommendations(payload.items || [], append);
+function applyGalleryPage(payload, append = false) {
+  renderGalleryCards(payload.items || [], append);
   nextRecommendationOffset = payload.next_offset || 0;
   hasMoreRecommendations = Boolean(payload.has_more);
   updateLoadMore(payload.total || 0);
@@ -722,7 +798,9 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
     return;
   }
   lastRenderedFetchId = lastFetch.id;
-  await loadRecommendations();
+  if (currentView !== "history") {
+    await loadCurrentPage();
+  }
 }
 
 function updateLoadMore(total = null) {
@@ -833,14 +911,19 @@ document.querySelector("#importBtn").addEventListener("click", () => importFileE
 document.querySelector("#resetBtn").addEventListener("click", () => resetLibrary().catch((error) => setStatus(error.message, true)));
 loadMoreBtn.addEventListener("click", () => {
   if (!hasMoreRecommendations) return;
-  loadRecommendations(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
+  loadCurrentPage(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
 });
 importFileEl.addEventListener("change", () => {
   importPreferences(importFileEl.files[0]).catch((error) => setStatus(error.message, true));
   importFileEl.value = "";
 });
-includeRatedEl.addEventListener("change", () => loadRecommendations().catch((error) => setStatus(error.message, true)));
-localFilterEl.addEventListener("change", () => loadRecommendations().catch((error) => setStatus(error.message, true)));
+localFilterEl.addEventListener("change", () => loadCurrentPage().catch((error) => setStatus(error.message, true)));
+for (const tab of viewTabs) {
+  tab.addEventListener("click", () => {
+    setActiveView(tab.dataset.view);
+    loadCurrentPage().catch((error) => setStatus(error.message, true));
+  });
+}
 recommendationsEl.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-vote]");
   if (button) {
@@ -871,7 +954,10 @@ recommendationsEl.addEventListener("click", (event) => {
 
 loadSettings()
   .then(loadStatus)
-  .then(loadRecommendations)
+  .then(() => {
+    setActiveView(currentView);
+    return loadCurrentPage();
+  })
   .catch((error) => setStatus(error.message, true));
 
 setInterval(() => {

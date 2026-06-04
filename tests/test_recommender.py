@@ -18,6 +18,7 @@ from exh_rec.recommender import (
     model_snapshot,
     parse_bootstrap_tags,
     parse_bootstrap_weight,
+    reaction_history_page,
     recommend,
     recommend_page,
     record_feedback,
@@ -620,6 +621,52 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(history[0]["score"], 2)
         self.assertEqual(history[0]["vote"], -0.5)
         self.assertEqual(history[1]["vote"], 1.0)
+
+    def test_reaction_history_page_returns_latest_reacted_galleries(self):
+        first_url = "https://exhentai.org/g/10c/d/"
+        second_url = "https://exhentai.org/g/10d/d/"
+        unrated_url = "https://exhentai.org/g/10e/d/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=first_url, gid="10c", token="d", title="Old Reaction", tags=["artist:old"]),
+                Gallery(url=second_url, gid="10d", token="d", title="New Reaction", tags=["artist:new"]),
+                Gallery(url=unrated_url, gid="10e", token="d", title="No Reaction", tags=["artist:none"]),
+            ],
+        )
+        record_feedback(self.conn, first_url, score=2)
+        record_feedback(self.conn, second_url, vote=1)
+
+        page = reaction_history_page(self.conn, limit=10)
+
+        self.assertEqual([item["url"] for item in page["items"]], [second_url, first_url])
+        self.assertEqual(page["total"], 2)
+        self.assertTrue(page["items"][0]["rated"])
+        self.assertEqual(page["items"][0]["user_vote"], 1.0)
+        self.assertEqual(page["items"][1]["user_score"], 2)
+        self.assertIn("feedback_created_at", page["items"][0])
+        self.assertNotIn(unrated_url, [item["url"] for item in page["items"]])
+
+    def test_reaction_history_page_supports_filter_and_offset(self):
+        alpha_url = "https://exhentai.org/g/10f/d/"
+        beta_url = "https://exhentai.org/g/10g/d/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=alpha_url, gid="10f", token="d", title="Alpha Match", tags=["artist:alpha"]),
+                Gallery(url=beta_url, gid="10g", token="d", title="Beta Match", tags=["artist:beta"]),
+            ],
+        )
+        record_feedback(self.conn, alpha_url, vote=1)
+        record_feedback(self.conn, beta_url, vote=-1)
+
+        filtered = reaction_history_page(self.conn, filter_text="alpha")
+        second_page = reaction_history_page(self.conn, limit=1, offset=1)
+
+        self.assertEqual([item["url"] for item in filtered["items"]], [alpha_url])
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(second_page["items"][0]["url"], alpha_url)
+        self.assertTrue(second_page["has_more"] is False)
 
     def test_export_import_preferences_round_trip(self):
         gallery_url = "https://exhentai.org/g/11/e/"

@@ -45,6 +45,7 @@ from exh_rec.app import (
     parse_bool,
     parse_feedback_request,
     query_int,
+    reaction_history_payload,
     recommend_candidate_limit,
     recommendation_payload,
     refresh_summary,
@@ -677,6 +678,33 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual(payload["latest"]["score"], 4)
         self.assertEqual(payload["latest"]["vote"], 0.5)
+        conn.close()
+
+    def test_reaction_history_payload_returns_reacted_gallery_cards(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        old_url = "https://exhentai.org/g/10h/a/"
+        new_url = "https://exhentai.org/g/10i/a/"
+        sample_url = "https://s.exhentai.org/t/history.jpg"
+        store_galleries(
+            conn,
+            [
+                Gallery(url=old_url, gid="10h", token="a", title="Old Feedback"),
+                Gallery(url=new_url, gid="10i", token="a", title="New Feedback"),
+            ],
+        )
+        store_gallery_samples(conn, new_url, 12, [sample_url])
+        record_feedback(conn, old_url, vote=-1)
+        record_feedback(conn, new_url, score=5)
+
+        payload = reaction_history_payload(conn, limit=10)
+
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual([item["url"] for item in payload["items"]], [new_url, old_url])
+        self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
+        self.assertEqual(payload["items"][0]["user_score"], 5)
+        self.assertTrue(payload["items"][0]["rated"])
         conn.close()
 
     def test_ensure_gallery_exists_raises_not_found_for_missing_feedback_target(self):

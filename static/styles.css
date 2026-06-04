@@ -25,7 +25,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -116,7 +117,8 @@ label {
 }
 
 textarea,
-input {
+input,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -131,7 +133,8 @@ input {
 }
 
 textarea:focus,
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--accent);
 }
 
@@ -201,6 +204,25 @@ button.danger:hover {
 .content {
   min-width: 0;
   padding: 20px;
+}
+
+.view-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.view-tabs button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06100d;
+  font-weight: 650;
+}
+
+.view-heading {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
 }
 
 .toolbar {
@@ -444,5 +466,10 @@ dd {
 
   .toolbar {
     display: grid;
+  }
+
+  .view-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
   }
 }
