@@ -1,3 +1,5 @@
 # Install torch and torchvision separately so you can choose a CPU or CUDA build.
 Pillow>=10
 transformers>=4.40
+# huggingface_hub downloads through httpx; SOCKS proxies need the socksio extra.
+socksio>=1

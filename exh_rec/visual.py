@@ -304,6 +304,10 @@ def download_dinov2(device: str | None = None) -> dict:
         path = _snapshot_download_dinov2()
     except Exception as exc:
         message = f"DINOv2 model download failed: {exc}"
+        if "socksio" in str(exc) or "httpx[socks]" in str(exc):
+            # huggingface_hub downloads via httpx, which needs the socksio extra to
+            # use a SOCKS proxy; PySocks only covers the app's own requests.
+            message += " (install it with: python3 -m pip install socksio)"
         with _DINO_LOCK:
             if _DINO_STATE.get("device_config") != requested_device:
                 _DINO_STATE.clear()

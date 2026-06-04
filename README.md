@@ -217,7 +217,13 @@ python3 -m pip install PySocks
 
 The Windows venv helper installs PySocks through `requirements.txt`.
 
-When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route. A `socks5://` proxy is exported to those variables as `socks5h://` so the download resolves DNS through the proxy (matching the app's own SOCKS requests), which matters when `huggingface.co` is only reachable via the proxy. If a DINOv2 download fails because of a network problem, it is reported as the visual encoder error but not cached permanently: once the proxy or network is fixed, the next enrichment retries the load automatically without restarting the server.
+When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route. A `socks5://` proxy is exported to those variables as `socks5h://` so the download resolves DNS through the proxy (matching the app's own SOCKS requests), which matters when `huggingface.co` is only reachable via the proxy. Hugging Face downloads go through `httpx`, which needs the `socksio` package to use a SOCKS proxy (PySocks only covers the app's own ExHentai requests), so install it alongside the visual stack when downloading models behind `socks5://`:
+
+```bash
+python3 -m pip install socksio
+```
+
+If a DINOv2 download fails because of a network problem, it is reported as the visual encoder error but not cached permanently: once the proxy or network is fixed, the next enrichment retries the load automatically without restarting the server. The settings panel's **Download DINOv2 Model** button pre-fetches the model and image processor through the configured proxy and reports a clear error (instead of the misleading "Can't load image processor" message) if a file is missing.
 
 Override the bind address or port with:
 
