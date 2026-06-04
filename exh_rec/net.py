@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import socket
 import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -81,6 +83,40 @@ def environment_proxy_url(proxy_url: str) -> str:
     if proxy_url.startswith("socks5://"):
         return "socks5h://" + proxy_url[len("socks5://"):]
     return proxy_url
+
+
+def open_url_with_retry(
+    request: urllib.request.Request,
+    timeout: int,
+    proxy_url: str = "",
+    attempts: int = 3,
+    backoff: float = 0.5,
+    retry_statuses: tuple[int, ...] = (500, 502, 503, 504),
+    sleep=time.sleep,
+) -> Any:
+    """Open a URL, retrying transient failures with exponential backoff.
+
+    Retries on connection errors, timeouts, and the given HTTP status codes
+    (server-side errors). Client errors such as 403/404 are never retried — a
+    stale ExHentai thumbnail URL fails fast so callers can fall back to a
+    refresh. Returns the live response object, so callers still use it as a
+    context manager.
+    """
+    last_exc: Exception | None = None
+    for index in range(max(1, attempts)):
+        try:
+            return open_url(request, timeout=timeout, proxy_url=proxy_url)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in retry_statuses or index == attempts - 1:
+                raise
+            last_exc = exc
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            if index == attempts - 1:
+                raise
+            last_exc = exc
+        sleep(backoff * (2 ** index))
+    # Unreachable: the loop either returns or raises on the final attempt.
+    raise last_exc if last_exc else RuntimeError("open_url_with_retry exhausted")
 
 
 def open_url(request: urllib.request.Request, timeout: int, proxy_url: str = "") -> Any:

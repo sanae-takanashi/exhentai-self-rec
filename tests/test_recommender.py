@@ -265,9 +265,30 @@ class RecommenderTest(unittest.TestCase):
             for row in self.conn.execute("SELECT url, thumb_url, visual_embedding_json FROM galleries")
         }
         self.assertIsNone(rows[first_url]["thumb_url"])
-        self.assertIsNone(rows[first_url]["visual_embedding_json"])
+        # The visual embedding is preserved so a transient bad cover does not throw
+        # away a learned vector; only the shared cover URL is cleared.
+        self.assertIsNotNone(rows[first_url]["visual_embedding_json"])
         self.assertIsNone(rows[second_url]["thumb_url"])
         self.assertEqual(rows[unique_url]["thumb_url"], "https://s.exhentai.org/w/unique.webp")
+
+    def test_clear_shared_thumbnail_metadata_ignores_ehgt_covers(self):
+        shared = "https://ehgt.org/aa/bb/sharedcover.jpg"
+        first_url = "https://exhentai.org/g/4e/a/"
+        second_url = "https://exhentai.org/g/4e/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=first_url, gid="4e", token="a", title="First", thumb_url=shared),
+                Gallery(url=second_url, gid="4e", token="b", title="Second", thumb_url=shared),
+            ],
+        )
+
+        cleared = clear_shared_thumbnail_metadata(self.conn)
+
+        self.assertEqual(cleared, 0)
+        rows = {row["url"]: row for row in self.conn.execute("SELECT url, thumb_url FROM galleries")}
+        self.assertEqual(rows[first_url]["thumb_url"], shared)
+        self.assertEqual(rows[second_url]["thumb_url"], shared)
 
     def test_store_gallery_samples_preserves_existing_samples_on_empty_refresh(self):
         gallery_url = "https://exhentai.org/g/4sample/a/"

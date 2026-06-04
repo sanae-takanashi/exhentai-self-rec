@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -18,15 +19,18 @@ from typing import Any
 from . import db
 from .exhentai import (
     Gallery,
+    apply_gallery_metadata,
     check_access,
     fetch_galleries,
     fetch_gallery_detail,
+    fetch_gallery_metadata,
     fetch_gallery_sample_pages,
     normalize_cookie_header,
+    sample_entry_url,
     usable_thumb,
     valid_cookie_header,
 )
-from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url, proxy_preview
+from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url_with_retry, proxy_preview
 from .recommender import (
     clear_feedback,
     export_preferences,
@@ -70,7 +74,7 @@ FETCH_STATE: dict[str, Any] = {"running": False}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
-ALLOWED_THUMB_HOSTS = {"s.exhentai.org"}
+ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
 
 
@@ -745,6 +749,11 @@ def fetch_and_store(
             try:
                 galleries = fetch_galleries(cookie, query=query, pages=pages, proxy_url=proxy_url)
                 fetched += len(galleries)
+                try:
+                    enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
+                except Exception as exc:
+                    errors.append(f"covers {query or 'recent'}: {exc}")
+                    FETCH_STATE["errors"] = list(errors)
                 with db.connect() as conn:
                     stored += store_galleries(conn, galleries)
                     candidates = select_detail_candidates(conn, galleries, detail_limit - len(selected_for_detail))
@@ -760,6 +769,7 @@ def fetch_and_store(
         for gallery in selected_for_detail:
             try:
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
+                ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
                 cache_sample_thumbnails(detailed.url, samples)
                 with db.connect() as conn:
@@ -874,6 +884,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         for gallery in candidates:
             try:
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
+                ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
                 cache_sample_thumbnails(detailed.url, samples)
                 with db.connect() as conn:
@@ -936,6 +947,37 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
 REFRESH_THUMBS_MAX = 60
 
 
+def enrich_covers_via_api(cookie: str, galleries: list[Gallery], proxy_url: str = "") -> int:
+    """Fill cover thumbnails/metadata on ``galleries`` from the gdata API.
+
+    Returns the number of covers set/changed. Prefers the stable ehgt.org cover;
+    galleries the API does not return keep their existing HTML-scraped cover.
+    """
+    pairs = [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token]
+    if not pairs:
+        return 0
+    metadata = fetch_gallery_metadata(cookie, pairs, proxy_url=proxy_url)
+    return apply_gallery_metadata(galleries, metadata)
+
+
+def ensure_api_cover(cookie: str, base: Gallery, detailed: Gallery, proxy_url: str = "") -> None:
+    """Keep a stable ehgt.org cover on a freshly detail-fetched gallery.
+
+    A detail page yields an expiring ``s.exhentai.org`` cover that the detail
+    store would otherwise persist over a good ehgt cover. Reuse an ehgt cover the
+    caller already has; otherwise ask the gdata API once (best effort).
+    """
+    if base.thumb_url and "ehgt.org" in base.thumb_url:
+        detailed.thumb_url = base.thumb_url
+        return
+    if detailed.thumb_url and "ehgt.org" in detailed.thumb_url:
+        return
+    try:
+        enrich_covers_via_api(cookie, [detailed], proxy_url=proxy_url)
+    except Exception:
+        pass
+
+
 def refresh_thumbnails(
     gallery_urls: Any,
     include_rated: bool = False,
@@ -963,24 +1005,45 @@ def refresh_thumbnails(
         if not cookie:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
-        updated = 0
-        errors: list[str] = []
+        galleries: list[Gallery] = []
         for url in urls:
             with db.connect() as conn:
                 row = conn.execute("SELECT * FROM galleries WHERE url = ?", (url,)).fetchone()
-            if not row:
-                continue
-            gallery = gallery_from_item(db.row_to_dict(row))
-            try:
-                detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
-            except Exception as exc:
-                errors.append(f"{url}: {exc}")
-                continue
-            thumb = usable_thumb(detailed.thumb_url)
+            if row:
+                galleries.append(gallery_from_item(db.row_to_dict(row)))
+
+        updated = 0
+        errors: list[str] = []
+        # Prefer the gdata API: one batched call yields stable ehgt.org covers for
+        # the whole page instead of N brittle HTML scrapes of expiring cover URLs.
+        api_thumbs: dict[str, str] = {}
+        try:
+            metadata = fetch_gallery_metadata(
+                cookie,
+                [(g.gid, g.token) for g in galleries if g.gid and g.token],
+                proxy_url=proxy_url,
+            )
+            for gallery in galleries:
+                thumb = usable_thumb((metadata.get(gallery.url) or {}).get("thumb"))
+                if thumb:
+                    api_thumbs[gallery.url] = thumb
+        except Exception as exc:
+            errors.append(f"gdata API: {exc}")
+
+        for gallery in galleries:
+            thumb = api_thumbs.get(gallery.url)
+            if not thumb:
+                # The API had no cover for this gallery; fall back to HTML scraping.
+                try:
+                    detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+                except Exception as exc:
+                    errors.append(f"{gallery.url}: {exc}")
+                    continue
+                thumb = usable_thumb(detailed.thumb_url)
             if not thumb:
                 continue
             with db.connect() as conn:
-                conn.execute("UPDATE galleries SET thumb_url = ? WHERE url = ?", (thumb, url))
+                conn.execute("UPDATE galleries SET thumb_url = ? WHERE url = ?", (thumb, gallery.url))
             updated += 1
 
         with db.connect() as conn:
@@ -1009,14 +1072,27 @@ def collect_gallery_samples(
     extra_pages: int,
     delay: float = 1.0,
     proxy_url: str = "",
-) -> list[str]:
-    """Pick page thumbnails for ``detailed`` while preserving the first page preview."""
-    pool = list(dict.fromkeys(detailed.sample_thumbs))
+) -> list:
+    """Pick page previews for ``detailed`` while preserving the first page preview.
+
+    Each entry is a URL string or a sprite-frame dict, so dedupe is keyed on the
+    underlying image URL rather than the (unhashable) entry itself.
+    """
+    pool: list = []
+    seen: set[str] = set()
+
+    def add(entry) -> None:
+        key = sample_entry_url(entry)
+        if key and key not in seen:
+            seen.add(key)
+            pool.append(entry)
+
+    for entry in detailed.sample_thumbs:
+        add(entry)
     count = sample_count_for(detailed.page_count)
     if len(pool) < count and extra_pages > 0:
-        for thumb in fetch_gallery_sample_pages(cookie, detailed, extra_pages, delay=delay, proxy_url=proxy_url):
-            if thumb not in pool:
-                pool.append(thumb)
+        for entry in fetch_gallery_sample_pages(cookie, detailed, extra_pages, delay=delay, proxy_url=proxy_url):
+            add(entry)
     if len(pool) <= count:
         return pool
     first_thumb = pool[0]
@@ -1040,6 +1116,7 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
 
     try:
         detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+        ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
         samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
         cache_sample_thumbnails(detailed.url, samples)
     except Exception as exc:
@@ -1319,10 +1396,13 @@ def recommendation_item_with_image_fallback(item: dict) -> dict:
     if item.get("thumb_url"):
         return item
     samples = item.get("samples") or []
-    if not samples:
+    # Only a standalone image URL works as a cover; a sprite-frame dict cannot be
+    # used directly (it is served cropped via the sample-index route instead).
+    first_url = next((sample for sample in samples if isinstance(sample, str) and sample), None)
+    if not first_url:
         return item
     updated = dict(item)
-    updated["thumb_url"] = samples[0]
+    updated["thumb_url"] = first_url
     return updated
 
 
@@ -1383,18 +1463,20 @@ def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]
 def cached_gallery_sample(gallery_url: str, sample_index: int) -> tuple[bytes, str]:
     if thumbnail_referer(gallery_url) != gallery_url.strip():
         raise ApiError(HTTPStatus.BAD_REQUEST, "valid gallery_url is required")
-    sample_url = gallery_sample_url(gallery_url, sample_index)
+    entry = gallery_sample_entry(gallery_url, sample_index)
     try:
-        return cached_thumbnail(sample_url, gallery_url)
+        return render_sample_entry(entry, gallery_url)
     except ApiError as exc:
         if not stale_thumbnail_error(exc):
             raise
 
     refresh_gallery_sample_metadata(gallery_url)
-    return cached_thumbnail(gallery_sample_url(gallery_url, sample_index, fallback_first=True), gallery_url)
+    entry = gallery_sample_entry(gallery_url, sample_index, fallback_first=True)
+    return render_sample_entry(entry, gallery_url)
 
 
-def gallery_sample_url(gallery_url: str, sample_index: int, fallback_first: bool = False) -> str:
+def gallery_sample_entry(gallery_url: str, sample_index: int, fallback_first: bool = False):
+    """Return the sample entry (URL string or sprite-frame dict) at ``sample_index``."""
     with db.connect() as conn:
         row = conn.execute("SELECT samples_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
     if not row:
@@ -1403,7 +1485,7 @@ def gallery_sample_url(gallery_url: str, sample_index: int, fallback_first: bool
         samples = json.loads(row["samples_json"] or "[]")
     except json.JSONDecodeError as exc:
         raise ApiError(HTTPStatus.NOT_FOUND, "Gallery has no sample images") from exc
-    samples = [str(sample) for sample in samples if str(sample).strip()]
+    samples = [sample for sample in samples if sample_entry_url(sample).strip()]
     if not samples:
         raise ApiError(HTTPStatus.NOT_FOUND, "Gallery has no sample images")
     if 0 <= sample_index < len(samples):
@@ -1411,6 +1493,68 @@ def gallery_sample_url(gallery_url: str, sample_index: int, fallback_first: bool
     if fallback_first:
         return samples[0]
     raise ApiError(HTTPStatus.NOT_FOUND, "Sample image not found")
+
+
+def render_sample_entry(entry, gallery_url: str) -> tuple[bytes, str]:
+    """Fetch (and crop, for sprite frames) the image bytes for one sample entry."""
+    if not isinstance(entry, dict):
+        return cached_thumbnail(str(entry), gallery_url)
+    sheet_url = str(entry.get("url") or "")
+    sheet_bytes, sheet_type = cached_thumbnail(sheet_url, gallery_url)
+    box = sprite_crop_box(entry)
+    if not box:
+        return sheet_bytes, sheet_type
+    cache_key = f"{sheet_url}#{box[0]},{box[1]},{box[2]},{box[3]}"
+    data_path, meta_path = thumbnail_cache_paths(cache_key)
+    cached = read_cached_thumbnail(data_path, meta_path, cache_key)
+    if cached:
+        return cached
+    try:
+        data, content_type = crop_sprite_bytes(sheet_bytes, *box)
+    except SpriteCropUnavailable:
+        # Pillow missing or the sheet could not be decoded: serve the whole sheet
+        # so the page still shows an image instead of a broken thumbnail.
+        return sheet_bytes, sheet_type
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.write_bytes(data)
+    meta_path.write_text(
+        json.dumps(
+            {"source_url": cache_key, "content_type": content_type, "fetched_at": current_timestamp()},
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+    return data, content_type
+
+
+def sprite_crop_box(entry: dict) -> tuple[int, int, int, int] | None:
+    try:
+        x, y, w, h = int(entry.get("x") or 0), int(entry.get("y") or 0), int(entry.get("w") or 0), int(entry.get("h") or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return max(0, x), max(0, y), w, h
+
+
+class SpriteCropUnavailable(RuntimeError):
+    pass
+
+
+def crop_sprite_bytes(data: bytes, x: int, y: int, w: int, h: int) -> tuple[bytes, str]:
+    """Crop one frame out of a sprite sheet with Pillow; return PNG bytes."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise SpriteCropUnavailable(f"Pillow is required to crop sprite previews: {exc}") from exc
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            frame = image.convert("RGB").crop((x, y, x + w, y + h))
+            buffer = io.BytesIO()
+            frame.save(buffer, format="PNG")
+    except Exception as exc:
+        raise SpriteCropUnavailable(f"Could not crop sprite frame: {exc}") from exc
+    return buffer.getvalue(), "image/png"
 
 
 def refresh_gallery_sample_metadata(gallery_url: str) -> None:
@@ -1426,6 +1570,7 @@ def refresh_gallery_sample_metadata(gallery_url: str) -> None:
     try:
         gallery = gallery_from_item(db.row_to_dict(row))
         detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+        ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
         samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
         cache_sample_thumbnails(detailed.url, samples)
     except ApiError:
@@ -1437,11 +1582,18 @@ def refresh_gallery_sample_metadata(gallery_url: str) -> None:
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
 
 
-def cache_sample_thumbnails(gallery_url: str, samples: list[str]) -> int:
+def cache_sample_thumbnails(gallery_url: str, samples: list) -> int:
     cached = 0
+    seen: set[str] = set()
     for sample in samples:
+        # Pre-warm by the underlying image URL; a sprite sheet is fetched once and
+        # reused across its frames, which are cropped lazily when served.
+        url = sample_entry_url(sample)
+        if not url or url in seen:
+            continue
+        seen.add(url)
         try:
-            cached_thumbnail(sample, gallery_url)
+            cached_thumbnail(url, gallery_url)
             cached += 1
         except ApiError:
             continue
@@ -1464,7 +1616,9 @@ def normalize_thumbnail_url(thumb_url: str) -> str:
 def is_allowed_thumbnail_url(thumb_url: str) -> bool:
     parsed = urllib.parse.urlparse(thumb_url)
     hostname = (parsed.hostname or "").lower()
-    return parsed.scheme == "https" and (hostname in ALLOWED_THUMB_HOSTS or hostname.endswith(".hath.network"))
+    return parsed.scheme == "https" and (
+        hostname in ALLOWED_THUMB_HOSTS or hostname.endswith(".hath.network") or hostname.endswith(".ehgt.org")
+    )
 
 
 def thumbnail_cache_paths(thumb_url: str) -> tuple[Path, Path]:
@@ -1512,7 +1666,7 @@ def fetch_thumbnail_bytes(
         },
     )
     try:
-        with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
+        with open_url_with_retry(request, timeout=timeout, proxy_url=proxy_url) as response:
             content_type = response_content_type(response.headers)
             data = response.read(THUMB_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:

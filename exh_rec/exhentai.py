@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import random
 import re
 import time
@@ -10,10 +11,13 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-from .net import open_url
+from .net import open_url, open_url_with_retry
 
 
 BASE_URL = "https://exhentai.org/"
+EH_API_URL = "https://api.e-hentai.org/api.php"
+GDATA_BATCH_SIZE = 25
+GDATA_BATCH_PAUSE = 5.0  # seconds between batches to respect the API rate limit
 GALLERY_RE = re.compile(r"(?:https?:)?(?://(?:exhentai|e-hentai)\.org)?/g/(\d+)/([0-9a-fA-F]+)/?")
 TAG_RE = re.compile(r"https?://(?:exhentai|e-hentai)\.org/tag/([^\"'#?]+)|/tag/([^\"'#?]+)")
 TAG_ATTR_RE = re.compile(
@@ -35,7 +39,25 @@ DETAIL_LENGTH_RE = re.compile(r"Length:\s*</td>\s*<td[^>]*>\s*([\d,]+)", re.I)
 DETAIL_LENGTH_FALLBACK_RE = re.compile(r"([\d,]+)\s*pages", re.I)
 GDT_START_RE = re.compile(r"<div[^>]*\bid=[\"']gdt[\"']", re.I)
 GDT_END_RE = re.compile(r"<div[^>]*\bid=[\"'](?:gdb|gtb|cdiv|chd)[\"']", re.I)
-SAMPLE_THUMB_RE = re.compile(r"(https?:)?//(?:[a-z0-9.-]*\bs\.exhentai\.org|[a-z0-9.-]+\.hath\.network)/[^\"')\s]+", re.I)
+SAMPLE_THUMB_RE = re.compile(
+    r"(https?:)?//(?:[a-z0-9.-]*\bs\.exhentai\.org|[a-z0-9.-]*\behgt\.org|[a-z0-9.-]+\.hath\.network)/[^\"')\s]+",
+    re.I,
+)
+STYLE_ATTR_RE = re.compile(r"style=[\"']([^\"']*)[\"']", re.I)
+SPRITE_POS_RE = re.compile(r"\)\s*(-?\d+)(?:px)?\s+(-?\d+)(?:px)?", re.I)
+SPRITE_WIDTH_RE = re.compile(r"\bwidth:\s*(\d+)\s*px", re.I)
+SPRITE_HEIGHT_RE = re.compile(r"\bheight:\s*(\d+)\s*px", re.I)
+
+
+@dataclass
+class SampleThumb:
+    """One page preview cropped from a sprite sheet (E-Hentai "Normal" mode)."""
+
+    url: str
+    x: int = 0
+    y: int = 0
+    w: int = 0
+    h: int = 0
 
 
 @dataclass
@@ -52,7 +74,9 @@ class Gallery:
     tags: list[str] = field(default_factory=list)
     source_query: str | None = None
     page_count: int | None = None
-    sample_thumbs: list[str] = field(default_factory=list)
+    # Each entry is either a plain URL string (individual/"Large" previews) or a
+    # ``{"url", "x", "y", "w", "h"}`` sprite-frame dict ("Normal" mode).
+    sample_thumbs: list = field(default_factory=list)
 
 
 class LinkTitleParser(HTMLParser):
@@ -219,7 +243,7 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str =
         },
     )
     try:
-        with open_url(request, timeout=timeout, proxy_url=proxy_url) as response:
+        with open_url_with_retry(request, timeout=timeout, proxy_url=proxy_url) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             return response.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
@@ -247,6 +271,156 @@ def fetch_galleries(
         if page + 1 < pages:
             time.sleep(delay)
     return galleries
+
+
+def post_api_json(cookie_header: str, payload: dict, timeout: int = 30, proxy_url: str = "") -> dict:
+    """POST a JSON request to the E-Hentai API and return the decoded response."""
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        EH_API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Cookie": normalize_cookie_header(cookie_header),
+            "User-Agent": "exhentai-self-recommend/0.1 (+local personal recommender)",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with open_url_with_retry(request, timeout=timeout, proxy_url=proxy_url) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return json.loads(response.read().decode(charset, errors="replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {exc.code} from gdata API: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach gdata API: {exc.reason}") from exc
+
+
+def fetch_gallery_metadata(
+    cookie_header: str,
+    gid_token_pairs: list[tuple[str | int, str]],
+    delay: float = GDATA_BATCH_PAUSE,
+    proxy_url: str = "",
+    sleep=time.sleep,
+) -> dict[str, dict]:
+    """Return ``{canonical_gallery_url: metadata}`` via the E-Hentai gdata API.
+
+    Galleries are looked up in batches of 25 (the API limit), with a pause
+    between batches to respect the rate limit. The ``thumb`` field is a stable
+    cover URL on the ehgt.org CDN, unlike the time-sensitive ``s.exhentai.org``
+    cover URLs scraped from HTML. A failing batch is skipped so the others still
+    return; the result may therefore be partial.
+    """
+    seen: set[tuple[int, str]] = set()
+    pairs: list[tuple[int, str]] = []
+    for gid, token in gid_token_pairs:
+        try:
+            key = (int(gid), str(token))
+        except (TypeError, ValueError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            pairs.append(key)
+
+    metadata: dict[str, dict] = {}
+    for index in range(0, len(pairs), GDATA_BATCH_SIZE):
+        chunk = pairs[index : index + GDATA_BATCH_SIZE]
+        try:
+            response = post_api_json(
+                cookie_header,
+                {"method": "gdata", "gidlist": [list(pair) for pair in chunk], "namespace": 1},
+                proxy_url=proxy_url,
+            )
+        except Exception:
+            continue
+        for entry in response.get("gmetadata") or []:
+            if not isinstance(entry, dict) or entry.get("error"):
+                continue
+            gid = entry.get("gid")
+            token = entry.get("token")
+            if gid is None or not token:
+                continue
+            metadata[canonical_gallery_url(str(gid), str(token))] = parse_gdata_entry(entry)
+        if index + GDATA_BATCH_SIZE < len(pairs):
+            sleep(delay)
+    return metadata
+
+
+def parse_gdata_entry(entry: dict) -> dict:
+    """Map one gdata ``gmetadata`` entry onto the fields the app stores."""
+    tags: list[str] = []
+    for raw in entry.get("tags") or []:
+        tag = normalize_tag(str(raw))
+        if tag and tag not in tags:
+            tags.append(tag)
+    return {
+        "thumb": str(entry.get("thumb") or "") or None,
+        "title": html.unescape(str(entry.get("title") or "")) or None,
+        "title_jpn": html.unescape(str(entry.get("title_jpn") or "")) or None,
+        "category": str(entry.get("category") or "") or None,
+        "uploader": html.unescape(str(entry.get("uploader") or "")) or None,
+        "posted": str(entry.get("posted") or "") or None,
+        "page_count": coerce_int(entry.get("filecount")),
+        "rating": coerce_float(entry.get("rating")),
+        "tags": tags,
+    }
+
+
+def coerce_int(value: object) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_float(value: object) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_gallery_metadata(galleries: list[Gallery], metadata: dict[str, dict]) -> int:
+    """Fill cover/title/category/etc. on ``galleries`` from gdata ``metadata``.
+
+    Prefers the ehgt.org ``thumb`` cover when present; otherwise leaves the
+    existing (HTML-scraped) values in place. Returns the number of galleries
+    whose ``thumb_url`` was set or changed.
+    """
+    updated = 0
+    for gallery in galleries:
+        meta = metadata.get(gallery.url)
+        if not meta:
+            continue
+        thumb = meta.get("thumb")
+        if thumb and thumb != gallery.thumb_url:
+            gallery.thumb_url = thumb
+            updated += 1
+        title = meta.get("title")
+        if title and (not gallery.title or gallery.title.startswith("Gallery ")):
+            gallery.title = title
+        gallery.category = gallery.category or meta.get("category")
+        gallery.uploader = gallery.uploader or meta.get("uploader")
+        if gallery.rating is None and meta.get("rating") is not None:
+            gallery.rating = meta["rating"]
+        if gallery.page_count is None and meta.get("page_count") is not None:
+            gallery.page_count = meta["page_count"]
+        if not gallery.posted_at and meta.get("posted"):
+            gallery.posted_at = format_posted(meta["posted"])
+        for tag in meta.get("tags") or []:
+            if tag not in gallery.tags:
+                gallery.tags.append(tag)
+    return updated
+
+
+def format_posted(posted: str) -> str:
+    """Format the gdata unix-timestamp ``posted`` field as a readable date."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(posted)))
+    except (TypeError, ValueError, OSError):
+        return posted
 
 
 def check_access(cookie_header: str, proxy_url: str = "") -> dict:
@@ -290,13 +464,13 @@ def fetch_gallery_sample_pages(
     if not candidate_pages:
         return []
     chosen = sorted(random.sample(candidate_pages, min(extra_pages, len(candidate_pages))))
-    thumbs: list[str] = []
+    thumbs: list = []
     for page in chosen:
         if delay:
             time.sleep(delay)
         page_html = fetch_page(cookie_header, sample_page_url(gallery.url, page), proxy_url=proxy_url)
-        _, page_thumbs = parse_gallery_pages(page_html)
-        thumbs.extend(page_thumbs)
+        _, page_entries = parse_gallery_pages_rich(page_html)
+        thumbs.extend(sample_storage(entry) for entry in page_entries)
     return thumbs
 
 
@@ -308,27 +482,100 @@ def sample_page_url(gallery_url: str, page: int) -> str:
 
 
 def parse_gallery_pages(page_html: str) -> tuple[int | None, list[str]]:
-    """Extract the page count and per-page thumbnail URLs from a gallery image-list page."""
+    """Page count and per-page thumbnail URLs (individual/"Large" previews only).
+
+    Backward-compatible wrapper: sprite-sheet ("Normal" mode) previews are
+    dropped here. Use :func:`parse_gallery_pages_rich` to also get sprite frames.
+    """
+    page_count, entries = parse_gallery_pages_rich(page_html)
+    return page_count, [entry for entry in entries if isinstance(entry, str)]
+
+
+def parse_gallery_pages_rich(page_html: str) -> tuple[int | None, list]:
+    """Page count and per-page previews, including sprite-sheet ("Normal") mode.
+
+    Returns individual previews as URL strings; when the gallery only exposes
+    sprite-sheet previews, returns :class:`SampleThumb` crop frames instead. A
+    gallery uses one mode or the other, so the list is homogeneous in practice.
+    """
     page_count = parse_page_count(page_html)
     block = gdt_block(page_html)
-    thumbs: list[str] = []
+
+    # "Normal" mode renders previews as sprite-sheet frames; detect those first so
+    # the large-preview passes below never mistake a sprite sheet for an
+    # individual image.
+    sprites = parse_sprite_previews(block)
+    if sprites:
+        return page_count, list(sprites)
+
+    large: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str) -> None:
+        url = normalize_sample_thumb(url)
+        if usable_thumb(url) and sample_thumb_host(url) and url not in seen:
+            seen.add(url)
+            large.append(url)
+
     for match in SAMPLE_THUMB_RE.finditer(block):
-        if css_url_looks_like_sprite(block, match):
-            continue
-        url = normalize_sample_thumb(match.group(0))
-        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
-            thumbs.append(url)
+        if not css_url_looks_like_sprite(block, match):
+            add(match.group(0))
     for candidate in img_src_candidates(block):
-        url = normalize_sample_thumb(candidate)
-        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
-            thumbs.append(url)
+        add(candidate)
     for match in CSS_URL_RE.finditer(block):
-        if css_url_looks_like_sprite(block, match):
+        if not css_url_looks_like_sprite(block, match):
+            add(match.group(1))
+
+    return page_count, large
+
+
+def parse_sprite_previews(block: str) -> list[SampleThumb]:
+    """Parse "Normal" mode sprite previews into per-frame crop boxes.
+
+    Each preview is an inner ``<div>`` whose inline style paints one frame of a
+    sprite sheet via ``background:... url(SHEET) -Xpx -Ypx`` with a fixed
+    ``width``/``height``. The negative background-position becomes a positive
+    crop offset into the sheet.
+    """
+    previews: list[SampleThumb] = []
+    for style in STYLE_ATTR_RE.findall(block):
+        if "url(" not in style.lower():
             continue
-        url = normalize_sample_thumb(match.group(1))
-        if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
-            thumbs.append(url)
-    return page_count, thumbs
+        url_match = CSS_URL_RE.search(style)
+        pos = SPRITE_POS_RE.search(style)
+        width = SPRITE_WIDTH_RE.search(style)
+        height = SPRITE_HEIGHT_RE.search(style)
+        if not (url_match and pos and width and height):
+            continue
+        url = normalize_sample_thumb(url_match.group(1))
+        if not (usable_thumb(url) and sample_thumb_host(url)):
+            continue
+        previews.append(
+            SampleThumb(
+                url=url,
+                x=max(0, -int(pos.group(1))),
+                y=max(0, -int(pos.group(2))),
+                w=int(width.group(1)),
+                h=int(height.group(1)),
+            )
+        )
+    return previews
+
+
+def sample_storage(entry) -> str | dict:
+    """Convert a parsed preview into its JSON-serializable storage form."""
+    if isinstance(entry, SampleThumb):
+        return {"url": entry.url, "x": entry.x, "y": entry.y, "w": entry.w, "h": entry.h}
+    return entry
+
+
+def sample_entry_url(entry) -> str:
+    """Return the image URL for a sample entry (string, dict, or SampleThumb)."""
+    if isinstance(entry, SampleThumb):
+        return entry.url
+    if isinstance(entry, dict):
+        return str(entry.get("url") or "")
+    return str(entry)
 
 
 def parse_page_count(page_html: str) -> int | None:
@@ -418,8 +665,13 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
     title = strip_html_match(DETAIL_TITLE_RE.search(page_html))
     rating_match = DETAIL_AVERAGE_RE.search(html.unescape(page_html)) or RATING_RE.search(html.unescape(page_html))
     rating = float(rating_match.group(1)) if rating_match else None
-    page_count, sample_thumbs = parse_gallery_pages(page_html)
-    thumb_url = usable_thumb(extract_thumb(id_block(page_html, "gd1"))) or (sample_thumbs[0] if sample_thumbs else None)
+    page_count, rich_entries = parse_gallery_pages_rich(page_html)
+    sample_thumbs = [sample_storage(entry) for entry in rich_entries]
+    thumb_url = usable_thumb(extract_thumb(id_block(page_html, "gd1")))
+    if not thumb_url:
+        # Fall back to the first individual preview; a sprite frame is not a usable
+        # standalone cover, so skip those (the gdata API supplies covers instead).
+        thumb_url = next((entry for entry in sample_thumbs if isinstance(entry, str)), None)
     return Gallery(
         url=gallery_url,
         gid=gid,
@@ -555,7 +807,11 @@ def css_url_looks_like_sprite(block: str, match: re.Match[str]) -> bool:
 def sample_thumb_host(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
     hostname = (parsed.hostname or "").lower()
-    return hostname == "s.exhentai.org" or hostname.endswith(".hath.network")
+    return (
+        hostname in {"s.exhentai.org", "ehgt.org"}
+        or hostname.endswith(".hath.network")
+        or hostname.endswith(".ehgt.org")
+    )
 
 
 def strip_html_match(match: re.Match[str] | None) -> str | None:

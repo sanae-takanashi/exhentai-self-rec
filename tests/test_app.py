@@ -1,3 +1,4 @@
+import io
 import unittest
 import sqlite3
 import threading
@@ -26,6 +27,9 @@ from exh_rec.app import (
     enrich_feedback_gallery,
     enrich_recommendations,
     ensure_gallery_exists,
+    gallery_sample_entry,
+    render_sample_entry,
+    SpriteCropUnavailable,
     fetch_and_store,
     feedback_history_payload,
     finish_interrupted_fetch_runs,
@@ -236,7 +240,7 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
 
-                with patch("exh_rec.app.open_url", fake_open_url):
+                with patch("exh_rec.net.open_url", fake_open_url):
                     first = cached_thumbnail(
                         "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
                         "https://exhentai.org/g/123/abcdef/",
@@ -284,7 +288,7 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc; igneous=secret")
                     db.set_setting(conn, "network_proxy", "socks5://127.0.0.1:1080")
 
-                with patch("exh_rec.app.open_url", fake_open_url):
+                with patch("exh_rec.net.open_url", fake_open_url):
                     cached_thumbnail(
                         "https://s.exhentai.org/w/01/913/40046-dq9gs0zn.webp",
                         "https://exhentai.org/g/123/abcdef/",
@@ -347,7 +351,9 @@ class AppTest(unittest.TestCase):
                 with patch("exh_rec.app.cached_thumbnail", side_effect=[stale_error, (b"fresh", "image/webp")]) as cached, patch(
                     "exh_rec.app.fetch_gallery_detail",
                     return_value=detailed,
-                ) as fetch_detail, patch("exh_rec.app.cache_sample_thumbnails") as cache_samples:
+                ) as fetch_detail, patch("exh_rec.app.cache_sample_thumbnails") as cache_samples, patch(
+                    "exh_rec.app.fetch_gallery_metadata", return_value={}
+                ):
                     result = cached_gallery_sample(gallery_url, 0)
 
                 with db.connect() as conn:
@@ -833,7 +839,9 @@ class AppTest(unittest.TestCase):
                     title="No Cover",
                     thumb_url="https://s.exhentai.org/t/aa/refreshed-cover.jpg",
                 )
-                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed) as fetch_detail:
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value={}), patch(
+                    "exh_rec.app.fetch_gallery_detail", return_value=detailed
+                ) as fetch_detail:
                     result = refresh_thumbnails([gallery_url])
 
                 with db.connect() as conn:
@@ -847,6 +855,55 @@ class AppTest(unittest.TestCase):
                 # A thumbnail refresh must not mark the gallery as fully enriched.
                 self.assertIsNone(row["detail_fetched_at"])
 
+    def test_refresh_thumbnails_uses_gdata_cover_without_html_scrape(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/700/a/"
+                ehgt_cover = "https://ehgt.org/aa/bb/700-cover.jpg"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="700", token="a", title="API Cover")])
+
+                metadata = {gallery_url: {"thumb": ehgt_cover}}
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata), patch(
+                    "exh_rec.app.fetch_gallery_detail"
+                ) as fetch_detail:
+                    result = refresh_thumbnails([gallery_url])
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT thumb_url FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["updated"], 1)
+                # The gdata cover is authoritative; no HTML scrape should happen.
+                fetch_detail.assert_not_called()
+                self.assertEqual(row["thumb_url"], ehgt_cover)
+
+    def test_refresh_thumbnails_falls_back_to_html_when_api_lacks_cover(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/701/a/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="701", token="a", title="HTML Cover")])
+
+                detailed = Gallery(url=gallery_url, gid="701", token="a", title="HTML Cover", thumb_url="https://s.exhentai.org/t/aa/html.jpg")
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value={}), patch(
+                    "exh_rec.app.fetch_gallery_detail", return_value=detailed
+                ) as fetch_detail:
+                    result = refresh_thumbnails([gallery_url])
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT thumb_url FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                fetch_detail.assert_called_once()
+                self.assertEqual(row["thumb_url"], "https://s.exhentai.org/t/aa/html.jpg")
+
     def test_refresh_thumbnails_reports_per_gallery_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
@@ -857,7 +914,9 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
                     store_galleries(conn, [Gallery(url=gallery_url, gid="71", token="a", title="Breaks")])
 
-                with patch("exh_rec.app.fetch_gallery_detail", side_effect=RuntimeError("boom")):
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value={}), patch(
+                    "exh_rec.app.fetch_gallery_detail", side_effect=RuntimeError("boom")
+                ):
                     result = refresh_thumbnails([gallery_url])
 
                 self.assertFalse(result["ok"])
@@ -886,6 +945,56 @@ class AppTest(unittest.TestCase):
             refresh_thumbnails([])
         self.assertEqual(ctx.exception.status, HTTPStatus.BAD_REQUEST)
         self.assertFalse(FETCH_LOCK.locked())
+
+    def test_is_allowed_thumbnail_url_accepts_ehgt(self):
+        self.assertTrue(is_allowed_thumbnail_url("https://ehgt.org/aa/bb/cover.jpg"))
+        self.assertTrue(is_allowed_thumbnail_url("https://s.exhentai.org/t/aa/x.jpg"))
+        # Only https is allowed, and unknown hosts are rejected.
+        self.assertFalse(is_allowed_thumbnail_url("http://ehgt.org/aa/bb/cover.jpg"))
+        self.assertFalse(is_allowed_thumbnail_url("https://evil.test/cover.jpg"))
+
+    def test_gallery_sample_entry_returns_string_or_sprite_dict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/900/a/"
+                sprite = {"url": "https://s.exhentai.org/m/001/sheet.jpg", "x": 100, "y": 0, "w": 100, "h": 142}
+                with db.connect() as conn:
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="900", token="a", title="Mixed")])
+                    store_gallery_samples(conn, gallery_url, 20, ["https://s.exhentai.org/t/page-0.jpg", sprite])
+
+                self.assertEqual(gallery_sample_entry(gallery_url, 0), "https://s.exhentai.org/t/page-0.jpg")
+                self.assertEqual(gallery_sample_entry(gallery_url, 1), sprite)
+
+    def test_render_sample_entry_crops_sprite_when_pillow_available(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        sheet = io.BytesIO()
+        Image.new("RGB", (300, 142), "red").save(sheet, format="PNG")
+        sheet_bytes = sheet.getvalue()
+        sprite = {"url": "https://s.exhentai.org/m/001/sheet.jpg", "x": 100, "y": 0, "w": 100, "h": 142}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with patch("exh_rec.app.cached_thumbnail", return_value=(sheet_bytes, "image/png")):
+                    data, content_type = render_sample_entry(sprite, "https://exhentai.org/g/900/a/")
+
+        self.assertEqual(content_type, "image/png")
+        cropped = Image.open(io.BytesIO(data))
+        self.assertEqual(cropped.size, (100, 142))
+
+    def test_render_sample_entry_falls_back_to_full_sheet_without_pillow(self):
+        sprite = {"url": "https://s.exhentai.org/m/001/sheet.jpg", "x": 100, "y": 0, "w": 100, "h": 142}
+        with patch("exh_rec.app.cached_thumbnail", return_value=(b"sheet-bytes", "image/jpeg")), patch(
+            "exh_rec.app.crop_sprite_bytes", side_effect=SpriteCropUnavailable("no pillow")
+        ):
+            data, content_type = render_sample_entry(sprite, "https://exhentai.org/g/900/a/")
+
+        self.assertEqual((data, content_type), (b"sheet-bytes", "image/jpeg"))
 
     def test_sample_count_for_uses_five_plus_one_per_hundred_pages(self):
         self.assertEqual(sample_count_for(None), 5)

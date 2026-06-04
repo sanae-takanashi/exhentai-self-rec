@@ -1,13 +1,23 @@
 import unittest
 from unittest.mock import patch
 
+from exh_rec import exhentai
 from exh_rec.exhentai import (
+    SampleThumb,
+    apply_gallery_metadata,
     check_access,
+    Gallery,
+    fetch_gallery_metadata,
     merge_gallery,
     normalize_cookie_header,
     parse_gallery_detail,
     parse_gallery_list,
     parse_gallery_pages,
+    parse_gallery_pages_rich,
+    parse_sprite_previews,
+    sample_entry_url,
+    sample_storage,
+    sample_thumb_host,
     sample_page_url,
     valid_cookie_header,
 )
@@ -361,6 +371,157 @@ class ParserTest(unittest.TestCase):
             normalize_cookie_header(exported),
             "ipb_member_id=123; ipb_pass_hash=abc123; sk=secret-session",
         )
+
+
+class GdataTest(unittest.TestCase):
+    def _payload(self, *gids):
+        return {
+            "gmetadata": [
+                {
+                    "gid": gid,
+                    "token": token,
+                    "title": title,
+                    "category": "Manga",
+                    "thumb": f"https://ehgt.org/aa/bb/{gid}.jpg",
+                    "uploader": "someone",
+                    "posted": "1700000000",
+                    "filecount": "42",
+                    "rating": "4.35",
+                    "tags": ["artist:foo_bar", "language:english"],
+                }
+                for gid, token, title in gids
+            ]
+        }
+
+    def test_fetch_gallery_metadata_parses_entries(self):
+        with patch.object(exhentai, "post_api_json", return_value=self._payload((123, "abc", "Title"))):
+            metadata = fetch_gallery_metadata("cookie", [("123", "abc")], sleep=lambda _: None)
+
+        url = "https://exhentai.org/g/123/abc/"
+        self.assertIn(url, metadata)
+        meta = metadata[url]
+        self.assertEqual(meta["thumb"], "https://ehgt.org/aa/bb/123.jpg")
+        self.assertEqual(meta["category"], "Manga")
+        self.assertEqual(meta["page_count"], 42)
+        self.assertAlmostEqual(meta["rating"], 4.35)
+        self.assertEqual(meta["tags"], ["artist:foo bar", "language:english"])
+
+    def test_fetch_gallery_metadata_batches_by_25_with_one_pause(self):
+        pairs = [(gid, "tok") for gid in range(30)]
+        batch_sizes: list[int] = []
+        sleeps: list[float] = []
+
+        def fake_post(cookie, payload, proxy_url=""):
+            batch_sizes.append(len(payload["gidlist"]))
+            return {"gmetadata": []}
+
+        with patch.object(exhentai, "post_api_json", side_effect=fake_post):
+            fetch_gallery_metadata("cookie", pairs, sleep=sleeps.append)
+
+        self.assertEqual(batch_sizes, [25, 5])
+        self.assertEqual(len(sleeps), 1)
+
+    def test_fetch_gallery_metadata_skips_error_entries_and_failed_batches(self):
+        responses = [
+            RuntimeError("boom"),
+            {"gmetadata": [{"gid": 9, "token": "z", "error": "expunged"}, {"gid": 8, "token": "y", "thumb": "https://ehgt.org/x/8.jpg", "title": "Eight"}]},
+        ]
+
+        def fake_post(cookie, payload, proxy_url=""):
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        pairs = [(gid, "tok") for gid in range(30)]
+        with patch.object(exhentai, "post_api_json", side_effect=fake_post):
+            metadata = fetch_gallery_metadata("cookie", pairs, sleep=lambda _: None)
+
+        # First batch raised; only the second batch's non-error entry survives.
+        self.assertEqual(list(metadata), ["https://exhentai.org/g/8/y/"])
+
+    def test_apply_gallery_metadata_prefers_ehgt_and_backfills(self):
+        gallery = Gallery(
+            url="https://exhentai.org/g/123/abc/",
+            gid="123",
+            token="abc",
+            title="Gallery 123",
+            thumb_url="https://s.exhentai.org/w/old.webp",
+        )
+        metadata = {
+            "https://exhentai.org/g/123/abc/": {
+                "thumb": "https://ehgt.org/aa/bb/123.jpg",
+                "title": "Real Title",
+                "category": "Doujinshi",
+                "uploader": "person",
+                "rating": 4.0,
+                "page_count": 12,
+                "posted": "1700000000",
+                "tags": ["parody:x"],
+            }
+        }
+
+        changed = apply_gallery_metadata([gallery], metadata)
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(gallery.thumb_url, "https://ehgt.org/aa/bb/123.jpg")
+        self.assertEqual(gallery.title, "Real Title")
+        self.assertEqual(gallery.category, "Doujinshi")
+        self.assertEqual(gallery.page_count, 12)
+        self.assertIn("parody:x", gallery.tags)
+
+
+class SpritePreviewTest(unittest.TestCase):
+    NORMAL_HTML = """
+    <div id="gdt">
+      <div class="gdtm" style="height:170px"><div style="margin:1px auto 0;width:100px;height:142px;background:transparent url(https://s.exhentai.org/m/001/sheet.jpg) 0 0 no-repeat"><a href="https://exhentai.org/s/aa/1-1"><img src="https://s.exhentai.org/img/blank.gif"></a></div></div>
+      <div class="gdtm" style="height:170px"><div style="margin:1px auto 0;width:100px;height:142px;background:transparent url(https://s.exhentai.org/m/001/sheet.jpg) -100px 0 no-repeat"><a href="https://exhentai.org/s/aa/1-2"><img src="https://s.exhentai.org/img/blank.gif"></a></div></div>
+    </div>
+    <div id="gdb"></div>
+    """
+
+    LARGE_HTML = """
+    <div id="gdt">
+      <div class="gdtl" style="height:300px"><a href="https://exhentai.org/s/aa/1-1"><img src="https://s.exhentai.org/m/001/page-1.jpg"></a></div>
+      <div class="gdtl" style="height:300px"><a href="https://exhentai.org/s/aa/1-2"><img src="https://s.exhentai.org/m/001/page-2.jpg"></a></div>
+    </div>
+    <div id="gdb"></div>
+    """
+
+    def test_parse_sprite_previews_extracts_offsets_and_size(self):
+        frames = parse_sprite_previews(self.NORMAL_HTML)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0], SampleThumb(url="https://s.exhentai.org/m/001/sheet.jpg", x=0, y=0, w=100, h=142))
+        self.assertEqual(frames[1], SampleThumb(url="https://s.exhentai.org/m/001/sheet.jpg", x=100, y=0, w=100, h=142))
+
+    def test_parse_gallery_pages_rich_returns_sprites_for_normal_mode(self):
+        _, entries = parse_gallery_pages_rich(self.NORMAL_HTML)
+        self.assertTrue(all(isinstance(entry, SampleThumb) for entry in entries))
+        self.assertEqual(len(entries), 2)
+
+    def test_parse_gallery_pages_returns_strings_for_large_mode(self):
+        _, entries = parse_gallery_pages_rich(self.LARGE_HTML)
+        self.assertTrue(all(isinstance(entry, str) for entry in entries))
+        # The legacy wrapper drops sprite frames but keeps individual previews.
+        _, legacy = parse_gallery_pages(self.LARGE_HTML)
+        self.assertEqual(entries, legacy)
+
+    def test_parse_gallery_pages_drops_sprites_for_backward_compatibility(self):
+        _, legacy = parse_gallery_pages(self.NORMAL_HTML)
+        self.assertEqual(legacy, [])
+
+    def test_sample_storage_and_entry_url_round_trip(self):
+        frame = SampleThumb(url="https://ehgt.org/x/sheet.jpg", x=100, y=0, w=100, h=142)
+        stored = sample_storage(frame)
+        self.assertEqual(stored, {"url": "https://ehgt.org/x/sheet.jpg", "x": 100, "y": 0, "w": 100, "h": 142})
+        self.assertEqual(sample_entry_url(stored), "https://ehgt.org/x/sheet.jpg")
+        self.assertEqual(sample_storage("https://ehgt.org/x/page.jpg"), "https://ehgt.org/x/page.jpg")
+        self.assertEqual(sample_entry_url("https://ehgt.org/x/page.jpg"), "https://ehgt.org/x/page.jpg")
+
+    def test_sample_thumb_host_accepts_ehgt(self):
+        self.assertTrue(sample_thumb_host("https://ehgt.org/aa/bb/x.jpg"))
+        self.assertTrue(sample_thumb_host("https://s.exhentai.org/m/x.jpg"))
+        self.assertFalse(sample_thumb_host("https://evil.test/x.jpg"))
 
 
 if __name__ == "__main__":

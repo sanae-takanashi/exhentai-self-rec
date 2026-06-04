@@ -92,7 +92,11 @@ function visualImageUrls(item) {
     urls.push(item.thumb_url);
   }
   for (const thumb of (item.samples || []).slice(0, visualMaxSampleImages)) {
-    urls.push(thumb);
+    // Sprite-frame samples are objects the DINOv2 server path cannot fetch
+    // directly; the cover plus any standalone sample URLs are enough for it.
+    if (typeof thumb === "string" && thumb) {
+      urls.push(thumb);
+    }
   }
   return urls;
 }

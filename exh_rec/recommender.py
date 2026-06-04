@@ -188,7 +188,7 @@ def store_gallery_samples(
     conn: sqlite3.Connection,
     url: str,
     page_count: int | None,
-    samples: list[str],
+    samples: list,
 ) -> None:
     samples_json = json.dumps(samples, ensure_ascii=True)
     conn.execute(
@@ -207,18 +207,22 @@ def store_gallery_samples(
 
 
 def clear_shared_thumbnail_metadata(conn: sqlite3.Connection) -> int:
-    """Clear likely CSS-sprite cover URLs shared by multiple galleries."""
+    """Clear likely CSS-sprite cover URLs shared by multiple galleries.
+
+    Only the brittle ``s.exhentai.org/w/`` sprite covers are cleared; stable
+    per-gallery ehgt.org covers (from the gdata API) are left alone. The visual
+    embedding is preserved so a transient bad cover does not throw away learned
+    vectors — the next Refresh Thumbs repopulates an ehgt cover.
+    """
     cursor = conn.execute(
         """
         UPDATE galleries
-        SET thumb_url = NULL,
-            visual_embedding_json = NULL,
-            visual_embedding_version = NULL,
-            visual_embedding_at = NULL
+        SET thumb_url = NULL
         WHERE thumb_url IN (
             SELECT thumb_url
             FROM galleries
             WHERE thumb_url LIKE 'https://s.exhentai.org/w/%'
+              AND thumb_url NOT LIKE 'https://ehgt.org/%'
             GROUP BY thumb_url
             HAVING COUNT(*) > 1
         )

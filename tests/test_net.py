@@ -1,11 +1,20 @@
 import os
+import socket
 import sys
 import types
 import unittest
+import urllib.error
 import urllib.request
 from unittest.mock import patch
 
-from exh_rec.net import apply_proxy_environment, environment_proxy_url, normalize_proxy_url, open_url, proxy_preview
+from exh_rec.net import (
+    apply_proxy_environment,
+    environment_proxy_url,
+    normalize_proxy_url,
+    open_url,
+    open_url_with_retry,
+    proxy_preview,
+)
 
 
 class NetTest(unittest.TestCase):
@@ -117,6 +126,80 @@ class NetTest(unittest.TestCase):
         self.assertEqual(calls, [("https://example.test/", 10)])
         self.assertEqual(build.call_count, 1)
         self.assertIn(("handler", {}), proxy_args)
+
+
+class RetryTest(unittest.TestCase):
+    def _http_error(self, code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("https://api.test/", code, "err", hdrs=None, fp=None)
+
+    def test_retries_on_5xx_then_succeeds(self):
+        sleeps: list[float] = []
+        attempts = {"count": 0}
+
+        def flaky(request, timeout, proxy_url=""):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise self._http_error(503)
+            return "response"
+
+        with patch("exh_rec.net.open_url", flaky):
+            result = open_url_with_retry(
+                urllib.request.Request("https://api.test/"), timeout=10, sleep=sleeps.append
+            )
+
+        self.assertEqual(result, "response")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_does_not_retry_on_404(self):
+        attempts = {"count": 0}
+
+        def not_found(request, timeout, proxy_url=""):
+            attempts["count"] += 1
+            raise self._http_error(404)
+
+        with patch("exh_rec.net.open_url", not_found):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                open_url_with_retry(
+                    urllib.request.Request("https://api.test/"), timeout=10, sleep=lambda _: None
+                )
+
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(attempts["count"], 1)
+
+    def test_retries_url_error_then_reraises_after_attempts(self):
+        attempts = {"count": 0}
+        sleeps: list[float] = []
+
+        def always_down(request, timeout, proxy_url=""):
+            attempts["count"] += 1
+            raise urllib.error.URLError("down")
+
+        with patch("exh_rec.net.open_url", always_down):
+            with self.assertRaises(urllib.error.URLError):
+                open_url_with_retry(
+                    urllib.request.Request("https://api.test/"), timeout=10, attempts=3, sleep=sleeps.append
+                )
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+
+    def test_retries_on_timeout(self):
+        attempts = {"count": 0}
+
+        def slow(request, timeout, proxy_url=""):
+            attempts["count"] += 1
+            if attempts["count"] < 2:
+                raise socket.timeout("timed out")
+            return "ok"
+
+        with patch("exh_rec.net.open_url", slow):
+            result = open_url_with_retry(
+                urllib.request.Request("https://api.test/"), timeout=10, sleep=lambda _: None
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 2)
 
 
 if __name__ == "__main__":
