@@ -119,6 +119,7 @@ def init_db() -> None:
             "learned_query_limit": "6",
             "recommend_candidate_limit": "2000",
             "recommend_language_filter": "japanese,chinese",
+            "recommend_model_mode": "hybrid",
             "sample_extra_pages": "2",
         }
         for key, value in defaults.items():

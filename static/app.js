@@ -10,6 +10,7 @@ const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const minutesEl = document.querySelector("#minutes");
 const networkProxyEl = document.querySelector("#networkProxy");
 const languageFilterEl = document.querySelector("#languageFilter");
+const modelModeEl = document.querySelector("#modelMode");
 const visualEncoderEl = document.querySelector("#visualEncoder");
 const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
@@ -284,6 +285,7 @@ async function loadSettings() {
   minutesEl.value = settings.refresh_interval_minutes;
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
+  modelModeEl.value = settings.recommend_model_mode || "hybrid";
   visualEncoderEl.value = settings.visual_encoder || visualDefaultEncoder;
   dinov2DeviceEl.value = settings.dinov2_device || "auto";
   autoRefreshEl.checked = settings.auto_refresh;
@@ -317,6 +319,7 @@ async function saveSettings() {
     refresh_interval_minutes: Number(minutesEl.value),
     network_proxy: networkProxyEl.value.trim(),
     recommend_language_filter: languageFilterEl.value.trim(),
+    recommend_model_mode: modelModeEl.value,
     visual_encoder: visualEncoderEl.value,
     dinov2_device: dinov2DeviceEl.value.trim(),
     auto_refresh: autoRefreshEl.checked,
@@ -404,11 +407,12 @@ async function loadRecommendations(offset = 0, append = false) {
   const freshnessWeight = currentView === "preview" ? "4" : "1";
   const bootstrapExploreCount = currentView === "review" ? "6" : "0";
   const languageFilter = languageFilterEl.value.trim();
+  const modelMode = modelModeEl.value || "hybrid";
   if (currentView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -877,6 +881,9 @@ function renderStatus(payload) {
   }
   if (payload.settings && payload.settings.recommend_language_filter) {
     rows.push(["Languages", payload.settings.recommend_language_filter]);
+  }
+  if (payload.settings && payload.settings.recommend_model_mode) {
+    rows.push(["Model", payload.settings.recommend_model_mode]);
   }
   if (payload.visual) {
     rows.push(["Visual", `${payload.visual.default_encoder || "simple"} (${payload.visual.default_version || "unknown"})`]);

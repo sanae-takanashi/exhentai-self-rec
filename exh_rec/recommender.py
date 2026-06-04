@@ -53,6 +53,9 @@ BOOTSTRAP_NAMESPACES = {
     "category",
     "uploader",
 }
+MODEL_MODE_HYBRID = "hybrid"
+MODEL_MODE_VISUAL = "visual"
+MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL}
 
 
 def parse_bootstrap_tags(raw: str) -> list[tuple[str, float]]:
@@ -727,6 +730,7 @@ def recommend(
     bootstrap_explore_count: int = 0,
     explore_seed: str | None = None,
     language_filter: list[str] | str | None = None,
+    model_mode: str = MODEL_MODE_HYBRID,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -739,6 +743,7 @@ def recommend(
         bootstrap_explore_count=bootstrap_explore_count,
         explore_seed=explore_seed,
         language_filter=language_filter,
+        model_mode=model_mode,
     )["items"]
 
 
@@ -753,6 +758,7 @@ def recommend_page(
     bootstrap_explore_count: int = 0,
     explore_seed: str | None = None,
     language_filter: list[str] | str | None = None,
+    model_mode: str = MODEL_MODE_HYBRID,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -762,6 +768,9 @@ def recommend_page(
     freshness_weight = max(0.0, min(10.0, float(freshness_weight)))
     bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
     language_filter_values = normalize_language_filter(language_filter)
+    model_mode = normalize_model_mode(model_mode)
+    if model_mode == MODEL_MODE_VISUAL:
+        bootstrap_explore_count = 0
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -792,7 +801,12 @@ def recommend_page(
         gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
         gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
         gallery["visual_ready"] = bool(gallery["visual_embedding"])
-        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
+        if model_mode == MODEL_MODE_VISUAL:
+            score, reasons = score_visual_gallery(gallery, visual_model)
+            if score is None:
+                continue
+        else:
+            score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = gallery.get("feedback_id") is not None
@@ -802,20 +816,22 @@ def recommend_page(
             continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
-        if gallery["user_vote"] < 0:
-            score -= 2.0
-            reasons.append("previous downvote")
-        elif gallery["user_vote"] > 0:
-            score += 0.5
-            reasons.append("previous upvote")
-        freshness = freshness_bonus(idx, candidate_limit) * freshness_weight
-        score += freshness
-        if freshness and reasons != ["recent"]:
-            freshness_reason = f"fresh {freshness:+.2f}"
-            if freshness_weight > 1.0:
-                reasons.insert(0, freshness_reason)
-            else:
-                reasons.append(freshness_reason)
+        if model_mode != MODEL_MODE_VISUAL:
+            if gallery["user_vote"] < 0:
+                score -= 2.0
+                reasons.append("previous downvote")
+            elif gallery["user_vote"] > 0:
+                score += 0.5
+                reasons.append("previous upvote")
+        if model_mode != MODEL_MODE_VISUAL:
+            freshness = freshness_bonus(idx, candidate_limit) * freshness_weight
+            score += freshness
+            if freshness and reasons != ["recent"]:
+                freshness_reason = f"fresh {freshness:+.2f}"
+                if freshness_weight > 1.0:
+                    reasons.insert(0, freshness_reason)
+                else:
+                    reasons.append(freshness_reason)
         gallery["score"] = round(score, 3)
         gallery["reasons"] = reasons[:5]
         scored.append(gallery)
@@ -842,7 +858,15 @@ def recommend_page(
         "candidate_limit": candidate_limit,
         "bootstrap_explore_count": bootstrap_explore_count,
         "language_filter": sorted(language_filter_values),
+        "model_mode": model_mode,
     }
+
+
+def normalize_model_mode(value: object) -> str:
+    mode = str(value or MODEL_MODE_HYBRID).strip().lower()
+    if mode in MODEL_MODES:
+        return mode
+    return MODEL_MODE_HYBRID
 
 
 def normalize_language_filter(value: list[str] | str | None) -> set[str]:
@@ -1099,6 +1123,13 @@ def score_gallery(
     if not reasons:
         reasons.append("recent")
     return score, reasons
+
+
+def score_visual_gallery(gallery: dict, visual_model: dict | None) -> tuple[float, list[str]] | tuple[None, list[str]]:
+    visual_score = score_visual_similarity(gallery, visual_model)
+    if visual_score == 0.0:
+        return None, []
+    return visual_score, [f"visual only {visual_score:+.2f}"]
 
 
 def score_visual_similarity(gallery: dict, visual_model: dict | None) -> float:

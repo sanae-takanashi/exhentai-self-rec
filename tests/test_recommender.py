@@ -16,6 +16,7 @@ from exh_rec.recommender import (
     import_preferences,
     learned_query_tags,
     model_snapshot,
+    normalize_model_mode,
     parse_bootstrap_tags,
     parse_bootstrap_weight,
     reaction_history_page,
@@ -409,6 +410,34 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual(items[0]["url"], similar_url)
         self.assertIn("visual", " ".join(items[0]["reasons"]))
+
+    def test_visual_only_mode_ignores_tag_bias(self):
+        liked_url = "https://exhentai.org/g/5vo/a/"
+        visual_url = "https://exhentai.org/g/5vo/b/"
+        tag_url = "https://exhentai.org/g/5vo/c/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=liked_url, gid="5vo", token="a", title="Liked Visual Only"),
+                Gallery(url=visual_url, gid="5vo", token="b", title="Visual Neighbor"),
+                Gallery(url=tag_url, gid="5vo", token="c", title="Tag Biased", tags=["artist:tagbias"]),
+            ],
+        )
+        store_visual_embedding(self.conn, liked_url, [1, 0, 0, 0] * 16, version=DINOV2_VISUAL_VERSION)
+        store_visual_embedding(self.conn, visual_url, [0.95, 0.05, 0, 0] * 16, version=DINOV2_VISUAL_VERSION)
+        store_visual_embedding(self.conn, tag_url, [0, 1, 0, 0] * 16, version=DINOV2_VISUAL_VERSION)
+        upsert_bootstrap_tags(self.conn, [("artist:tagbias", 5.0)])
+        record_feedback(self.conn, liked_url, vote=1)
+
+        hybrid_top = recommend_page(self.conn, limit=1, include_rated=False)["items"][0]
+        visual_top = recommend_page(self.conn, limit=1, include_rated=False, model_mode="visual")["items"][0]
+        visual_with_rated = recommend_page(self.conn, include_rated=True, model_mode="visual")["items"]
+
+        self.assertEqual(hybrid_top["url"], tag_url)
+        self.assertEqual(visual_top["url"], visual_url)
+        self.assertTrue(visual_top["reasons"][0].startswith("visual only"))
+        self.assertNotIn("previous upvote", " ".join(" ".join(item["reasons"]) for item in visual_with_rated))
+        self.assertEqual(normalize_model_mode("bad"), "hybrid")
 
     def test_visual_preference_model_uses_negative_feedback_direction(self):
         liked_url = "https://exhentai.org/g/5vp/a/"
