@@ -64,12 +64,23 @@ def proxy_preview(proxy_url: str) -> str:
 
 
 def apply_proxy_environment(proxy_url: str) -> None:
-    proxy_url = normalize_proxy_url(proxy_url)
+    proxy_url = environment_proxy_url(normalize_proxy_url(proxy_url))
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         if proxy_url:
             os.environ[key] = proxy_url
         else:
             os.environ.pop(key, None)
+
+
+def environment_proxy_url(proxy_url: str) -> str:
+    # Libraries that read these env vars (requests, and through it huggingface_hub
+    # for DINOv2 downloads) resolve DNS locally for a plain socks5:// proxy, which
+    # fails when the target host is only reachable through the proxy. socks5h://
+    # resolves the hostname on the proxy side, matching how this app's own SOCKS
+    # requests already behave.
+    if proxy_url.startswith("socks5://"):
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
 
 
 def open_url(request: urllib.request.Request, timeout: int, proxy_url: str = "") -> Any:

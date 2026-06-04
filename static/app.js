@@ -28,6 +28,7 @@ let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
+let renderedGalleryUrls = [];
 let visualDefaultEncoder = "simple";
 let visualEmbeddingVersion = "canvas-rgb-8x8-v1";
 let visualFallbackEncoder = "simple";
@@ -382,6 +383,29 @@ async function enrichTopRecommendations() {
   }
 }
 
+async function refreshThumbnails() {
+  const galleryUrls = [...renderedGalleryUrls];
+  if (!galleryUrls.length) {
+    setStatus("No galleries on the page to refresh", true);
+    return;
+  }
+  setStatus(`Refreshing thumbnails for ${galleryUrls.length} galleries`);
+  const payload = await api("/api/refresh-thumbs", {
+    method: "POST",
+    body: JSON.stringify({
+      gallery_urls: galleryUrls,
+      include_rated: includeRatedEl.checked,
+      filter_text: localFilterEl.value.trim(),
+    }),
+  });
+  applyRecommendationPage(payload);
+  if (payload.errors.length) {
+    setStatus(`Refreshed ${payload.updated} thumbnails; errors: ${payload.errors.join(" | ")}`, true);
+  } else {
+    setStatus(`Refreshed ${payload.updated} thumbnails`);
+  }
+}
+
 async function checkLogin() {
   setStatus("Checking ExHentai access");
   const payload = await api("/api/check", {
@@ -552,6 +576,14 @@ async function importPreferences(file) {
 }
 
 function renderRecommendations(items, append = false) {
+  if (!append) {
+    renderedGalleryUrls = [];
+  }
+  for (const item of items) {
+    if (item && item.url) {
+      renderedGalleryUrls.push(item.url);
+    }
+  }
   if (!append && !items.length) {
     recommendationsEl.innerHTML = `<div class="hint">No galleries yet. Save cookies and bootstrap tags, then fetch.</div>`;
     return;
@@ -769,6 +801,7 @@ function escapeAttr(value) {
 document.querySelector("#saveBtn").addEventListener("click", () => saveSettings().catch((error) => setStatus(error.message, true)));
 document.querySelector("#fetchBtn").addEventListener("click", () => fetchNew().catch((error) => setStatus(error.message, true)));
 document.querySelector("#enrichBtn").addEventListener("click", () => enrichTopRecommendations().catch((error) => setStatus(error.message, true)));
+document.querySelector("#refreshThumbsBtn").addEventListener("click", () => refreshThumbnails().catch((error) => setStatus(error.message, true)));
 document.querySelector("#checkBtn").addEventListener("click", () => checkLogin().catch((error) => setStatus(error.message, true)));
 document.querySelector("#clearCookieBtn").addEventListener("click", () => clearCookie().catch((error) => setStatus(error.message, true)));
 document.querySelector("#searchFetchBtn").addEventListener("click", () => fetchNew(queryEl.value).catch((error) => setStatus(error.message, true)));

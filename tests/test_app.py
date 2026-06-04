@@ -44,6 +44,7 @@ from exh_rec.app import (
     recommend_candidate_limit,
     recommendation_payload,
     refresh_summary,
+    refresh_thumbnails,
     reset_library_payload,
     sample_count_for,
     save_visual_embedding_payload,
@@ -814,6 +815,77 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
                 self.assertIsNotNone(row["detail_fetched_at"])
                 self.assertIn("artist:detailfav", learned)
+
+    def test_refresh_thumbnails_backfills_missing_cover(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/70/a/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="70", token="a", title="No Cover")])
+
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="70",
+                    token="a",
+                    title="No Cover",
+                    thumb_url="https://s.exhentai.org/t/aa/refreshed-cover.jpg",
+                )
+                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed) as fetch_detail:
+                    result = refresh_thumbnails([gallery_url])
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT thumb_url, detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["updated"], 1)
+                fetch_detail.assert_called_once()
+                self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
+                self.assertEqual(row["thumb_url"], "https://s.exhentai.org/t/aa/refreshed-cover.jpg")
+                # A thumbnail refresh must not mark the gallery as fully enriched.
+                self.assertIsNone(row["detail_fetched_at"])
+
+    def test_refresh_thumbnails_reports_per_gallery_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/71/a/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="71", token="a", title="Breaks")])
+
+                with patch("exh_rec.app.fetch_gallery_detail", side_effect=RuntimeError("boom")):
+                    result = refresh_thumbnails([gallery_url])
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["updated"], 0)
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIn("boom", result["errors"][0])
+
+    def test_refresh_thumbnails_requires_cookie(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    store_galleries(conn, [Gallery(url="https://exhentai.org/g/72/a/", gid="72", token="a", title="No Cookie")])
+
+                with patch("exh_rec.app.fetch_gallery_detail") as fetch_detail:
+                    with self.assertRaises(ApiError) as ctx:
+                        refresh_thumbnails(["https://exhentai.org/g/72/a/"])
+
+                self.assertEqual(ctx.exception.status, HTTPStatus.BAD_REQUEST)
+                fetch_detail.assert_not_called()
+                self.assertFalse(FETCH_LOCK.locked())
+
+    def test_refresh_thumbnails_rejects_empty_request(self):
+        with self.assertRaises(ApiError) as ctx:
+            refresh_thumbnails([])
+        self.assertEqual(ctx.exception.status, HTTPStatus.BAD_REQUEST)
+        self.assertFalse(FETCH_LOCK.locked())
 
     def test_sample_count_for_uses_five_plus_one_per_hundred_pages(self):
         self.assertEqual(sample_count_for(None), 5)

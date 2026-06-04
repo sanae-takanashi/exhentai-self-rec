@@ -101,13 +101,13 @@ def dinov2_dependency_status(device: str | None = None) -> dict:
             "cuda_device_name": _DINO_STATE.get("cuda_device_name"),
             "error": None,
         }
-    if _DINO_STATE.get("error") and _DINO_STATE.get("device_config") == requested_device:
+    if _DINO_STATE.get("deps_error") and _DINO_STATE.get("device_config") == requested_device:
         return {
             "available": False,
             "loaded": False,
             "model": DINOV2_MODEL_NAME,
             "device_config": requested_device,
-            "error": _DINO_STATE["error"],
+            "error": _DINO_STATE["deps_error"],
         }
     missing = [
         name
@@ -121,6 +121,10 @@ def dinov2_dependency_status(device: str | None = None) -> dict:
     ]
     device_status = torch_device_status(requested_device) if not missing and importlib.util.find_spec("torch") else {}
     device_error = device_status.get("error")
+    # A prior model download/initialization failure (typically a network issue) is
+    # kept only for reporting; it must not flip "available" off or it would prevent
+    # the next attempt from retrying once the proxy or network is fixed.
+    load_error = _DINO_STATE.get("load_error") if _DINO_STATE.get("device_config") == requested_device else None
     return {
         "available": not missing and not device_error,
         "loaded": False,
@@ -131,7 +135,7 @@ def dinov2_dependency_status(device: str | None = None) -> dict:
         "cuda_device_count": device_status.get("cuda_device_count", 0),
         "cuda_device_name": device_status.get("cuda_device_name"),
         "missing": missing,
-        "error": f"Missing optional dependencies: {', '.join(missing)}" if missing else device_error,
+        "error": f"Missing optional dependencies: {', '.join(missing)}" if missing else (device_error or load_error),
     }
 
 
@@ -186,20 +190,24 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
     requested_device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
     if _DINO_STATE.get("loaded") and _DINO_STATE.get("device_config") == requested_device:
         return _DINO_STATE["processor"], _DINO_STATE["model"], _DINO_STATE["torch"], _DINO_STATE["Image"]
-    if _DINO_STATE.get("error") and _DINO_STATE.get("device_config") == requested_device:
-        raise VisualEncoderUnavailable(_DINO_STATE["error"])
+    if _DINO_STATE.get("deps_error") and _DINO_STATE.get("device_config") == requested_device:
+        raise VisualEncoderUnavailable(_DINO_STATE["deps_error"])
     with _DINO_LOCK:
         if _DINO_STATE.get("loaded") and _DINO_STATE.get("device_config") == requested_device:
             return _DINO_STATE["processor"], _DINO_STATE["model"], _DINO_STATE["torch"], _DINO_STATE["Image"]
+        if _DINO_STATE.get("deps_error") and _DINO_STATE.get("device_config") == requested_device:
+            raise VisualEncoderUnavailable(_DINO_STATE["deps_error"])
         try:
             import torch
             from PIL import Image
             from transformers import AutoImageProcessor, AutoModel
         except Exception as exc:
+            # Missing optional dependencies cannot be fixed without reinstalling, so
+            # this is cached as a hard failure that blocks future load attempts.
             _DINO_STATE.clear()
             _DINO_STATE["device_config"] = requested_device
-            _DINO_STATE["error"] = f"DINOv2 dependencies are unavailable: {exc}"
-            raise VisualEncoderUnavailable(_DINO_STATE["error"]) from exc
+            _DINO_STATE["deps_error"] = f"DINOv2 dependencies are unavailable: {exc}"
+            raise VisualEncoderUnavailable(_DINO_STATE["deps_error"]) from exc
 
         try:
             processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME)
@@ -208,10 +216,13 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
             model.to(resolved_device)
             model.eval()
         except Exception as exc:
+            # Downloading/initializing the model can fail transiently (for example a
+            # blocked network). Record it for status reporting but leave the state
+            # retryable so a later call can succeed once the proxy/network is fixed.
             _DINO_STATE.clear()
             _DINO_STATE["device_config"] = requested_device
-            _DINO_STATE["error"] = f"DINOv2 model is unavailable: {exc}"
-            raise VisualEncoderUnavailable(_DINO_STATE["error"]) from exc
+            _DINO_STATE["load_error"] = f"DINOv2 model is unavailable: {exc}"
+            raise VisualEncoderUnavailable(_DINO_STATE["load_error"]) from exc
 
         cuda_available = bool(torch.cuda.is_available())
         cuda_device_count = int(torch.cuda.device_count()) if hasattr(torch.cuda, "device_count") else 0
@@ -221,6 +232,7 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
                 cuda_device_name = torch.cuda.get_device_name(0)
             except Exception:
                 cuda_device_name = None
+        _DINO_STATE.pop("load_error", None)
         _DINO_STATE.update(
             {
                 "loaded": True,

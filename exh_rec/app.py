@@ -23,6 +23,7 @@ from .exhentai import (
     fetch_gallery_detail,
     fetch_gallery_sample_pages,
     normalize_cookie_header,
+    usable_thumb,
     valid_cookie_header,
 )
 from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url, proxy_preview
@@ -178,6 +179,14 @@ class Handler(BaseHTTPRequestHandler):
                     include_rated=parse_bool(payload.get("include_rated")),
                     filter_text=payload.get("filter_text"),
                     limit=payload.get("limit"),
+                )
+                self.send_json(result)
+            elif path == "/api/refresh-thumbs":
+                payload = self.read_json()
+                result = refresh_thumbnails(
+                    payload.get("gallery_urls"),
+                    include_rated=parse_bool(payload.get("include_rated")),
+                    filter_text=payload.get("filter_text"),
                 )
                 self.send_json(result)
             elif path == "/api/feedback":
@@ -892,6 +901,69 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         else:
             last = None
         FETCH_STATE.update({"running": False, "last_fetch": last})
+        FETCH_LOCK.release()
+
+
+REFRESH_THUMBS_MAX = 60
+
+
+def refresh_thumbnails(
+    gallery_urls: Any,
+    include_rated: bool = False,
+    filter_text: str | None = None,
+) -> dict:
+    """Re-fetch cover thumbnails for the given galleries (the current page) and backfill any that are missing."""
+    if not isinstance(gallery_urls, list):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_urls must be a list")
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in gallery_urls:
+        url = str(raw or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    urls = urls[:REFRESH_THUMBS_MAX]
+    if not urls:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "no galleries to refresh")
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
+    try:
+        with db.connect() as conn:
+            cookie = db.get_setting(conn, "cookie_header", "")
+            proxy_url = network_proxy(conn)
+        if not cookie:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+
+        updated = 0
+        errors: list[str] = []
+        for url in urls:
+            with db.connect() as conn:
+                row = conn.execute("SELECT * FROM galleries WHERE url = ?", (url,)).fetchone()
+            if not row:
+                continue
+            gallery = gallery_from_item(db.row_to_dict(row))
+            try:
+                detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+                continue
+            thumb = usable_thumb(detailed.thumb_url)
+            if not thumb:
+                continue
+            with db.connect() as conn:
+                conn.execute("UPDATE galleries SET thumb_url = ? WHERE url = ?", (thumb, url))
+            updated += 1
+
+        with db.connect() as conn:
+            clear_shared_thumbnail_metadata(conn)
+            page = recommendation_payload(
+                conn,
+                limit=40,
+                include_rated=include_rated,
+                filter_text=filter_text,
+            )
+        return {"ok": not errors, "updated": updated, "errors": errors, **page}
+    finally:
         FETCH_LOCK.release()
 
 

@@ -20,7 +20,8 @@ TAG_ATTR_RE = re.compile(
     r"\b(?:title|id)=[\"'](?:ta_)?((?:artist|character|cosplayer|female|group|language|male|mixed|other|parody|reclass):[^\"']+)[\"']",
     re.I,
 )
-IMG_RE = re.compile(r"<img\b[^>]*(?:data-src|src)=[\"']([^\"']+)[\"']", re.I)
+IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
+IMG_ATTR_RE = re.compile(r"\b(data-src|src)=[\"']([^\"']+)[\"']", re.I)
 CSS_URL_RE = re.compile(r"url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)", re.I)
 CAT_RE = re.compile(r"class=[\"'][^\"']*\bcn\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
 UPLOADER_RE = re.compile(r"class=[\"'][^\"']*\bglhide\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
@@ -317,7 +318,7 @@ def parse_gallery_pages(page_html: str) -> tuple[int | None, list[str]]:
         url = normalize_sample_thumb(match.group(0))
         if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
             thumbs.append(url)
-    for candidate in IMG_RE.findall(block):
+    for candidate in img_src_candidates(block):
         url = normalize_sample_thumb(candidate)
         if usable_thumb(url) and sample_thumb_host(url) and url not in thumbs:
             thumbs.append(url)
@@ -516,8 +517,20 @@ def usable_thumb(url: str | None) -> str | None:
     return url
 
 
+def img_src_candidates(block: str) -> list[str]:
+    """Yield image URLs from ``<img>`` tags, preferring ``data-src`` (the real lazy-load target) over the ``src`` placeholder within each tag."""
+    candidates: list[str] = []
+    for tag in IMG_TAG_RE.findall(block):
+        attrs = {name.lower(): value for name, value in IMG_ATTR_RE.findall(tag)}
+        for key in ("data-src", "src"):
+            value = attrs.get(key)
+            if value:
+                candidates.append(value)
+    return candidates
+
+
 def extract_thumb(block: str) -> str | None:
-    for img in IMG_RE.findall(block):
+    for img in img_src_candidates(block):
         url = usable_thumb(html.unescape(img))
         if url:
             return url

@@ -153,6 +153,8 @@ Use the local filter field to narrow recommendations already stored in SQLite by
 
 Use `Enrich` to open detail pages for the best currently recommended galleries that still have only list metadata. This uses the same `Details` limit and saved cookie, but does not fetch new result pages.
 
+Use `Refresh Thumbs` to re-fetch the cover thumbnail for the galleries currently shown on the page (`POST /api/refresh-thumbs` with their `gallery_urls`, capped at 60 per request). This is handy for galleries that were stored before a parser fix and show `No thumbnail`: it opens each gallery's detail page, reads the cover (falling back to the first page image), and updates only `thumb_url` without marking the gallery as fully enriched or retraining the model. It shares the fetch lock, so it is refused while a fetch or enrichment is running.
+
 Fetch and Enrich retrain the learned model after successfully saving new detail pages, so any existing feedback on those galleries starts using the fuller metadata right away.
 
 Detail enrichment preserves the gallery's original listing freshness, so opening metadata for an older gallery does not make it look newly fetched in the recent queue.
@@ -215,7 +217,7 @@ python3 -m pip install PySocks
 
 The Windows venv helper installs PySocks through `requirements.txt`.
 
-When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route.
+When a proxy is configured, the app also sets `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` for the server process before DINOv2 model loading, which helps Hugging Face downloads use the same route. A `socks5://` proxy is exported to those variables as `socks5h://` so the download resolves DNS through the proxy (matching the app's own SOCKS requests), which matters when `huggingface.co` is only reachable via the proxy. If a DINOv2 download fails because of a network problem, it is reported as the visual encoder error but not cached permanently: once the proxy or network is fixed, the next enrichment retries the load automatically without restarting the server.
 
 Override the bind address or port with:
 

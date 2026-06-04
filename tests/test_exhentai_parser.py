@@ -108,6 +108,23 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(len(galleries), 1)
         self.assertIsNone(galleries[0].thumb_url)
 
+    def test_parse_gallery_list_prefers_data_src_over_blank_placeholder(self):
+        # Lazy-loaded list thumbnails carry the real cover in data-src while src holds
+        # a blank.gif placeholder; the real URL must win regardless of attribute order.
+        html = """
+        <tr class="gtr0">
+          <td><div class="glthumb"><a href="https://exhentai.org/g/55557/abc557/">
+            <img data-src="https://s.exhentai.org/t/aa/lazy-cover.jpg" src="https://exhentai.org/img/blank.gif">
+          </a></div></td>
+          <td><a class="glink" href="https://exhentai.org/g/55557/abc557/">Lazy Thumb Title</a></td>
+        </tr>
+        """
+
+        galleries = parse_gallery_list(html)
+
+        self.assertEqual(len(galleries), 1)
+        self.assertEqual(galleries[0].thumb_url, "https://s.exhentai.org/t/aa/lazy-cover.jpg")
+
     def test_parse_gallery_detail(self):
         html = """
         <html>
