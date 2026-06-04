@@ -726,6 +726,7 @@ def recommend(
     freshness_weight: float = 1.0,
     bootstrap_explore_count: int = 0,
     explore_seed: str | None = None,
+    language_filter: list[str] | str | None = None,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -737,6 +738,7 @@ def recommend(
         freshness_weight=freshness_weight,
         bootstrap_explore_count=bootstrap_explore_count,
         explore_seed=explore_seed,
+        language_filter=language_filter,
     )["items"]
 
 
@@ -750,6 +752,7 @@ def recommend_page(
     freshness_weight: float = 1.0,
     bootstrap_explore_count: int = 0,
     explore_seed: str | None = None,
+    language_filter: list[str] | str | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -758,6 +761,7 @@ def recommend_page(
     candidate_limit = max(limit + offset, candidate_limit)
     freshness_weight = max(0.0, min(10.0, float(freshness_weight)))
     bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
+    language_filter_values = normalize_language_filter(language_filter)
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -793,6 +797,8 @@ def recommend_page(
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = gallery.get("feedback_id") is not None
         if gallery["rated"] and not include_rated:
+            continue
+        if not gallery_matches_language_filter(gallery, language_filter_values):
             continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
@@ -835,7 +841,37 @@ def recommend_page(
         "has_more": next_offset < len(scored),
         "candidate_limit": candidate_limit,
         "bootstrap_explore_count": bootstrap_explore_count,
+        "language_filter": sorted(language_filter_values),
     }
+
+
+def normalize_language_filter(value: list[str] | str | None) -> set[str]:
+    if value is None:
+        return set()
+    parts = value if isinstance(value, list) else re.split(r"[\n,]+", str(value))
+    languages = set()
+    for part in parts:
+        language = str(part or "").strip().lower()
+        if not language:
+            continue
+        if language.startswith("language:"):
+            language = language.split(":", 1)[1].strip()
+        if language:
+            languages.add(language)
+    return languages
+
+
+def gallery_matches_language_filter(gallery: dict, languages: set[str]) -> bool:
+    if not languages:
+        return True
+    gallery_languages = {
+        str(tag).split(":", 1)[1].strip().lower()
+        for tag in gallery.get("tags") or []
+        if str(tag).strip().lower().startswith("language:")
+    }
+    if not gallery_languages:
+        return True
+    return bool(gallery_languages & languages)
 
 
 def mix_bootstrap_exploration(

@@ -638,6 +638,25 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn(unrated_url, default_urls)
         self.assertIn(rated_url, all_urls)
 
+    def test_recommend_filters_explicit_language_tags(self):
+        japanese_url = "https://exhentai.org/g/8j/b/"
+        english_url = "https://exhentai.org/g/8e/b/"
+        unknown_url = "https://exhentai.org/g/8u/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=japanese_url, gid="8j", token="b", title="Japanese Item", tags=["language:japanese"]),
+                Gallery(url=english_url, gid="8e", token="b", title="English Item", tags=["language:english"]),
+                Gallery(url=unknown_url, gid="8u", token="b", title="Unknown Language"),
+            ],
+        )
+
+        urls = [item["url"] for item in recommend_page(self.conn, language_filter="japanese,chinese")["items"]]
+
+        self.assertIn(japanese_url, urls)
+        self.assertIn(unknown_url, urls)
+        self.assertNotIn(english_url, urls)
+
     def test_neutral_score_counts_as_rated_without_learning_weight(self):
         neutral_url = "https://exhentai.org/g/9/c/"
         store_galleries(

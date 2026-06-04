@@ -39,6 +39,7 @@ from .recommender import (
     import_preferences,
     learned_query_tags,
     model_snapshot,
+    normalize_language_filter,
     parse_bootstrap_tags,
     reaction_history_page,
     recommend_page,
@@ -138,6 +139,7 @@ class Handler(BaseHTTPRequestHandler):
                 freshness_weight = query_float(query, "freshness_weight", default=1.0, lower=0.0, upper=10.0)
                 bootstrap_explore_count = query_int(query, "bootstrap_explore_count", default=0, lower=0, upper=20)
                 explore_seed = str(query.get("explore_seed", [""])[0])[:80]
+                language_filter = query.get("language_filter", [None])[0]
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(
@@ -150,6 +152,7 @@ class Handler(BaseHTTPRequestHandler):
                             freshness_weight=freshness_weight,
                             bootstrap_explore_count=bootstrap_explore_count,
                             explore_seed=explore_seed,
+                            language_filter=language_filter,
                         )
                     )
             elif path == "/api/reactions":
@@ -360,6 +363,7 @@ def get_settings() -> dict:
             "detail_fetch_limit": detail_fetch_limit(conn),
             "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
+            "recommend_language_filter": configured_language_filter(conn),
             "sample_extra_pages": sample_extra_pages(conn),
             "network_proxy": proxy_url,
             "network_proxy_preview": proxy_preview(proxy_url),
@@ -389,6 +393,7 @@ def get_status() -> dict:
                 "detail_fetch_limit": detail_fetch_limit(conn),
                 "learned_query_limit": learned_query_limit(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
+                "recommend_language_filter": configured_language_filter(conn),
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "network_proxy": proxy_url,
                 "network_proxy_preview": proxy_preview(proxy_url),
@@ -438,6 +443,9 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "recommend_candidate_limit" in payload:
             limit = bounded_int(payload["recommend_candidate_limit"], default=2000, lower=100, upper=10000)
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
+        if "recommend_language_filter" in payload:
+            languages = normalize_language_filter(str(payload["recommend_language_filter"]))
+            db.set_setting(conn, "recommend_language_filter", ",".join(sorted(languages)))
         if "sample_extra_pages" in payload:
             extra = bounded_int(payload["sample_extra_pages"], default=2, lower=0, upper=10)
             db.set_setting(conn, "sample_extra_pages", str(extra))
@@ -1395,6 +1403,11 @@ def recommend_candidate_limit(conn) -> int:
     return bounded_int(db.get_setting(conn, "recommend_candidate_limit", "2000"), default=2000, lower=100, upper=10000)
 
 
+def configured_language_filter(conn) -> str:
+    languages = normalize_language_filter(db.get_setting(conn, "recommend_language_filter", "japanese,chinese"))
+    return ",".join(sorted(languages))
+
+
 def sample_extra_pages(conn) -> int:
     return bounded_int(db.get_setting(conn, "sample_extra_pages", "2"), default=2, lower=0, upper=10)
 
@@ -1408,7 +1421,10 @@ def recommendation_payload(
     freshness_weight: float = 1.0,
     bootstrap_explore_count: int = 0,
     explore_seed: str | None = None,
+    language_filter: str | None = None,
 ) -> dict:
+    if language_filter is None:
+        language_filter = configured_language_filter(conn)
     page = recommend_page(
         conn,
         limit=limit,
@@ -1419,6 +1435,7 @@ def recommendation_payload(
         freshness_weight=freshness_weight,
         bootstrap_explore_count=bootstrap_explore_count,
         explore_seed=explore_seed,
+        language_filter=language_filter,
     )
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}
