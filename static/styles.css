@@ -66,10 +66,25 @@ h2 {
 }
 
 .actions,
-.toolbar,
-.row {
+.toolbar {
   display: flex;
   gap: 10px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.row label {
+  min-width: 0;
+}
+
+.row input[type="number"] {
+  min-height: 44px;
+  font-size: 15px;
+  padding: 11px 12px;
 }
 
 .actions.stacked {
