@@ -44,6 +44,7 @@ from exh_rec.app import (
     network_proxy,
     parse_bool,
     parse_feedback_request,
+    query_float,
     query_int,
     reaction_history_payload,
     recommend_candidate_limit,
@@ -199,6 +200,12 @@ class AppTest(unittest.TestCase):
         self.assertEqual(query_int({"limit": ["500"]}, "limit", default=40, lower=1, upper=100), 100)
         self.assertEqual(query_int({"offset": ["-5"]}, "offset", default=0, lower=0, upper=10000), 0)
         self.assertEqual(query_int({}, "limit", default=40, lower=1, upper=100), 40)
+
+    def test_query_float_defaults_invalid_values_and_clamps_bounds(self):
+        self.assertEqual(query_float({"freshness_weight": ["bad"]}, "freshness_weight", default=1.0, lower=0.0, upper=10.0), 1.0)
+        self.assertEqual(query_float({"freshness_weight": ["50"]}, "freshness_weight", default=1.0, lower=0.0, upper=10.0), 10.0)
+        self.assertEqual(query_float({"freshness_weight": ["-5"]}, "freshness_weight", default=1.0, lower=0.0, upper=10.0), 0.0)
+        self.assertEqual(query_float({}, "freshness_weight", default=1.0, lower=0.0, upper=10.0), 1.0)
 
     def test_server_display_url_uses_loopback_for_wildcard_bind(self):
         self.assertEqual(server_display_url("0.0.0.0", 8787), "http://127.0.0.1:8787")

@@ -135,6 +135,7 @@ class Handler(BaseHTTPRequestHandler):
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
                 offset = query_int(query, "offset", default=0, lower=0, upper=10000)
                 include_rated = parse_bool(query.get("include_rated", ["0"])[0])
+                freshness_weight = query_float(query, "freshness_weight", default=1.0, lower=0.0, upper=10.0)
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(
@@ -144,6 +145,7 @@ class Handler(BaseHTTPRequestHandler):
                             include_rated=include_rated,
                             offset=offset,
                             filter_text=filter_text,
+                            freshness_weight=freshness_weight,
                         )
                     )
             elif path == "/api/reactions":
@@ -1322,6 +1324,10 @@ def query_int(query: dict[str, list[str]], key: str, default: int, lower: int, u
     return bounded_int((query.get(key) or [default])[0], default=default, lower=lower, upper=upper)
 
 
+def query_float(query: dict[str, list[str]], key: str, default: float, lower: float, upper: float) -> float:
+    return bounded_float((query.get(key) or [default])[0], default=default, lower=lower, upper=upper)
+
+
 def parse_feedback_request(payload: dict[str, Any]) -> tuple[int | None, int | None]:
     score = payload.get("score")
     vote = payload.get("vote")
@@ -1357,6 +1363,14 @@ def bounded_int(value: Any, default: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, parsed))
 
 
+def bounded_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(lower, min(upper, parsed))
+
+
 def fetch_pages(conn) -> int:
     return bounded_int(db.get_setting(conn, "fetch_pages", "1"), default=1, lower=1, upper=5)
 
@@ -1387,6 +1401,7 @@ def recommendation_payload(
     include_rated: bool = False,
     offset: int = 0,
     filter_text: str | None = None,
+    freshness_weight: float = 1.0,
 ) -> dict:
     page = recommend_page(
         conn,
@@ -1395,6 +1410,7 @@ def recommendation_payload(
         offset=offset,
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
+        freshness_weight=freshness_weight,
     )
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}

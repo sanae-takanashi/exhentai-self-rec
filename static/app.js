@@ -353,7 +353,7 @@ function viewCopy(view) {
   if (view === "preview") {
     return {
       title: "Model Preview",
-      subtitle: "Read-only full model ranking, including galleries with reactions.",
+      subtitle: "Read-only full model ranking with stronger freshness, including galleries with reactions.",
       empty: "No model recommendations yet.",
       loaded: "preview recommendations loaded",
     };
@@ -397,8 +397,9 @@ async function loadReactionHistory(offset = 0, append = false) {
 async function loadRecommendations(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const includeRated = currentView === "preview" ? "1" : "0";
+  const freshnessWeight = currentView === "preview" ? "4" : "1";
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);

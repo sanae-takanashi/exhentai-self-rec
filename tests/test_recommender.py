@@ -472,6 +472,33 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn("bootstrap artist:fresh +1", item["reasons"])
         self.assertIn("fresh +0.25", item["reasons"])
 
+    def test_freshness_weight_can_surface_newer_recommendations(self):
+        galleries = [
+            Gallery(
+                url=f"https://exhentai.org/g/fresh-{idx}/e/",
+                gid=f"fresh-{idx}",
+                token="e",
+                title="Old Strong Match" if idx == 99 else f"Fresh Candidate {idx}",
+                tags=["artist:oldmatch"] if idx == 99 else ["artist:newmatch"] if idx == 0 else [],
+            )
+            for idx in range(100)
+        ]
+        store_galleries(self.conn, galleries)
+        for idx, gallery in enumerate(galleries):
+            age = 99 - idx
+            self.conn.execute(
+                "UPDATE galleries SET last_seen_at = ? WHERE url = ?",
+                (f"2026-06-04 12:{age // 60:02d}:{age % 60:02d}", gallery.url),
+            )
+        upsert_bootstrap_tags(self.conn, [("artist:oldmatch", 0.4), ("artist:newmatch", 0.01)])
+
+        default_top = recommend_page(self.conn, limit=1, candidate_limit=100)["items"][0]
+        fresh_top = recommend_page(self.conn, limit=1, candidate_limit=100, freshness_weight=4.0)["items"][0]
+
+        self.assertEqual(default_top["url"], galleries[99].url)
+        self.assertEqual(fresh_top["url"], galleries[0].url)
+        self.assertIn("fresh +1.00", fresh_top["reasons"])
+
     def test_latest_feedback_retrain_replaces_old_signal(self):
         gallery_url = "https://exhentai.org/g/6/f/"
         store_galleries(

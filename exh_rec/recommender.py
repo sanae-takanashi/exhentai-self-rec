@@ -722,6 +722,7 @@ def recommend(
     offset: int = 0,
     filter_text: str | None = None,
     candidate_limit: int = 2000,
+    freshness_weight: float = 1.0,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -730,6 +731,7 @@ def recommend(
         offset=offset,
         filter_text=filter_text,
         candidate_limit=candidate_limit,
+        freshness_weight=freshness_weight,
     )["items"]
 
 
@@ -740,12 +742,14 @@ def recommend_page(
     offset: int = 0,
     filter_text: str | None = None,
     candidate_limit: int = 2000,
+    freshness_weight: float = 1.0,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
     candidate_limit = max(limit + offset, candidate_limit)
+    freshness_weight = max(0.0, min(10.0, float(freshness_weight)))
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -790,7 +794,7 @@ def recommend_page(
         elif gallery["user_vote"] > 0:
             score += 0.5
             reasons.append("previous upvote")
-        freshness = freshness_bonus(idx, candidate_limit)
+        freshness = freshness_bonus(idx, candidate_limit) * freshness_weight
         score += freshness
         if freshness and reasons != ["recent"]:
             reasons.append(f"fresh {freshness:+.2f}")
