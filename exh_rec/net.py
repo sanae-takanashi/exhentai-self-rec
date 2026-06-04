@@ -103,7 +103,8 @@ def open_url_with_socks_proxy(
     rdns = parsed_proxy.scheme == "socks5h" or parsed_proxy.scheme == "socks5"
 
     with _SOCKS_LOCK, patched_socks_create_connection(socks, proxy_host, proxy_port, username, password, rdns):
-        return urllib.request.urlopen(request, timeout=timeout)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(request, timeout=timeout)
 
 
 @contextmanager
