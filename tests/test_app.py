@@ -22,6 +22,7 @@ from exh_rec.app import (
     check_saved_access,
     collect_gallery_samples,
     configured_dinov2_device,
+    configured_visual_encoder,
     enrich_feedback_gallery,
     enrich_recommendations,
     ensure_gallery_exists,
@@ -439,6 +440,30 @@ class AppTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["fallback_required"])
         self.assertEqual(result["fallback_encoder"], "simple")
+        cached.assert_not_called()
+
+    def test_save_visual_embedding_payload_skips_dinov2_when_encoder_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                with db.connect() as conn:
+                    db.set_setting(conn, "visual_encoder", "simple")
+
+                with patch("exh_rec.app.dinov2_dependency_status") as status, patch("exh_rec.app.cached_thumbnail") as cached:
+                    result = save_visual_embedding_payload(
+                        {
+                            "gallery_url": "https://exhentai.org/g/42s/a/",
+                            "encoder": "dinov2",
+                            "image_urls": ["https://s.exhentai.org/t/1.webp"],
+                        }
+                    )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["fallback_required"])
+        self.assertEqual(result["fallback_encoder"], "simple")
+        self.assertIn("disabled", result["reason"])
+        status.assert_not_called()
         cached.assert_not_called()
 
     def test_save_visual_embedding_payload_rejects_bad_embedding(self):
@@ -1114,13 +1139,16 @@ class AppTest(unittest.TestCase):
             with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
                 db.init_db()
 
-                save_settings({"network_proxy": "127.0.0.1:7890", "dinov2_device": "CUDA:0"})
+                save_settings({"network_proxy": "127.0.0.1:7890", "visual_encoder": "simple", "dinov2_device": "CUDA:0"})
 
                 with db.connect() as conn:
                     self.assertEqual(network_proxy(conn), "http://127.0.0.1:7890")
+                    self.assertEqual(configured_visual_encoder(conn), "simple")
                     self.assertEqual(configured_dinov2_device(conn), "cuda:0")
                 settings = get_settings()
                 self.assertEqual(settings["network_proxy_preview"], "http://127.0.0.1:7890")
+                self.assertEqual(settings["visual_encoder"], "simple")
+                self.assertEqual(settings["visual"]["default_encoder"], "simple")
                 self.assertEqual(settings["dinov2_device"], "cuda:0")
 
     def test_save_settings_rejects_invalid_proxy_and_dinov2_device(self):
@@ -1131,11 +1159,15 @@ class AppTest(unittest.TestCase):
 
                 with self.assertRaises(ApiError) as proxy_ctx:
                     save_settings({"network_proxy": "ftp://127.0.0.1:21"})
+                with self.assertRaises(ApiError) as encoder_ctx:
+                    save_settings({"visual_encoder": "vae"})
                 with self.assertRaises(ApiError) as device_ctx:
                     save_settings({"dinov2_device": "gpu"})
 
                 self.assertEqual(proxy_ctx.exception.status.value, 400)
                 self.assertIn("Proxy must use", proxy_ctx.exception.message)
+                self.assertEqual(encoder_ctx.exception.status.value, 400)
+                self.assertIn("Visual encoder", encoder_ctx.exception.message)
                 self.assertEqual(device_ctx.exception.status.value, 400)
                 self.assertIn("DINOv2 device", device_ctx.exception.message)
 

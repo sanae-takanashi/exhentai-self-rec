@@ -64,14 +64,20 @@ For DINOv2 on CPU:
 
 ```powershell
 .\scripts\setup-venv.ps1 -Visual cpu
-.\scripts\run.ps1 -DinoDevice cpu
+.\scripts\run.ps1 -VisualEncoder dinov2 -DinoDevice cpu
 ```
 
 For DINOv2 with CUDA, install a CUDA-enabled PyTorch build. If your PyTorch/CUDA wheel index is known, pass it explicitly:
 
 ```powershell
 .\scripts\setup-venv.ps1 -Visual cuda -TorchIndexUrl "https://download.pytorch.org/whl/cu121"
-.\scripts\run.ps1 -DinoDevice cuda
+.\scripts\run.ps1 -VisualEncoder dinov2 -DinoDevice cuda
+```
+
+On a slow VPS, keep DINOv2 disabled and use browser/simple embeddings:
+
+```powershell
+.\scripts\run.ps1 -VisualEncoder simple
 ```
 
 If your PowerShell policy blocks local scripts, run:
@@ -157,7 +163,7 @@ Use `Retrain` to rebuild learned weights from stored feedback. This is also done
 
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
 
-Visual embeddings prefer server-side DINOv2 (`facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`). Install the optional stack with your preferred PyTorch build plus `transformers`, `torchvision`, and `Pillow`; if DINOv2 cannot load, the browser automatically decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
+Visual embeddings can use either browser-side simple vectors or server-side DINOv2. Use `Visual encoder` in the settings panel, or `EXH_REC_VISUAL_ENCODER=simple`, on slow CPU-only machines. Use `dinov2` on a laptop/workstation with enough CPU/GPU. DINOv2 uses `facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`. Install the optional stack with your preferred PyTorch build plus `transformers`, `torchvision`, and `Pillow`; if DINOv2 is disabled or cannot load, the browser decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons.
 
 Set `DINOv2 device` in the settings panel, or use `EXH_REC_DINOV2_DEVICE`, to control where PyTorch runs:
 
@@ -168,6 +174,12 @@ EXH_REC_DINOV2_DEVICE=cuda:0 python3 -m exh_rec.app
 ```
 
 `auto` is the default and uses CUDA when `torch.cuda.is_available()` is true, then falls back to CPU. Use a CUDA-enabled PyTorch install on your laptop if you want GPU acceleration; CPU-only PyTorch is enough when you want to avoid GPU packages.
+
+To explicitly avoid DINOv2 on a VPS:
+
+```bash
+EXH_REC_VISUAL_ENCODER=simple python3 -m exh_rec.app
+```
 
 If you rate the same gallery more than once in the same direction, the latest signal gets a small capped confidence boost during retraining. A later opposite vote changes the learned direction instead of preserving the older streak.
 

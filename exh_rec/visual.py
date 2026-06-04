@@ -10,7 +10,7 @@ from typing import Any
 
 SIMPLE_VISUAL_VERSION = "canvas-rgb-8x8-v1"
 DINOV2_VISUAL_VERSION = "dinov2-small-cls-v1"
-DEFAULT_VISUAL_ENCODER = "dinov2"
+DEFAULT_VISUAL_ENCODER = os.environ.get("EXH_REC_VISUAL_ENCODER", "dinov2")
 DINOV2_MODEL_NAME = os.environ.get("EXH_REC_DINOV2_MODEL", "facebook/dinov2-small")
 DEFAULT_DINOV2_DEVICE = os.environ.get("EXH_REC_DINOV2_DEVICE", "auto")
 _DINO_LOCK = threading.Lock()
@@ -19,6 +19,13 @@ _DINO_STATE: dict[str, Any] = {}
 
 class VisualEncoderUnavailable(RuntimeError):
     pass
+
+
+def normalize_visual_encoder(value: object) -> str:
+    encoder = str(value or DEFAULT_VISUAL_ENCODER).strip().lower()
+    if encoder in {"dinov2", "simple"}:
+        return encoder
+    raise ValueError("Visual encoder must be dinov2 or simple")
 
 
 def normalize_embedding(values: list[object]) -> list[float]:

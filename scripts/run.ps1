@@ -3,6 +3,7 @@ param(
     [string]$Port = "",
     [string]$DataDir = "",
     [string]$Proxy = "",
+    [string]$VisualEncoder = "",
     [string]$DinoDevice = ""
 )
 
@@ -25,6 +26,9 @@ if ($DataDir) {
 }
 if ($Proxy) {
     $env:EXH_REC_PROXY = $Proxy
+}
+if ($VisualEncoder) {
+    $env:EXH_REC_VISUAL_ENCODER = $VisualEncoder
 }
 if ($DinoDevice) {
     $env:EXH_REC_DINOV2_DEVICE = $DinoDevice

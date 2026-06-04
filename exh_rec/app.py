@@ -55,6 +55,7 @@ from .visual import (
     dinov2_dependency_status,
     dinov2_embedding,
     normalize_dinov2_device,
+    normalize_visual_encoder,
 )
 
 
@@ -316,6 +317,7 @@ def get_settings() -> dict:
         cookie = db.get_setting(conn, "cookie_header", "")
         proxy_url = network_proxy(conn)
         dinov2_device = configured_dinov2_device(conn)
+        visual_encoder = configured_visual_encoder(conn)
         return {
             "has_cookie": bool(cookie),
             "cookie_preview": preview_cookie(cookie),
@@ -329,8 +331,9 @@ def get_settings() -> dict:
             "sample_extra_pages": sample_extra_pages(conn),
             "network_proxy": proxy_url,
             "network_proxy_preview": proxy_preview(proxy_url),
+            "visual_encoder": visual_encoder,
             "dinov2_device": dinov2_device,
-            "visual": visual_settings(dinov2_device),
+            "visual": visual_settings(visual_encoder, dinov2_device),
             "last_access_check": get_access_check(conn),
             "bootstrap_tags": get_bootstrap_tags(conn),
         }
@@ -340,6 +343,7 @@ def get_status() -> dict:
     with db.connect() as conn:
         proxy_url = network_proxy(conn)
         dinov2_device = configured_dinov2_device(conn)
+        visual_encoder = configured_visual_encoder(conn)
         return {
             "fetch": dict(FETCH_STATE),
             "last_fetch": last_fetch_run(conn),
@@ -356,10 +360,11 @@ def get_status() -> dict:
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "network_proxy": proxy_url,
                 "network_proxy_preview": proxy_preview(proxy_url),
+                "visual_encoder": visual_encoder,
                 "dinov2_device": dinov2_device,
                 "last_access_check": get_access_check(conn),
             },
-            "visual": visual_settings(dinov2_device),
+            "visual": visual_settings(visual_encoder, dinov2_device),
         }
 
 
@@ -413,6 +418,12 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "network_proxy", proxy_url)
             apply_proxy_environment(proxy_url)
             refresh_relevant_change = True
+        if "visual_encoder" in payload:
+            try:
+                encoder = normalize_visual_encoder(payload["visual_encoder"])
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            db.set_setting(conn, "visual_encoder", encoder)
         if "dinov2_device" in payload:
             try:
                 device = normalize_dinov2_device(payload["dinov2_device"])
@@ -461,6 +472,13 @@ def configured_dinov2_device(conn) -> str:
         return normalize_dinov2_device(DEFAULT_DINOV2_DEVICE)
 
 
+def configured_visual_encoder(conn) -> str:
+    try:
+        return normalize_visual_encoder(db.get_setting(conn, "visual_encoder", DEFAULT_VISUAL_ENCODER))
+    except ValueError:
+        return normalize_visual_encoder(DEFAULT_VISUAL_ENCODER)
+
+
 def import_preferences_payload(data: dict, replace: bool = False) -> dict:
     try:
         with db.connect() as conn:
@@ -475,7 +493,9 @@ def save_visual_embedding_payload(payload: dict[str, Any]) -> dict:
     if not gallery_url:
         raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
     embedding = payload.get("embedding")
-    default_encoder = "simple" if embedding is not None else DEFAULT_VISUAL_ENCODER
+    with db.connect() as conn:
+        configured_encoder = configured_visual_encoder(conn)
+    default_encoder = "simple" if embedding is not None else configured_encoder
     encoder = str(payload.get("encoder") or default_encoder).strip().lower()
     if embedding is None and encoder == "dinov2":
         return save_dinov2_visual_embedding(gallery_url, payload)
@@ -495,7 +515,17 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     with db.connect() as conn:
         proxy_url = network_proxy(conn)
         dinov2_device = configured_dinov2_device(conn)
+        visual_encoder = configured_visual_encoder(conn)
     apply_proxy_environment(proxy_url)
+    if visual_encoder != "dinov2":
+        return {
+            "ok": False,
+            "gallery_url": gallery_url,
+            "encoder": "dinov2",
+            "fallback_required": True,
+            "fallback_encoder": "simple",
+            "reason": "DINOv2 is disabled by visual_encoder setting",
+        }
     dinov2_status = dinov2_dependency_status(dinov2_device)
     if not dinov2_status.get("available"):
         return {
@@ -543,11 +573,12 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     }
 
 
-def visual_settings(device: str | None = None) -> dict:
+def visual_settings(encoder: str | None = None, device: str | None = None) -> dict:
+    encoder = normalize_visual_encoder(encoder or DEFAULT_VISUAL_ENCODER)
     device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
     return {
-        "default_encoder": DEFAULT_VISUAL_ENCODER,
-        "default_version": DINOV2_VISUAL_VERSION,
+        "default_encoder": encoder,
+        "default_version": DINOV2_VISUAL_VERSION if encoder == "dinov2" else SIMPLE_VISUAL_VERSION,
         "fallback_encoder": "simple",
         "fallback_version": SIMPLE_VISUAL_VERSION,
         "dinov2": dinov2_dependency_status(device),

@@ -9,6 +9,7 @@ const candidateLimitEl = document.querySelector("#candidateLimit");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const minutesEl = document.querySelector("#minutes");
 const networkProxyEl = document.querySelector("#networkProxy");
+const visualEncoderEl = document.querySelector("#visualEncoder");
 const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
@@ -27,10 +28,10 @@ let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
-const visualDefaultEncoder = "dinov2";
-const visualEmbeddingVersion = "dinov2-small-cls-v1";
-const visualFallbackEncoder = "simple";
-const visualFallbackVersion = "canvas-rgb-8x8-v1";
+let visualDefaultEncoder = "simple";
+let visualEmbeddingVersion = "canvas-rgb-8x8-v1";
+let visualFallbackEncoder = "simple";
+let visualFallbackVersion = "canvas-rgb-8x8-v1";
 const visualGridSize = 8;
 const visualMaxSampleImages = 10;
 const visualMaxConcurrent = 2;
@@ -248,8 +249,19 @@ function bootstrapText(tags) {
   return tags.map((item) => `${item.tag}:${item.weight}`).join("\n");
 }
 
+function applyVisualSettings(visual) {
+  if (!visual) {
+    return;
+  }
+  visualDefaultEncoder = visual.default_encoder || "simple";
+  visualEmbeddingVersion = visual.default_version || visualFallbackVersion;
+  visualFallbackEncoder = visual.fallback_encoder || "simple";
+  visualFallbackVersion = visual.fallback_version || "canvas-rgb-8x8-v1";
+}
+
 async function loadSettings() {
   const settings = await api("/api/settings");
+  applyVisualSettings(settings.visual);
   cookiePreviewEl.textContent = cookiePreviewText(settings);
   tagsEl.value = bootstrapText(settings.bootstrap_tags);
   pagesEl.value = settings.fetch_pages;
@@ -259,12 +271,14 @@ async function loadSettings() {
   sampleExtraPagesEl.value = settings.sample_extra_pages;
   minutesEl.value = settings.refresh_interval_minutes;
   networkProxyEl.value = settings.network_proxy || "";
+  visualEncoderEl.value = settings.visual_encoder || visualDefaultEncoder;
   dinov2DeviceEl.value = settings.dinov2_device || "auto";
   autoRefreshEl.checked = settings.auto_refresh;
 }
 
 async function loadStatus() {
   const payload = await api("/api/status");
+  applyVisualSettings(payload.visual);
   renderStatus(payload);
   await reloadRecommendationsAfterFetch(payload);
   return payload;
@@ -289,6 +303,7 @@ async function saveSettings() {
     sample_extra_pages: Number(sampleExtraPagesEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
     network_proxy: networkProxyEl.value.trim(),
+    visual_encoder: visualEncoderEl.value,
     dinov2_device: dinov2DeviceEl.value.trim(),
     auto_refresh: autoRefreshEl.checked,
   };
@@ -719,6 +734,9 @@ function renderStatus(payload) {
   }
   if (payload.settings && payload.settings.network_proxy_preview) {
     rows.push(["Proxy", payload.settings.network_proxy_preview]);
+  }
+  if (payload.visual) {
+    rows.push(["Visual", `${payload.visual.default_encoder || "simple"} (${payload.visual.default_version || "unknown"})`]);
   }
   if (payload.visual && payload.visual.dinov2) {
     const dino = payload.visual.dinov2;
