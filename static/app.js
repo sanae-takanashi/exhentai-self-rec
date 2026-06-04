@@ -65,10 +65,10 @@ function thumbnailSrc(item) {
   return `/thumb?${params.toString()}`;
 }
 
-function sampleSrc(galleryUrl, thumbUrl) {
+function sampleSrc(galleryUrl, index) {
   const params = new URLSearchParams({
-    url: thumbUrl,
     gallery_url: galleryUrl,
+    sample: String(index),
   });
   return `/thumb?${params.toString()}`;
 }
@@ -78,8 +78,8 @@ function visualImageSources(item) {
   if (item.thumb_url) {
     sources.push(thumbnailSrc(item));
   }
-  for (const thumb of (item.samples || []).slice(0, visualMaxSampleImages)) {
-    sources.push(sampleSrc(item.url, thumb));
+  for (const [index] of (item.samples || []).slice(0, visualMaxSampleImages).entries()) {
+    sources.push(sampleSrc(item.url, index));
   }
   return sources;
 }
@@ -553,7 +553,7 @@ function renderRecommendations(items, append = false) {
     const samples = item.samples || [];
     const samplesPreview = samples.length
       ? `<div class="samples">${samples
-          .map((thumb) => `<img src="${escapeAttr(sampleSrc(item.url, thumb))}" alt="" loading="lazy">`)
+          .map((thumb, index) => `<img src="${escapeAttr(sampleSrc(item.url, index))}" alt="" loading="lazy">`)
           .join("")}</div>`
       : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");

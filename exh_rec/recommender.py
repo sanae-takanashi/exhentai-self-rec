@@ -190,15 +190,19 @@ def store_gallery_samples(
     page_count: int | None,
     samples: list[str],
 ) -> None:
+    samples_json = json.dumps(samples, ensure_ascii=True)
     conn.execute(
         """
         UPDATE galleries
         SET page_count = COALESCE(?, page_count),
-            samples_json = ?,
+            samples_json = CASE
+                WHEN ? != '[]' THEN ?
+                ELSE samples_json
+            END,
             samples_fetched_at = CURRENT_TIMESTAMP
         WHERE url = ?
         """,
-        (page_count, json.dumps(samples, ensure_ascii=True), url),
+        (page_count, samples_json, samples_json, url),
     )
 
 

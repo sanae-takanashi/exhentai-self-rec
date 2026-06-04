@@ -23,6 +23,7 @@ from exh_rec.recommender import (
     record_feedback,
     retrain_model,
     score_gallery,
+    store_gallery_samples,
     store_visual_embedding,
     store_galleries,
     upsert_bootstrap_tags,
@@ -267,6 +268,17 @@ class RecommenderTest(unittest.TestCase):
         self.assertIsNone(rows[first_url]["visual_embedding_json"])
         self.assertIsNone(rows[second_url]["thumb_url"])
         self.assertEqual(rows[unique_url]["thumb_url"], "https://s.exhentai.org/w/unique.webp")
+
+    def test_store_gallery_samples_preserves_existing_samples_on_empty_refresh(self):
+        gallery_url = "https://exhentai.org/g/4sample/a/"
+        sample_url = "https://old.hath.network/c2/sample.webp"
+        store_galleries(self.conn, [Gallery(url=gallery_url, gid="4sample", token="a", title="Samples")])
+        store_gallery_samples(self.conn, gallery_url, 40, [sample_url])
+
+        store_gallery_samples(self.conn, gallery_url, 40, [])
+
+        row = self.conn.execute("SELECT samples_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        self.assertIn(sample_url, row["samples_json"])
 
     def test_store_galleries_list_fetch_updates_existing_last_seen(self):
         gallery_url = "https://exhentai.org/g/4c/d/"

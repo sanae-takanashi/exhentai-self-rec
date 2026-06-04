@@ -18,6 +18,7 @@ from exh_rec.app import (
     build_queries,
     build_query_plan,
     cached_thumbnail,
+    cached_gallery_sample,
     check_saved_access,
     collect_gallery_samples,
     configured_dinov2_device,
@@ -295,6 +296,66 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status.value, 400)
         self.assertEqual(ctx.exception.message, "unsupported thumbnail host")
+
+    def test_cached_gallery_sample_uses_stored_sample_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/43/a/"
+                sample_url = "https://s.exhentai.org/t/sample-1.webp"
+                with db.connect() as conn:
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="43", token="a", title="Sample Index")])
+                    store_gallery_samples(conn, gallery_url, 20, ["https://s.exhentai.org/t/sample-0.webp", sample_url])
+
+                with patch("exh_rec.app.cached_thumbnail", return_value=(b"sample", "image/webp")) as cached:
+                    result = cached_gallery_sample(gallery_url, 1)
+
+        self.assertEqual(result, (b"sample", "image/webp"))
+        cached.assert_called_once_with(sample_url, gallery_url)
+
+    def test_cached_gallery_sample_refreshes_stale_sample_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/44/a/"
+                stale_url = "https://old.hath.network/c2/stale.webp"
+                fresh_url = "https://new.hath.network/c2/fresh.webp"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="44", token="a", title="Stale Sample")])
+                    store_gallery_samples(conn, gallery_url, 20, [stale_url])
+
+                detailed = Gallery(
+                    url=gallery_url,
+                    gid="44",
+                    token="a",
+                    title="Stale Sample",
+                    page_count=20,
+                    sample_thumbs=[
+                        fresh_url,
+                        "https://new.hath.network/c2/fresh-1.webp",
+                        "https://new.hath.network/c2/fresh-2.webp",
+                        "https://new.hath.network/c2/fresh-3.webp",
+                        "https://new.hath.network/c2/fresh-4.webp",
+                    ],
+                )
+                stale_error = ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail fetch failed with HTTP 404")
+                with patch("exh_rec.app.cached_thumbnail", side_effect=[stale_error, (b"fresh", "image/webp")]) as cached, patch(
+                    "exh_rec.app.fetch_gallery_detail",
+                    return_value=detailed,
+                ) as fetch_detail, patch("exh_rec.app.cache_sample_thumbnails") as cache_samples:
+                    result = cached_gallery_sample(gallery_url, 0)
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT samples_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+        self.assertEqual(result, (b"fresh", "image/webp"))
+        self.assertEqual(cached.call_args_list[-1].args, (fresh_url, gallery_url))
+        fetch_detail.assert_called_once()
+        cache_samples.assert_called_once()
+        self.assertIn(fresh_url, row["samples_json"])
 
     def test_thumbnail_proxy_allows_hath_sample_hosts(self):
         self.assertTrue(is_allowed_thumbnail_url("https://abc123.hath.network/c2/a/1.webp"))

@@ -103,7 +103,11 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 thumb_url = str(query.get("url", [""])[0])
                 gallery_url = str(query.get("gallery_url", [""])[0])
-                self.serve_thumbnail(thumb_url, gallery_url)
+                if "sample" in query:
+                    sample_index = query_int(query, "sample", default=0, lower=0, upper=10000)
+                    self.serve_gallery_sample(gallery_url, sample_index)
+                else:
+                    self.serve_thumbnail(thumb_url, gallery_url)
             elif path == "/api/settings":
                 self.send_json(get_settings())
             elif path == "/api/status":
@@ -278,6 +282,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_thumbnail(self, thumb_url: str, gallery_url: str) -> None:
         data, content_type = cached_thumbnail(thumb_url, gallery_url)
+        self.send_bytes(data, content_type, cache_control="private, max-age=86400")
+
+    def serve_gallery_sample(self, gallery_url: str, sample_index: int) -> None:
+        data, content_type = cached_gallery_sample(gallery_url, sample_index)
         self.send_bytes(data, content_type, cache_control="private, max-age=86400")
 
     def serve_static(self, name: str, body: bool = True) -> None:
@@ -684,6 +692,7 @@ def fetch_and_store(
             try:
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
+                cache_sample_thumbnails(detailed.url, samples)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
@@ -797,6 +806,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             try:
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
+                cache_sample_thumbnails(detailed.url, samples)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
@@ -899,6 +909,7 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
     try:
         detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
         samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
+        cache_sample_thumbnails(detailed.url, samples)
     except Exception as exc:
         return {"status": "failed", "reason": str(exc)}
 
@@ -1235,6 +1246,80 @@ def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]
         encoding="utf-8",
     )
     return data, content_type
+
+
+def cached_gallery_sample(gallery_url: str, sample_index: int) -> tuple[bytes, str]:
+    if thumbnail_referer(gallery_url) != gallery_url.strip():
+        raise ApiError(HTTPStatus.BAD_REQUEST, "valid gallery_url is required")
+    sample_url = gallery_sample_url(gallery_url, sample_index)
+    try:
+        return cached_thumbnail(sample_url, gallery_url)
+    except ApiError as exc:
+        if not stale_thumbnail_error(exc):
+            raise
+
+    refresh_gallery_sample_metadata(gallery_url)
+    return cached_thumbnail(gallery_sample_url(gallery_url, sample_index, fallback_first=True), gallery_url)
+
+
+def gallery_sample_url(gallery_url: str, sample_index: int, fallback_first: bool = False) -> str:
+    with db.connect() as conn:
+        row = conn.execute("SELECT samples_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+    if not row:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery not found")
+    try:
+        samples = json.loads(row["samples_json"] or "[]")
+    except json.JSONDecodeError as exc:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery has no sample images") from exc
+    samples = [str(sample) for sample in samples if str(sample).strip()]
+    if not samples:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery has no sample images")
+    if 0 <= sample_index < len(samples):
+        return samples[sample_index]
+    if fallback_first:
+        return samples[0]
+    raise ApiError(HTTPStatus.NOT_FOUND, "Sample image not found")
+
+
+def refresh_gallery_sample_metadata(gallery_url: str) -> None:
+    with db.connect() as conn:
+        cookie = db.get_setting(conn, "cookie_header", "")
+        extra_pages = sample_extra_pages(conn)
+        proxy_url = network_proxy(conn)
+        row = conn.execute("SELECT * FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+    if not row:
+        raise ApiError(HTTPStatus.NOT_FOUND, "Gallery not found")
+    if not cookie:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+    try:
+        gallery = gallery_from_item(db.row_to_dict(row))
+        detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+        samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
+        cache_sample_thumbnails(detailed.url, samples)
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"Sample refresh failed: {exc}") from exc
+    with db.connect() as conn:
+        store_galleries(conn, [detailed], detail_fetched=True)
+        store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
+
+
+def cache_sample_thumbnails(gallery_url: str, samples: list[str]) -> int:
+    cached = 0
+    for sample in samples:
+        try:
+            cached_thumbnail(sample, gallery_url)
+            cached += 1
+        except ApiError:
+            continue
+    return cached
+
+
+def stale_thumbnail_error(exc: ApiError) -> bool:
+    return exc.status == HTTPStatus.BAD_GATEWAY and (
+        "HTTP 403" in exc.message or "HTTP 404" in exc.message
+    )
 
 
 def normalize_thumbnail_url(thumb_url: str) -> str:
