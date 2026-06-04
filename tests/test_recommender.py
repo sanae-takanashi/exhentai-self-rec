@@ -497,7 +497,7 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual(default_top["url"], galleries[99].url)
         self.assertEqual(fresh_top["url"], galleries[0].url)
-        self.assertIn("fresh +1.00", fresh_top["reasons"])
+        self.assertEqual(fresh_top["reasons"][0], "fresh +1.00")
 
     def test_latest_feedback_retrain_replaces_old_signal(self):
         gallery_url = "https://exhentai.org/g/6/f/"

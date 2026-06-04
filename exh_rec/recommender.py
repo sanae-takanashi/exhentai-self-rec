@@ -797,7 +797,11 @@ def recommend_page(
         freshness = freshness_bonus(idx, candidate_limit) * freshness_weight
         score += freshness
         if freshness and reasons != ["recent"]:
-            reasons.append(f"fresh {freshness:+.2f}")
+            freshness_reason = f"fresh {freshness:+.2f}"
+            if freshness_weight > 1.0:
+                reasons.insert(0, freshness_reason)
+            else:
+                reasons.append(freshness_reason)
         gallery["score"] = round(score, 3)
         gallery["reasons"] = reasons[:5]
         scored.append(gallery)
