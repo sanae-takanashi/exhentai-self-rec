@@ -868,7 +868,7 @@ def collect_gallery_samples(
     delay: float = 1.0,
     proxy_url: str = "",
 ) -> list[str]:
-    """Pick a random spread of page thumbnails for ``detailed`` (5 + pages//100)."""
+    """Pick page thumbnails for ``detailed`` while preserving the first page preview."""
     pool = list(dict.fromkeys(detailed.sample_thumbs))
     count = sample_count_for(detailed.page_count)
     if len(pool) < count and extra_pages > 0:
@@ -877,7 +877,8 @@ def collect_gallery_samples(
                 pool.append(thumb)
     if len(pool) <= count:
         return pool
-    return random.sample(pool, count)
+    first_thumb = pool[0]
+    return [first_thumb, *random.sample(pool[1:], count - 1)]
 
 
 def enrich_feedback_gallery(gallery_url: str) -> dict:
@@ -1159,17 +1160,27 @@ def recommendation_payload(
     offset: int = 0,
     filter_text: str | None = None,
 ) -> dict:
-    return {
-        **recommend_page(
-            conn,
-            limit=limit,
-            include_rated=include_rated,
-            offset=offset,
-            filter_text=filter_text,
-            candidate_limit=recommend_candidate_limit(conn),
-        ),
-        "last_fetch": last_fetch_run(conn),
-    }
+    page = recommend_page(
+        conn,
+        limit=limit,
+        include_rated=include_rated,
+        offset=offset,
+        filter_text=filter_text,
+        candidate_limit=recommend_candidate_limit(conn),
+    )
+    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def recommendation_item_with_image_fallback(item: dict) -> dict:
+    if item.get("thumb_url"):
+        return item
+    samples = item.get("samples") or []
+    if not samples:
+        return item
+    updated = dict(item)
+    updated["thumb_url"] = samples[0]
+    return updated
 
 
 def feedback_history_payload(conn, gallery_url: str, limit: int = 25) -> dict:

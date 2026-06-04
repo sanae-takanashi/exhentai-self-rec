@@ -52,7 +52,14 @@ from exh_rec.app import (
     thumbnail_referer,
 )
 from exh_rec.exhentai import Gallery
-from exh_rec.recommender import learned_query_tags, parse_bootstrap_tags, record_feedback, store_galleries, upsert_bootstrap_tags
+from exh_rec.recommender import (
+    learned_query_tags,
+    parse_bootstrap_tags,
+    record_feedback,
+    store_galleries,
+    store_gallery_samples,
+    upsert_bootstrap_tags,
+)
 from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION
 
 
@@ -498,6 +505,21 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["last_fetch"]["enriched_count"], 1)
         conn.close()
 
+    def test_recommendation_payload_uses_first_sample_as_thumbnail_fallback(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery_url = "https://exhentai.org/g/9s/a/"
+        first_sample = "https://s.exhentai.org/t/first.jpg"
+        store_galleries(conn, [Gallery(url=gallery_url, gid="9s", token="a", title="Sample Fallback")])
+        store_gallery_samples(conn, gallery_url, 40, [first_sample, "https://s.exhentai.org/t/second.jpg"])
+
+        payload = recommendation_payload(conn, limit=1)
+
+        self.assertEqual(payload["items"][0]["thumb_url"], first_sample)
+        self.assertEqual(payload["items"][0]["samples"][0], first_sample)
+        conn.close()
+
     def test_refresh_summary_explains_auto_refresh_readiness(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -729,6 +751,21 @@ class AppTest(unittest.TestCase):
         extra.assert_not_called()
         self.assertEqual(len(samples), 5)
         self.assertTrue(set(samples).issubset(set(detailed.sample_thumbs)))
+
+    def test_collect_gallery_samples_always_keeps_first_page_preview(self):
+        detailed = Gallery(
+            url="https://exhentai.org/g/40f/a/",
+            gid="40f",
+            token="a",
+            title="First Page",
+            page_count=40,
+            sample_thumbs=[f"https://s.exhentai.org/t/{i}.jpg" for i in range(10)],
+        )
+        with patch("exh_rec.app.random.sample", return_value=detailed.sample_thumbs[5:9]):
+            samples = collect_gallery_samples("cookie", detailed, extra_pages=0)
+
+        self.assertEqual(samples[0], detailed.sample_thumbs[0])
+        self.assertEqual(len(samples), 5)
 
     def test_collect_gallery_samples_fetches_extra_pages_for_large_galleries(self):
         detailed = Gallery(
