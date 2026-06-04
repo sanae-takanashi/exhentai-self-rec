@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import sqlite3
 import time
@@ -723,6 +724,8 @@ def recommend(
     filter_text: str | None = None,
     candidate_limit: int = 2000,
     freshness_weight: float = 1.0,
+    bootstrap_explore_count: int = 0,
+    explore_seed: str | None = None,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -732,6 +735,8 @@ def recommend(
         filter_text=filter_text,
         candidate_limit=candidate_limit,
         freshness_weight=freshness_weight,
+        bootstrap_explore_count=bootstrap_explore_count,
+        explore_seed=explore_seed,
     )["items"]
 
 
@@ -743,6 +748,8 @@ def recommend_page(
     filter_text: str | None = None,
     candidate_limit: int = 2000,
     freshness_weight: float = 1.0,
+    bootstrap_explore_count: int = 0,
+    explore_seed: str | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -750,6 +757,7 @@ def recommend_page(
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
     candidate_limit = max(limit + offset, candidate_limit)
     freshness_weight = max(0.0, min(10.0, float(freshness_weight)))
+    bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -808,6 +816,14 @@ def recommend_page(
 
     scored.sort(key=lambda item: item["score"], reverse=True)
     scored = diversify_ranked_galleries(scored)
+    if bootstrap_explore_count and not include_rated and scored:
+        scored = mix_bootstrap_exploration(
+            scored,
+            limit=limit,
+            count=bootstrap_explore_count,
+            bootstrap_queries=bootstrap_source_queries(bootstrap),
+            seed=explore_seed,
+        )
     items = scored[offset : offset + limit]
     next_offset = offset + len(items)
     return {
@@ -818,7 +834,63 @@ def recommend_page(
         "total": len(scored),
         "has_more": next_offset < len(scored),
         "candidate_limit": candidate_limit,
+        "bootstrap_explore_count": bootstrap_explore_count,
     }
+
+
+def mix_bootstrap_exploration(
+    scored: list[dict],
+    limit: int,
+    count: int,
+    bootstrap_queries: set[str],
+    seed: str | None = None,
+) -> list[dict]:
+    if count <= 0 or limit <= 1 or not bootstrap_queries:
+        return scored
+    keep_count = max(1, limit - count)
+    protected = scored[:keep_count]
+    pool = [
+        item
+        for item in scored[keep_count:]
+        if normalize_source_query(item.get("source_query")) in bootstrap_queries
+    ]
+    rng = random.Random(str(seed)) if seed else random.Random()
+    rng.shuffle(pool)
+    selected = []
+    selected_urls = set()
+    for item in pool:
+        selected_item = dict(item)
+        selected_item["reasons"] = ["bootstrap explore", *item.get("reasons", [])][:5]
+        selected.append(selected_item)
+        selected_urls.add(item["url"])
+        if len(selected) >= count:
+            break
+    if not selected:
+        return scored
+    remainder = [item for item in scored[keep_count:] if item["url"] not in selected_urls]
+    return [*protected, *selected, *remainder]
+
+
+def bootstrap_source_queries(bootstrap: dict[str, float]) -> set[str]:
+    return {
+        format_bootstrap_source_query(tag)
+        for tag, weight in bootstrap.items()
+        if weight > 0
+    }
+
+
+def format_bootstrap_source_query(tag: str) -> str:
+    value = str(tag or "").strip().lower()
+    if ":" not in value:
+        return value
+    namespace, body = value.split(":", 1)
+    if " " in body:
+        return f'{namespace}:"{body}"'
+    return value
+
+
+def normalize_source_query(query: object) -> str:
+    return str(query or "").strip().lower()
 
 
 def reaction_history_page(

@@ -29,6 +29,7 @@ let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
 let lastRenderedFetchId = null;
 let currentView = "review";
+let reviewExploreSeed = "";
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
 let renderedGalleryUrls = [];
@@ -360,7 +361,7 @@ function viewCopy(view) {
   }
   return {
     title: "Review Queue",
-    subtitle: "Unrated galleries ready for feedback.",
+    subtitle: "Unrated galleries with a few random bootstrap-seed picks mixed in.",
     empty: "No unrated galleries yet. Save cookies and bootstrap tags, then fetch.",
     loaded: "review recommendations loaded",
   };
@@ -398,8 +399,12 @@ async function loadRecommendations(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const includeRated = currentView === "preview" ? "1" : "0";
   const freshnessWeight = currentView === "preview" ? "4" : "1";
+  const bootstrapExploreCount = currentView === "review" ? "6" : "0";
+  if (currentView === "review" && !append && offset === 0) {
+    reviewExploreSeed = `${Date.now()}-${Math.random()}`;
+  }
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);

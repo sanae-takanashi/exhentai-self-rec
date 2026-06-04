@@ -499,6 +499,44 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(fresh_top["url"], galleries[0].url)
         self.assertEqual(fresh_top["reasons"][0], "fresh +1.00")
 
+    def test_bootstrap_exploration_mixes_seed_galleries_into_review_page(self):
+        strong = [
+            Gallery(
+                url=f"https://exhentai.org/g/strong-{idx}/e/",
+                gid=f"strong-{idx}",
+                token="e",
+                title=f"Strong Match {idx}",
+            )
+            for idx in range(20)
+        ]
+        exploratory = [
+            Gallery(
+                url=f"https://exhentai.org/g/explore-{idx}/e/",
+                gid=f"explore-{idx}",
+                token="e",
+                title=f"Bootstrap Seed {idx}",
+                source_query="female:seed",
+            )
+            for idx in range(10)
+        ]
+        store_galleries(self.conn, [*strong, *exploratory])
+        upsert_bootstrap_tags(self.conn, [("strong", 1.0), ("female:seed", 1.0)])
+
+        ranked = recommend_page(self.conn, limit=10, candidate_limit=100, bootstrap_explore_count=0)
+        explored = recommend_page(
+            self.conn,
+            limit=10,
+            candidate_limit=100,
+            bootstrap_explore_count=3,
+            explore_seed="fixed-review-seed",
+        )
+
+        self.assertEqual(sum(1 for item in ranked["items"] if item.get("source_query") == "female:seed"), 0)
+        explored_items = [item for item in explored["items"] if item.get("source_query") == "female:seed"]
+        self.assertEqual(len(explored_items), 3)
+        self.assertTrue(all(item["reasons"][0] == "bootstrap explore" for item in explored_items))
+        self.assertEqual(explored["bootstrap_explore_count"], 3)
+
     def test_latest_feedback_retrain_replaces_old_signal(self):
         gallery_url = "https://exhentai.org/g/6/f/"
         store_galleries(

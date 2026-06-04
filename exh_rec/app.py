@@ -136,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
                 offset = query_int(query, "offset", default=0, lower=0, upper=10000)
                 include_rated = parse_bool(query.get("include_rated", ["0"])[0])
                 freshness_weight = query_float(query, "freshness_weight", default=1.0, lower=0.0, upper=10.0)
+                bootstrap_explore_count = query_int(query, "bootstrap_explore_count", default=0, lower=0, upper=20)
+                explore_seed = str(query.get("explore_seed", [""])[0])[:80]
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(
@@ -146,6 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                             offset=offset,
                             filter_text=filter_text,
                             freshness_weight=freshness_weight,
+                            bootstrap_explore_count=bootstrap_explore_count,
+                            explore_seed=explore_seed,
                         )
                     )
             elif path == "/api/reactions":
@@ -1402,6 +1406,8 @@ def recommendation_payload(
     offset: int = 0,
     filter_text: str | None = None,
     freshness_weight: float = 1.0,
+    bootstrap_explore_count: int = 0,
+    explore_seed: str | None = None,
 ) -> dict:
     page = recommend_page(
         conn,
@@ -1411,6 +1417,8 @@ def recommendation_payload(
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
         freshness_weight=freshness_weight,
+        bootstrap_explore_count=bootstrap_explore_count,
+        explore_seed=explore_seed,
     )
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}
