@@ -29,7 +29,6 @@ from exh_rec.recommender import (
     store_gallery_samples,
     store_visual_embedding,
     store_galleries,
-    tag_position_strength,
     upsert_bootstrap_tags,
     visual_preference_model,
 )
@@ -180,7 +179,7 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn("uploader:trusteduploader", text)
         self.assertIn("artist:name", text)
 
-    def test_tag_feature_strength_uses_order_within_namespace(self):
+    def test_tag_feature_strength_is_independent_of_order_within_namespace(self):
         features = dict(
             gallery_feature_values(
                 {
@@ -192,11 +191,11 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual(features["tag:male:first"], 1.0)
         self.assertEqual(features["tag:female:bondage"], 1.0)
-        self.assertEqual(features["tag:male:second"], tag_position_strength(1))
-        self.assertEqual(features["tag:female:gloves"], tag_position_strength(1))
-        self.assertEqual(features["tag:female:stockings"], tag_position_strength(2))
+        self.assertEqual(features["tag:male:second"], 1.0)
+        self.assertEqual(features["tag:female:gloves"], 1.0)
+        self.assertEqual(features["tag:female:stockings"], 1.0)
 
-    def test_tag_order_affects_learned_training_and_scoring(self):
+    def test_tag_order_does_not_affect_learned_training_and_scoring(self):
         liked_url = "https://exhentai.org/g/3o/c/"
         store_galleries(
             self.conn,
@@ -216,14 +215,14 @@ class RecommenderTest(unittest.TestCase):
             "SELECT weight FROM feature_weights WHERE feature = ?",
             ("tag:female:bondage",),
         ).fetchone()
-        expected = LEARNING_RATE * feature_learning_multiplier("tag:female:bondage") * tag_position_strength(1)
+        expected = LEARNING_RATE * feature_learning_multiplier("tag:female:bondage")
         self.assertAlmostEqual(row["weight"], expected)
 
         weights = {"tag:female:bondage": 1.0}
         high_score, _ = score_gallery({"title": "High", "tags": ["male:first", "female:bondage"]}, {}, weights)
         low_score, _ = score_gallery({"title": "Low", "tags": ["female:other", "female:bondage"]}, {}, weights)
 
-        self.assertGreater(high_score, low_score)
+        self.assertEqual(high_score, low_score)
 
     def test_score_feedback_uses_scaled_signal(self):
         self.assertEqual(feedback_signal(score=1), -1.0)

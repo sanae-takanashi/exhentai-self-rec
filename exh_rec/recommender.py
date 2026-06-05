@@ -26,8 +26,6 @@ VISUAL_VERSION_PRIORITY = (DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION)
 VISUAL_SCORE_SCALE = 1.35
 VISUAL_MIN_DIMS = 16
 VISUAL_MAX_DIMS = 2048
-TAG_POSITION_DECAY = 0.12
-MIN_TAG_POSITION_STRENGTH = 0.35
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -304,15 +302,11 @@ def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
     uploader = (gallery.get("uploader") or "").strip().lower()
     if uploader:
         add_feature(f"uploader:{uploader}")
-    namespace_positions: dict[str, int] = {}
     for tag in gallery.get("tags") or []:
         norm = str(tag).strip().lower()
         if not norm:
             continue
-        namespace = tag_namespace(norm)
-        position = namespace_positions.get(namespace, 0)
-        namespace_positions[namespace] = position + 1
-        add_feature(f"tag:{norm}", tag_position_strength(position))
+        add_feature(f"tag:{norm}")
     for token in TOKEN_RE.findall(gallery.get("title") or ""):
         token = token.lower().strip("_:+.-")
         if len(token) >= 3 and not token.isdigit():
@@ -322,11 +316,6 @@ def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
 
 def tag_namespace(tag: str) -> str:
     return tag.split(":", 1)[0] if ":" in tag else ""
-
-
-def tag_position_strength(position: int) -> float:
-    position = max(0, int(position))
-    return max(MIN_TAG_POSITION_STRENGTH, 1.0 / (1.0 + position * TAG_POSITION_DECAY))
 
 
 def record_feedback(
