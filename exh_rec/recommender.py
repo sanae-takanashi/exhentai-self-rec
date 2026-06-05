@@ -26,6 +26,9 @@ VISUAL_VERSION_PRIORITY = (DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION)
 VISUAL_SCORE_SCALE = 1.35
 VISUAL_MIN_DIMS = 16
 VISUAL_MAX_DIMS = 2048
+MIN_CORPUS_TAG_STRENGTH_GALLERIES = 10
+MIN_TAG_STRENGTH = 0.55
+MAX_TAG_STRENGTH = 1.2
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -136,14 +139,15 @@ def learned_query_tags(conn: sqlite3.Connection, limit: int = 6) -> list[str]:
 def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_fetched: bool = False) -> int:
     count = 0
     for gallery in galleries:
+        tag_weights_json = json.dumps(normalize_tag_weights(gallery.tag_weights), ensure_ascii=True)
         existing = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
         conn.execute(
             """
             INSERT INTO galleries(
                 url, gid, token, title, category, uploader, posted_at, thumb_url,
-                rating, tags_json, source_query, detail_fetched_at, last_seen_at
+                rating, tags_json, tag_weights_json, source_query, detail_fetched_at, last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 category = COALESCE(excluded.category, galleries.category),
@@ -157,6 +161,10 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 tags_json = CASE
                     WHEN excluded.tags_json != '[]' THEN excluded.tags_json
                     ELSE galleries.tags_json
+                END,
+                tag_weights_json = CASE
+                    WHEN excluded.tag_weights_json != '{}' THEN excluded.tag_weights_json
+                    ELSE galleries.tag_weights_json
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
@@ -176,6 +184,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 gallery.thumb_url,
                 gallery.rating,
                 json.dumps(gallery.tags, ensure_ascii=True),
+                tag_weights_json,
                 gallery.source_query,
                 None,
                 1 if detail_fetched else 0,
@@ -287,8 +296,10 @@ def gallery_features(gallery: dict) -> list[str]:
     return [feature for feature, _strength in gallery_feature_values(gallery)]
 
 
-def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
+def gallery_feature_values(gallery: dict, tag_strengths: dict[str, float] | None = None) -> list[tuple[str, float]]:
     features: dict[str, float] = {}
+    tag_weights = normalize_tag_weights(gallery.get("tag_weights") or {})
+    tag_strengths = tag_strengths or {}
 
     def add_feature(feature: str, strength: float = 1.0) -> None:
         feature = feature.strip().lower()
@@ -306,7 +317,10 @@ def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
         norm = str(tag).strip().lower()
         if not norm:
             continue
-        add_feature(f"tag:{norm}")
+        strength = tag_weights.get(norm)
+        if strength is None:
+            strength = tag_strengths.get(norm, 1.0)
+        add_feature(f"tag:{norm}", strength)
     for token in TOKEN_RE.findall(gallery.get("title") or ""):
         token = token.lower().strip("_:+.-")
         if len(token) >= 3 and not token.isdigit():
@@ -316,6 +330,24 @@ def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
 
 def tag_namespace(tag: str) -> str:
     return tag.split(":", 1)[0] if ":" in tag else ""
+
+
+def normalize_tag_weights(raw: object) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    weights: dict[str, float] = {}
+    for tag, value in raw.items():
+        tag = normalize_bootstrap_value(str(tag or "").strip().lower())
+        if not tag:
+            continue
+        try:
+            strength = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isnan(strength):
+            continue
+        weights[tag] = max(MIN_TAG_STRENGTH, min(MAX_TAG_STRENGTH, strength))
+    return weights
 
 
 def record_feedback(
@@ -389,7 +421,7 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
             for row in conn.execute(
                 f"""
                 SELECT url, gid, token, title, category, uploader, posted_at, thumb_url,
-                       rating, tags_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
+                       rating, tags_json, tag_weights_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
                 FROM galleries
                 WHERE url IN ({placeholders})
                 ORDER BY url
@@ -423,9 +455,9 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             """
             INSERT INTO galleries(
                 url, gid, token, title, category, uploader, posted_at, thumb_url,
-                rating, tags_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
+                rating, tags_json, tag_weights_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 category = COALESCE(excluded.category, galleries.category),
@@ -436,6 +468,10 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 tags_json = CASE
                     WHEN excluded.tags_json != '[]' THEN excluded.tags_json
                     ELSE galleries.tags_json
+                END,
+                tag_weights_json = CASE
+                    WHEN excluded.tag_weights_json != '{}' THEN excluded.tag_weights_json
+                    ELSE galleries.tag_weights_json
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
@@ -452,6 +488,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 gallery.get("thumb_url"),
                 import_gallery_rating(gallery.get("rating")),
                 import_tags_json(gallery.get("tags_json")),
+                import_tag_weights_json(gallery.get("tag_weights_json")),
                 gallery.get("source_query"),
                 gallery.get("detail_fetched_at"),
                 gallery.get("first_seen_at"),
@@ -536,6 +573,16 @@ def import_tags_json(raw: object) -> str:
     return json.dumps(parsed, ensure_ascii=True)
 
 
+def import_tag_weights_json(raw: object) -> str:
+    if not raw:
+        return "{}"
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return "{}"
+    return json.dumps(normalize_tag_weights(parsed), ensure_ascii=True)
+
+
 def optional_float(value: object) -> float | None:
     try:
         parsed = float(value)
@@ -574,6 +621,7 @@ def import_feedback_score(value: object) -> int | None:
 
 def retrain_model(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM feature_weights")
+    tag_strengths = tag_corpus_strengths(conn)
     rows = conn.execute(
         """
         SELECT g.*, f.id AS feedback_id, f.vote AS feedback_signal
@@ -593,7 +641,8 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         feedback_id = int(gallery.pop("feedback_id"))
         signal *= feedback_confidence(conn, gallery["url"], feedback_id, signal)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
-        apply_feedback_features(conn, gallery, signal)
+        gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
+        apply_feedback_features(conn, gallery, signal, tag_strengths=tag_strengths)
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
@@ -691,10 +740,15 @@ def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id:
     return 1.0 + boost
 
 
-def apply_feedback_features(conn: sqlite3.Connection, gallery: dict, signal: float) -> None:
+def apply_feedback_features(
+    conn: sqlite3.Connection,
+    gallery: dict,
+    signal: float,
+    tag_strengths: dict[str, float] | None = None,
+) -> None:
     if signal == 0:
         return
-    for feature, strength in gallery_feature_values(gallery):
+    for feature, strength in gallery_feature_values(gallery, tag_strengths=tag_strengths):
         weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature) * strength
         conn.execute(
             """
@@ -713,6 +767,39 @@ def apply_feedback_features(conn: sqlite3.Connection, gallery: dict, signal: flo
                 1 if signal < 0 else 0,
             ),
         )
+
+
+def tag_corpus_strengths(conn: sqlite3.Connection) -> dict[str, float]:
+    rows = conn.execute("SELECT tags_json FROM galleries").fetchall()
+    total = len(rows)
+    if total < MIN_CORPUS_TAG_STRENGTH_GALLERIES:
+        return {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            tags = json.loads(row["tags_json"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        seen: set[str] = set()
+        for raw in tags if isinstance(tags, list) else []:
+            tag = normalize_bootstrap_value(str(raw or "").strip().lower())
+            if tag:
+                seen.add(tag)
+        for tag in seen:
+            counts[tag] = counts.get(tag, 0) + 1
+    if not counts:
+        return {}
+    max_idf = math.log((total + 1) / 2) + 1
+    if max_idf <= 1:
+        return {}
+    strengths: dict[str, float] = {}
+    for tag, count in counts.items():
+        idf = math.log((total + 1) / (count + 1)) + 1
+        rarity = math.sqrt(max(0.0, min(1.0, (idf - 1) / (max_idf - 1))))
+        support = 0.55 + 0.45 * (1.0 - math.exp(-count / 4.0))
+        strength = MIN_TAG_STRENGTH + (MAX_TAG_STRENGTH - MIN_TAG_STRENGTH) * rarity * support
+        strengths[tag] = round(max(MIN_TAG_STRENGTH, min(MAX_TAG_STRENGTH, strength)), 4)
+    return strengths
 
 
 def feature_learning_multiplier(feature: str) -> float:
@@ -790,6 +877,7 @@ def recommend_page(
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
+    tag_strengths = tag_corpus_strengths(conn)
     rows = conn.execute(
         """
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote
@@ -813,6 +901,7 @@ def recommend_page(
     for idx, row in enumerate(rows):
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
         gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
         gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
         gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
@@ -822,7 +911,7 @@ def recommend_page(
             if score is None:
                 continue
         else:
-            score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
+            score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = gallery.get("feedback_id") is not None
@@ -981,6 +1070,7 @@ def reaction_history_page(
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
+    tag_strengths = tag_corpus_strengths(conn)
     rows = conn.execute(
         """
         SELECT g.*, f.id AS feedback_id, f.vote AS user_vote, f.score AS user_score,
@@ -1001,13 +1091,14 @@ def reaction_history_page(
     for row in rows:
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
         gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
         gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
         gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
         gallery["visual_ready"] = bool(gallery["visual_embedding"])
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
-        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model)
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["rated"] = True
@@ -1102,6 +1193,7 @@ def score_gallery(
     bootstrap: dict[str, float],
     weights: dict[str, float],
     visual_model: dict | None = None,
+    tag_strengths: dict[str, float] | None = None,
 ) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
@@ -1114,7 +1206,7 @@ def score_gallery(
             reasons.append(f"bootstrap {tag} {weight:+g}")
 
     feature_hits = []
-    for feature, strength in gallery_feature_values(gallery):
+    for feature, strength in gallery_feature_values(gallery, tag_strengths=tag_strengths):
         weight = weights.get(feature, 0.0)
         if weight:
             adjusted_weight = weight * strength

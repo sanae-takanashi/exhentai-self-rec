@@ -29,6 +29,7 @@ from exh_rec.recommender import (
     store_gallery_samples,
     store_visual_embedding,
     store_galleries,
+    tag_corpus_strengths,
     upsert_bootstrap_tags,
     visual_preference_model,
 )
@@ -223,6 +224,60 @@ class RecommenderTest(unittest.TestCase):
         low_score, _ = score_gallery({"title": "Low", "tags": ["female:other", "female:bondage"]}, {}, weights)
 
         self.assertEqual(high_score, low_score)
+
+    def test_site_tag_power_weights_same_namespace_tags(self):
+        liked_url = "https://exhentai.org/g/3p/c/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=liked_url,
+                    gid="3p",
+                    token="c",
+                    title="Powered Tags",
+                    tags=["female:solid", "female:weak"],
+                    tag_weights={"female:solid": 1.15, "female:weak": 0.55},
+                )
+            ],
+        )
+
+        features = dict(gallery_feature_values({"tags": ["female:solid", "female:weak"], "tag_weights": {"female:solid": 1.15, "female:weak": 0.55}}))
+        self.assertGreater(features["tag:female:solid"], features["tag:female:weak"])
+
+        record_feedback(self.conn, liked_url, vote=1)
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute(
+                "SELECT feature, weight FROM feature_weights WHERE feature IN (?, ?)",
+                ("tag:female:solid", "tag:female:weak"),
+            )
+        }
+
+        self.assertGreater(weights["tag:female:solid"], weights["tag:female:weak"])
+
+    def test_corpus_reliability_weights_same_namespace_tags_without_site_power(self):
+        galleries = []
+        liked_url = "https://exhentai.org/g/3q/0/"
+        for index in range(20):
+            tags = ["female:common"]
+            if index < 4:
+                tags.append("female:specific")
+            galleries.append(Gallery(url=f"https://exhentai.org/g/3q/{index}/", gid=f"3q{index}", token=str(index), title=f"Corpus {index}", tags=tags))
+        store_galleries(self.conn, galleries)
+
+        strengths = tag_corpus_strengths(self.conn)
+        self.assertGreater(strengths["female:specific"], strengths["female:common"])
+
+        record_feedback(self.conn, liked_url, vote=1)
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute(
+                "SELECT feature, weight FROM feature_weights WHERE feature IN (?, ?)",
+                ("tag:female:specific", "tag:female:common"),
+            )
+        }
+
+        self.assertGreater(weights["tag:female:specific"], weights["tag:female:common"])
 
     def test_score_feedback_uses_scaled_signal(self):
         self.assertEqual(feedback_signal(score=1), -1.0)

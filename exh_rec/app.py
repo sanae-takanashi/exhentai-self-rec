@@ -53,6 +53,7 @@ from .recommender import (
     store_galleries,
     store_gallery_samples,
     store_visual_embedding,
+    tag_corpus_strengths,
     upsert_bootstrap_tags,
     visual_preference_model,
 )
@@ -1312,6 +1313,7 @@ def select_detail_candidates(conn, galleries, remaining_limit: int) -> list:
         return []
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    tag_strengths = tag_corpus_strengths(conn)
     candidates = []
     seen: set[str] = set()
     for order, gallery in enumerate(galleries):
@@ -1328,9 +1330,11 @@ def select_detail_candidates(conn, galleries, remaining_limit: int) -> list:
                 "uploader": gallery.uploader,
                 "rating": gallery.rating,
                 "tags": gallery.tags,
+                "tag_weights": gallery.tag_weights,
             },
             bootstrap,
             weights,
+            tag_strengths=tag_strengths,
         )
         candidates.append((score, order, gallery))
     candidates.sort(key=lambda item: (-item[0], item[1]))

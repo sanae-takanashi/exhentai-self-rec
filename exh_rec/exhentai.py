@@ -24,6 +24,13 @@ TAG_ATTR_RE = re.compile(
     r"\b(?:title|id)=[\"'](?:ta_)?((?:artist|character|cosplayer|female|group|language|male|mixed|other|parody|reclass):[^\"']+)[\"']",
     re.I,
 )
+TAG_OPEN_RE = re.compile(r"<[a-z0-9]+\b(?P<attrs>[^>]*)>", re.I)
+CLASS_ATTR_RE = re.compile(r"\bclass=[\"']([^\"']+)[\"']", re.I)
+TAG_POWER_CLASS_STRENGTHS = {
+    "gt": 1.15,  # solid border: high cumulative tag power
+    "gtl": 0.9,  # dashed/light tag
+    "gtw": 0.55,  # dotted/weak tag
+}
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
 IMG_ATTR_RE = re.compile(r"\b(data-src|src)=[\"']([^\"']+)[\"']", re.I)
 CSS_URL_RE = re.compile(r"url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)", re.I)
@@ -72,6 +79,7 @@ class Gallery:
     thumb_url: str | None = None
     rating: float | None = None
     tags: list[str] = field(default_factory=list)
+    tag_weights: dict[str, float] = field(default_factory=dict)
     source_query: str | None = None
     page_count: int | None = None
     # Each entry is either a plain URL string (individual/"Large" previews) or a
@@ -640,6 +648,7 @@ def parse_gallery_list(page_html: str, source_query: str | None = None) -> list[
         block = nearby_gallery_block(page_html, match.start(), match.end())
         title = titles_by_url.get(url) or extract_title_from_block(block) or f"Gallery {gid}"
         tags = extract_tags(block)
+        tag_weights = extract_tag_weights(block)
         rating_match = RATING_RE.search(html.unescape(block))
         rating = float(rating_match.group(1)) if rating_match else None
         galleries[url] = Gallery(
@@ -652,6 +661,7 @@ def parse_gallery_list(page_html: str, source_query: str | None = None) -> list[
             thumb_url=extract_thumb(block),
             rating=rating,
             tags=tags,
+            tag_weights=tag_weights,
             source_query=source_query,
         )
 
@@ -672,6 +682,8 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
         # Fall back to the first individual preview; a sprite frame is not a usable
         # standalone cover, so skip those (the gdata API supplies covers instead).
         thumb_url = next((entry for entry in sample_thumbs if isinstance(entry, str)), None)
+    tags = extract_tags(page_html)
+    tag_weights = extract_tag_weights(page_html)
     return Gallery(
         url=gallery_url,
         gid=gid,
@@ -682,7 +694,8 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
         posted_at=strip_html_match(DETAIL_POSTED_RE.search(page_html)),
         thumb_url=thumb_url,
         rating=rating,
-        tags=extract_tags(page_html),
+        tags=tags,
+        tag_weights=tag_weights,
         page_count=page_count,
         sample_thumbs=sample_thumbs,
     )
@@ -693,6 +706,8 @@ def merge_gallery(base: Gallery, detail: Gallery) -> Gallery:
     for tag in detail.tags:
         if tag not in tags:
             tags.append(tag)
+    tag_weights = dict(base.tag_weights)
+    tag_weights.update(detail.tag_weights)
     return Gallery(
         url=base.url,
         gid=base.gid or detail.gid,
@@ -704,6 +719,7 @@ def merge_gallery(base: Gallery, detail: Gallery) -> Gallery:
         thumb_url=detail.thumb_url or base.thumb_url,
         rating=detail.rating if detail.rating is not None else base.rating,
         tags=tags,
+        tag_weights=tag_weights,
         source_query=base.source_query,
         page_count=detail.page_count if detail.page_count is not None else base.page_count,
         sample_thumbs=detail.sample_thumbs or base.sample_thumbs,
@@ -750,6 +766,42 @@ def extract_tags(block: str) -> list[str]:
         if tag and tag not in tags:
             tags.append(tag)
     return tags
+
+
+def extract_tag_weights(block: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for match in TAG_OPEN_RE.finditer(block):
+        attrs = match.group("attrs") or ""
+        strength = tag_power_strength(attrs)
+        if strength is None:
+            continue
+        nearby = block[match.end() : min(len(block), match.end() + 500)]
+        tag = first_tag_in_html(f"{attrs} {nearby}")
+        if not tag:
+            continue
+        weights[tag] = max(weights.get(tag, 0.0), strength)
+    return weights
+
+
+def tag_power_strength(attrs: str) -> float | None:
+    class_match = CLASS_ATTR_RE.search(attrs)
+    if not class_match:
+        return None
+    classes = set(class_match.group(1).lower().split())
+    for class_name in ("gt", "gtl", "gtw"):
+        if class_name in classes:
+            return TAG_POWER_CLASS_STRENGTHS[class_name]
+    return None
+
+
+def first_tag_in_html(value: str) -> str | None:
+    attr_match = TAG_ATTR_RE.search(value)
+    if attr_match:
+        return normalize_tag(attr_match.group(1))
+    link_match = TAG_RE.search(value)
+    if link_match:
+        return normalize_tag(next(group for group in link_match.groups() if group))
+    return None
 
 
 def normalize_tag(raw: str) -> str:

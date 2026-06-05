@@ -165,6 +165,7 @@ class ParserTest(unittest.TestCase):
           <div id="taglist">
             <div class="gt" title="artist:taglist_artist">taglist artist</div>
             <div class="gtl" id="ta_female:big_breasts">big breasts</div>
+            <div class="gtw" id="ta_female:weak_tag">weak tag</div>
             <div class="gt" title="parody:space%20title">space title</div>
           </div>
         </html>
@@ -174,7 +175,10 @@ class ParserTest(unittest.TestCase):
 
         self.assertIn("artist:taglist artist", gallery.tags)
         self.assertIn("female:big breasts", gallery.tags)
+        self.assertIn("female:weak tag", gallery.tags)
         self.assertIn("parody:space title", gallery.tags)
+        self.assertGreater(gallery.tag_weights["artist:taglist artist"], gallery.tag_weights["female:big breasts"])
+        self.assertGreater(gallery.tag_weights["female:big breasts"], gallery.tag_weights["female:weak tag"])
 
     def test_parse_gallery_pages_reads_length_and_thumbnails(self):
         html = """

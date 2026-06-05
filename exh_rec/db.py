@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS galleries (
     thumb_url TEXT,
     rating REAL,
     tags_json TEXT NOT NULL DEFAULT '[]',
+    tag_weights_json TEXT NOT NULL DEFAULT '{}',
     source_query TEXT,
     detail_fetched_at TEXT,
     page_count INTEGER,
@@ -104,6 +105,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         ensure_column(conn, "feedback", "score", "INTEGER")
         ensure_column(conn, "galleries", "detail_fetched_at", "TEXT")
+        ensure_column(conn, "galleries", "tag_weights_json", "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(conn, "galleries", "page_count", "INTEGER")
         ensure_column(conn, "galleries", "samples_json", "TEXT NOT NULL DEFAULT '[]'")
         ensure_column(conn, "galleries", "samples_fetched_at", "TEXT")
@@ -162,4 +164,10 @@ def row_to_dict(row: sqlite3.Row) -> dict:
             data["samples"] = json.loads(data.pop("samples_json") or "[]")
         except json.JSONDecodeError:
             data["samples"] = []
+    if "tag_weights_json" in data:
+        try:
+            parsed = json.loads(data.pop("tag_weights_json") or "{}")
+            data["tag_weights"] = parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            data["tag_weights"] = {}
     return data
