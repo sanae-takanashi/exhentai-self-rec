@@ -13,6 +13,7 @@ from exh_rec.recommender import (
     feature_learning_multiplier,
     feedback_signal,
     get_bootstrap_tags,
+    gallery_feature_values,
     import_preferences,
     learned_query_tags,
     model_snapshot,
@@ -28,6 +29,7 @@ from exh_rec.recommender import (
     store_gallery_samples,
     store_visual_embedding,
     store_galleries,
+    tag_position_strength,
     upsert_bootstrap_tags,
     visual_preference_model,
 )
@@ -177,6 +179,51 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn("category:manga", text)
         self.assertIn("uploader:trusteduploader", text)
         self.assertIn("artist:name", text)
+
+    def test_tag_feature_strength_uses_order_within_namespace(self):
+        features = dict(
+            gallery_feature_values(
+                {
+                    "title": "Tagged",
+                    "tags": ["male:first", "female:bondage", "female:gloves", "male:second", "female:stockings"],
+                }
+            )
+        )
+
+        self.assertEqual(features["tag:male:first"], 1.0)
+        self.assertEqual(features["tag:female:bondage"], 1.0)
+        self.assertEqual(features["tag:male:second"], tag_position_strength(1))
+        self.assertEqual(features["tag:female:gloves"], tag_position_strength(1))
+        self.assertEqual(features["tag:female:stockings"], tag_position_strength(2))
+
+    def test_tag_order_affects_learned_training_and_scoring(self):
+        liked_url = "https://exhentai.org/g/3o/c/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=liked_url,
+                    gid="3o",
+                    token="c",
+                    title="Ordered Tags",
+                    tags=["male:first", "female:other", "female:bondage"],
+                )
+            ],
+        )
+
+        record_feedback(self.conn, liked_url, vote=1)
+        row = self.conn.execute(
+            "SELECT weight FROM feature_weights WHERE feature = ?",
+            ("tag:female:bondage",),
+        ).fetchone()
+        expected = LEARNING_RATE * feature_learning_multiplier("tag:female:bondage") * tag_position_strength(1)
+        self.assertAlmostEqual(row["weight"], expected)
+
+        weights = {"tag:female:bondage": 1.0}
+        high_score, _ = score_gallery({"title": "High", "tags": ["male:first", "female:bondage"]}, {}, weights)
+        low_score, _ = score_gallery({"title": "Low", "tags": ["female:other", "female:bondage"]}, {}, weights)
+
+        self.assertGreater(high_score, low_score)
 
     def test_score_feedback_uses_scaled_signal(self):
         self.assertEqual(feedback_signal(score=1), -1.0)

@@ -26,6 +26,8 @@ VISUAL_VERSION_PRIORITY = (DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION)
 VISUAL_SCORE_SCALE = 1.35
 VISUAL_MIN_DIMS = 16
 VISUAL_MAX_DIMS = 2048
+TAG_POSITION_DECAY = 0.12
+MIN_TAG_POSITION_STRENGTH = 0.35
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -284,22 +286,47 @@ def parse_visual_embedding(raw: object) -> list[float] | None:
 
 
 def gallery_features(gallery: dict) -> list[str]:
-    features: list[str] = []
+    return [feature for feature, _strength in gallery_feature_values(gallery)]
+
+
+def gallery_feature_values(gallery: dict) -> list[tuple[str, float]]:
+    features: dict[str, float] = {}
+
+    def add_feature(feature: str, strength: float = 1.0) -> None:
+        feature = feature.strip().lower()
+        if not feature:
+            return
+        features[feature] = max(features.get(feature, 0.0), strength)
+
     category = (gallery.get("category") or "").strip().lower()
     if category:
-        features.append(f"category:{category}")
+        add_feature(f"category:{category}")
     uploader = (gallery.get("uploader") or "").strip().lower()
     if uploader:
-        features.append(f"uploader:{uploader}")
+        add_feature(f"uploader:{uploader}")
+    namespace_positions: dict[str, int] = {}
     for tag in gallery.get("tags") or []:
         norm = str(tag).strip().lower()
-        if norm:
-            features.append(f"tag:{norm}")
+        if not norm:
+            continue
+        namespace = tag_namespace(norm)
+        position = namespace_positions.get(namespace, 0)
+        namespace_positions[namespace] = position + 1
+        add_feature(f"tag:{norm}", tag_position_strength(position))
     for token in TOKEN_RE.findall(gallery.get("title") or ""):
         token = token.lower().strip("_:+.-")
         if len(token) >= 3 and not token.isdigit():
-            features.append(f"title:{token}")
-    return sorted(set(features))
+            add_feature(f"title:{token}")
+    return sorted(features.items())
+
+
+def tag_namespace(tag: str) -> str:
+    return tag.split(":", 1)[0] if ":" in tag else ""
+
+
+def tag_position_strength(position: int) -> float:
+    position = max(0, int(position))
+    return max(MIN_TAG_POSITION_STRENGTH, 1.0 / (1.0 + position * TAG_POSITION_DECAY))
 
 
 def record_feedback(
@@ -678,8 +705,8 @@ def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id:
 def apply_feedback_features(conn: sqlite3.Connection, gallery: dict, signal: float) -> None:
     if signal == 0:
         return
-    for feature in gallery_features(gallery):
-        weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature)
+    for feature, strength in gallery_feature_values(gallery):
+        weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature) * strength
         conn.execute(
             """
             INSERT INTO feature_weights(feature, weight, positive_count, negative_count, updated_at)
@@ -1098,11 +1125,12 @@ def score_gallery(
             reasons.append(f"bootstrap {tag} {weight:+g}")
 
     feature_hits = []
-    for feature in gallery_features(gallery):
+    for feature, strength in gallery_feature_values(gallery):
         weight = weights.get(feature, 0.0)
         if weight:
-            score += weight
-            feature_hits.append((feature, weight))
+            adjusted_weight = weight * strength
+            score += adjusted_weight
+            feature_hits.append((feature, adjusted_weight))
 
     feature_hits.sort(key=lambda item: abs(item[1]), reverse=True)
     for feature, weight in feature_hits[:3]:
