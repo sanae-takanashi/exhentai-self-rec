@@ -761,14 +761,33 @@ function renderGalleryCards(items, append = false) {
 }
 
 function feedbackStatusMessage(base, payload) {
+  const update = payload.feedback_update || {};
+  const details = [];
+  if (update.latest_feedback_id) {
+    details.push(`feedback #${update.latest_feedback_id}`);
+  }
+  if (update.retrained) {
+    details.push(update.model_changed ? "model changed" : "model retrained no weight change");
+  }
+  if (Number.isFinite(update.elapsed_ms)) {
+    details.push(`update ${update.elapsed_ms}ms`);
+  }
+  if (Number.isFinite(update.feedback_events_after)) {
+    details.push(`events ${update.feedback_events_before || 0}->${update.feedback_events_after}`);
+  }
+  if (Number.isFinite(update.model_features_after)) {
+    details.push(`features ${update.model_features_before || 0}->${update.model_features_after}`);
+  }
+  if (Number.isFinite(update.visual_rated_after)) {
+    details.push(`visual rated ${update.visual_rated_before || 0}->${update.visual_rated_after}`);
+  }
   const enrichment = payload.feedback_enrichment || {};
   if (enrichment.status === "success") {
-    return `${base}; full metadata learned`;
+    details.push("full metadata learned");
+  } else if (enrichment.status === "failed") {
+    details.push("detail fetch failed");
   }
-  if (enrichment.status === "failed") {
-    return `${base}; detail fetch failed`;
-  }
-  return base;
+  return details.length ? `${base}; ${details.join("; ")}` : base;
 }
 
 async function withPendingFeedback(galleryUrl, action) {

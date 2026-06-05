@@ -35,6 +35,7 @@ from .recommender import (
     clear_feedback,
     export_preferences,
     feedback_history,
+    feedback_signal,
     get_bootstrap_tags,
     import_preferences,
     learned_query_tags,
@@ -53,6 +54,7 @@ from .recommender import (
     store_gallery_samples,
     store_visual_embedding,
     upsert_bootstrap_tags,
+    visual_preference_model,
 )
 from .visual import (
     DEFAULT_VISUAL_ENCODER,
@@ -223,7 +225,26 @@ class Handler(BaseHTTPRequestHandler):
                 vote, score = parse_feedback_request(payload)
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
+                    before_model = model_snapshot(conn)
+                    before_signature = model_signature(conn)
+                    update_started = time.perf_counter()
+                    log_feedback_received("record", gallery_url, vote=vote, score=score)
                     record_feedback(conn, gallery_url, vote=vote, score=score, note=payload.get("note"))
+                    elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
+                    after_model = model_snapshot(conn)
+                    feedback_update = feedback_update_summary(
+                        conn,
+                        action="record",
+                        gallery_url=gallery_url,
+                        vote=vote,
+                        score=score,
+                        before_model=before_model,
+                        before_signature=before_signature,
+                        after_model=after_model,
+                        after_signature=model_signature(conn),
+                        elapsed_ms=elapsed_ms,
+                    )
+                    log_feedback_update(feedback_update)
                 feedback_enrichment = enrich_feedback_gallery(gallery_url)
                 with db.connect() as conn:
                     page = recommendation_payload(
@@ -232,7 +253,7 @@ class Handler(BaseHTTPRequestHandler):
                         include_rated=parse_bool(payload.get("include_rated")),
                         filter_text=payload.get("filter_text"),
                     )
-                self.send_json({"ok": True, "feedback_enrichment": feedback_enrichment, **page})
+                self.send_json({"ok": True, "feedback_update": feedback_update, "feedback_enrichment": feedback_enrichment, **page})
             elif path == "/api/feedback/clear":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -240,14 +261,34 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
+                    before_model = model_snapshot(conn)
+                    before_signature = model_signature(conn)
+                    update_started = time.perf_counter()
+                    log_feedback_received("clear", gallery_url)
                     removed = clear_feedback(conn, gallery_url)
+                    elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
+                    after_model = model_snapshot(conn)
+                    feedback_update = feedback_update_summary(
+                        conn,
+                        action="clear",
+                        gallery_url=gallery_url,
+                        vote=None,
+                        score=None,
+                        before_model=before_model,
+                        before_signature=before_signature,
+                        after_model=after_model,
+                        after_signature=model_signature(conn),
+                        removed=removed,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    log_feedback_update(feedback_update)
                     page = recommendation_payload(
                         conn,
                         limit=40,
                         include_rated=parse_bool(payload.get("include_rated")),
                         filter_text=payload.get("filter_text"),
                     )
-                self.send_json({"ok": True, "removed": removed, **page})
+                self.send_json({"ok": True, "removed": removed, "feedback_update": feedback_update, **page})
             elif path == "/api/retrain":
                 payload = self.read_json()
                 with db.connect() as conn:
@@ -654,6 +695,108 @@ def visual_settings(encoder: str | None = None, device: str | None = None) -> di
         "fallback_version": SIMPLE_VISUAL_VERSION,
         "dinov2": dinov2_dependency_status(device),
     }
+
+
+def model_signature(conn) -> dict:
+    feature_rows = [
+        (
+            str(row["feature"]),
+            round(float(row["weight"]), 8),
+            int(row["positive_count"]),
+            int(row["negative_count"]),
+        )
+        for row in conn.execute(
+            """
+            SELECT feature, weight, positive_count, negative_count
+            FROM feature_weights
+            ORDER BY feature
+            """
+        )
+    ]
+    visual_model = visual_preference_model(conn)
+    visual_signature = None
+    if visual_model:
+        visual_signature = {
+            "version": visual_model.get("version"),
+            "positive_count": visual_model.get("positive_count"),
+            "negative_count": visual_model.get("negative_count"),
+            "total_weight": round(float(visual_model.get("total_weight") or 0), 8),
+            "vector_head": [round(float(value), 6) for value in (visual_model.get("vector") or [])[:12]],
+        }
+    return {"features": feature_rows, "visual": visual_signature}
+
+
+def feedback_update_summary(
+    conn,
+    action: str,
+    gallery_url: str,
+    vote: int | None,
+    score: int | None,
+    before_model: dict,
+    before_signature: dict,
+    after_model: dict,
+    after_signature: dict,
+    removed: int | None = None,
+    elapsed_ms: float | None = None,
+) -> dict:
+    latest = feedback_history(conn, gallery_url, limit=1)
+    signal = feedback_signal(vote=vote, score=score) if action == "record" else None
+    before_counts = before_model.get("counts", {})
+    after_counts = after_model.get("counts", {})
+    before_visual = before_model.get("visual", {})
+    after_visual = after_model.get("visual", {})
+    return {
+        "action": action,
+        "gallery_url": gallery_url,
+        "vote": vote,
+        "score": score,
+        "signal": signal,
+        "removed": removed,
+        "latest_feedback_id": latest[0]["id"] if latest else None,
+        "feedback_events_before": before_counts.get("feedback_events", 0),
+        "feedback_events_after": after_counts.get("feedback_events", 0),
+        "rated_galleries_before": before_counts.get("rated_galleries", 0),
+        "rated_galleries_after": after_counts.get("rated_galleries", 0),
+        "model_features_before": before_counts.get("model_features", 0),
+        "model_features_after": after_counts.get("model_features", 0),
+        "visual_ready_before": bool(before_visual.get("ready")),
+        "visual_ready_after": bool(after_visual.get("ready")),
+        "visual_rated_before": before_visual.get("rated_embedded_galleries", 0),
+        "visual_rated_after": after_visual.get("rated_embedded_galleries", 0),
+        "model_changed": before_signature != after_signature,
+        "retrained": True,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def log_feedback_received(action: str, gallery_url: str, vote: int | None = None, score: int | None = None) -> None:
+    print(
+        "[feedback] "
+        f"received action={action} "
+        f"url={gallery_url} "
+        f"vote={vote} "
+        f"score={score}",
+        flush=True,
+    )
+
+
+def log_feedback_update(summary: dict) -> None:
+    print(
+        "[feedback] "
+        f"action={summary.get('action')} "
+        f"url={summary.get('gallery_url')} "
+        f"vote={summary.get('vote')} "
+        f"score={summary.get('score')} "
+        f"signal={summary.get('signal')} "
+        f"events={summary.get('feedback_events_before')}->{summary.get('feedback_events_after')} "
+        f"rated={summary.get('rated_galleries_before')}->{summary.get('rated_galleries_after')} "
+        f"features={summary.get('model_features_before')}->{summary.get('model_features_after')} "
+        f"visual_ready={summary.get('visual_ready_before')}->{summary.get('visual_ready_after')} "
+        f"visual_rated={summary.get('visual_rated_before')}->{summary.get('visual_rated_after')} "
+        f"model_changed={summary.get('model_changed')} "
+        f"elapsed_ms={summary.get('elapsed_ms')}",
+        flush=True,
+    )
 
 
 def reset_library_payload() -> dict:

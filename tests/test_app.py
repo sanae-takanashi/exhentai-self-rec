@@ -34,6 +34,7 @@ from exh_rec.app import (
     SpriteCropUnavailable,
     fetch_and_store,
     feedback_history_payload,
+    feedback_update_summary,
     finish_interrupted_fetch_runs,
     fetch_runs,
     format_generated_query,
@@ -43,6 +44,8 @@ from exh_rec.app import (
     is_allowed_thumbnail_url,
     is_remote_search_preference,
     missing_common_cookie_keys,
+    model_snapshot,
+    model_signature,
     network_proxy,
     parse_bool,
     parse_feedback_request,
@@ -687,6 +690,40 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual(payload["latest"]["score"], 4)
         self.assertEqual(payload["latest"]["vote"], 0.5)
+        conn.close()
+
+    def test_feedback_update_summary_reports_retrain_effects(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery_url = "https://exhentai.org/g/10u/a/"
+        store_galleries(conn, [Gallery(url=gallery_url, gid="10u", token="a", title="Feedback Update", tags=["artist:update"])])
+        before_model = model_snapshot(conn)
+        before_signature = model_signature(conn)
+
+        record_feedback(conn, gallery_url, vote=1)
+        after_model = model_snapshot(conn)
+        summary = feedback_update_summary(
+            conn,
+            action="record",
+            gallery_url=gallery_url,
+            vote=1,
+            score=None,
+            before_model=before_model,
+            before_signature=before_signature,
+            after_model=after_model,
+            after_signature=model_signature(conn),
+            elapsed_ms=12.34,
+        )
+
+        self.assertTrue(summary["retrained"])
+        self.assertTrue(summary["model_changed"])
+        self.assertEqual(summary["elapsed_ms"], 12.34)
+        self.assertEqual(summary["signal"], 1.0)
+        self.assertEqual(summary["feedback_events_before"], 0)
+        self.assertEqual(summary["feedback_events_after"], 1)
+        self.assertEqual(summary["rated_galleries_after"], 1)
+        self.assertIsNotNone(summary["latest_feedback_id"])
         conn.close()
 
     def test_reaction_history_payload_returns_reacted_gallery_cards(self):
