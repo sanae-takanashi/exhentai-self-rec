@@ -122,6 +122,7 @@ def init_db() -> None:
             "recommend_candidate_limit": "2000",
             "recommend_language_filter": "japanese,chinese",
             "recommend_model_mode": "hybrid",
+            "review_require_bootstrap_match": "1",
             "sample_extra_pages": "2",
         }
         for key, value in defaults.items():

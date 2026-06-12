@@ -846,6 +846,35 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn(unknown_url, urls)
         self.assertNotIn(english_url, urls)
 
+    def test_recommend_can_require_positive_bootstrap_match(self):
+        matched_url = "https://exhentai.org/g/8m/b/"
+        source_only_url = "https://exhentai.org/g/8s/b/"
+        learned_only_url = "https://exhentai.org/g/8l/b/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=matched_url, gid="8m", token="b", title="Matched Item", tags=["female:seed"]),
+                Gallery(url=source_only_url, gid="8s", token="b", title="Source Only", source_query="female:seed"),
+                Gallery(url=learned_only_url, gid="8l", token="b", title="Learned Only", tags=["artist:liked"]),
+            ],
+        )
+        upsert_bootstrap_tags(self.conn, [("female:seed", 1.0)])
+        record_feedback(self.conn, learned_only_url, vote=1)
+
+        unfiltered_urls = [item["url"] for item in recommend_page(self.conn, include_rated=True)["items"]]
+        filtered_urls = [
+            item["url"]
+            for item in recommend_page(
+                self.conn,
+                include_rated=True,
+                require_bootstrap_match=True,
+            )["items"]
+        ]
+
+        self.assertIn(source_only_url, unfiltered_urls)
+        self.assertIn(learned_only_url, unfiltered_urls)
+        self.assertEqual(filtered_urls, [matched_url])
+
     def test_neutral_score_counts_as_rated_without_learning_weight(self):
         neutral_url = "https://exhentai.org/g/9/c/"
         store_galleries(

@@ -835,6 +835,7 @@ def recommend(
     explore_seed: str | None = None,
     language_filter: list[str] | str | None = None,
     model_mode: str = MODEL_MODE_HYBRID,
+    require_bootstrap_match: bool = False,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -848,6 +849,7 @@ def recommend(
         explore_seed=explore_seed,
         language_filter=language_filter,
         model_mode=model_mode,
+        require_bootstrap_match=require_bootstrap_match,
     )["items"]
 
 
@@ -863,6 +865,7 @@ def recommend_page(
     explore_seed: str | None = None,
     language_filter: list[str] | str | None = None,
     model_mode: str = MODEL_MODE_HYBRID,
+    require_bootstrap_match: bool = False,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -875,6 +878,7 @@ def recommend_page(
     model_mode = normalize_model_mode(model_mode)
     if model_mode == MODEL_MODE_VISUAL:
         bootstrap_explore_count = 0
+        require_bootstrap_match = False
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -920,6 +924,8 @@ def recommend_page(
             continue
         if not gallery_matches_language_filter(gallery, language_filter_values):
             continue
+        if require_bootstrap_match and not gallery_matches_positive_bootstrap(gallery, bootstrap):
+            continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
         if model_mode != MODEL_MODE_VISUAL:
@@ -963,6 +969,7 @@ def recommend_page(
         "has_more": next_offset < len(scored),
         "candidate_limit": candidate_limit,
         "bootstrap_explore_count": bootstrap_explore_count,
+        "require_bootstrap_match": bool(require_bootstrap_match),
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
     }
@@ -1002,6 +1009,15 @@ def gallery_matches_language_filter(gallery: dict, languages: set[str]) -> bool:
     if not gallery_languages:
         return True
     return bool(gallery_languages & languages)
+
+
+def gallery_matches_positive_bootstrap(gallery: dict, bootstrap: dict[str, float]) -> bool:
+    positive_bootstrap = {tag: weight for tag, weight in bootstrap.items() if float(weight) > 0}
+    if not positive_bootstrap:
+        return False
+    searchable = bootstrap_search_text(gallery)
+    exact_values = bootstrap_exact_values(gallery)
+    return any(bootstrap_matches(tag, searchable, exact_values) for tag in positive_bootstrap)
 
 
 def mix_bootstrap_exploration(

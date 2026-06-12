@@ -11,6 +11,7 @@ const minutesEl = document.querySelector("#minutes");
 const networkProxyEl = document.querySelector("#networkProxy");
 const languageFilterEl = document.querySelector("#languageFilter");
 const modelModeEl = document.querySelector("#modelMode");
+const reviewRequireBootstrapMatchEl = document.querySelector("#reviewRequireBootstrapMatch");
 const visualEncoderEl = document.querySelector("#visualEncoder");
 const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
@@ -286,6 +287,7 @@ async function loadSettings() {
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
   modelModeEl.value = settings.recommend_model_mode || "hybrid";
+  reviewRequireBootstrapMatchEl.checked = settings.review_require_bootstrap_match !== false;
   visualEncoderEl.value = settings.visual_encoder || visualDefaultEncoder;
   dinov2DeviceEl.value = settings.dinov2_device || "auto";
   autoRefreshEl.checked = settings.auto_refresh;
@@ -320,6 +322,7 @@ async function saveSettings() {
     network_proxy: networkProxyEl.value.trim(),
     recommend_language_filter: languageFilterEl.value.trim(),
     recommend_model_mode: modelModeEl.value,
+    review_require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
     visual_encoder: visualEncoderEl.value,
     dinov2_device: dinov2DeviceEl.value.trim(),
     auto_refresh: autoRefreshEl.checked,
@@ -406,13 +409,14 @@ async function loadRecommendations(offset = 0, append = false) {
   const includeRated = currentView === "preview" ? "1" : "0";
   const freshnessWeight = currentView === "preview" ? "4" : "1";
   const bootstrapExploreCount = currentView === "review" ? "6" : "0";
+  const requireBootstrapMatch = currentView === "review" && reviewRequireBootstrapMatchEl.checked ? "1" : "0";
   const languageFilter = languageFilterEl.value.trim();
   const modelMode = modelModeEl.value || "hybrid";
   if (currentView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -533,6 +537,7 @@ async function vote(galleryUrl, voteValue) {
         gallery_url: galleryUrl,
         vote: voteValue,
         include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
     });
@@ -550,6 +555,7 @@ async function score(galleryUrl, scoreValue) {
         gallery_url: galleryUrl,
         score: scoreValue,
         include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
     });
@@ -567,6 +573,7 @@ async function skip(galleryUrl) {
         gallery_url: galleryUrl,
         score: 3,
         include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
     });
@@ -583,6 +590,7 @@ async function clearRating(galleryUrl) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
     });
@@ -903,6 +911,9 @@ function renderStatus(payload) {
   }
   if (payload.settings && payload.settings.recommend_model_mode) {
     rows.push(["Model", payload.settings.recommend_model_mode]);
+  }
+  if (payload.settings && typeof payload.settings.review_require_bootstrap_match === "boolean") {
+    rows.push(["Review", payload.settings.review_require_bootstrap_match ? "Bootstrap match required" : "Any model match"]);
   }
   if (payload.visual) {
     rows.push(["Visual", `${payload.visual.default_encoder || "simple"} (${payload.visual.default_version || "unknown"})`]);

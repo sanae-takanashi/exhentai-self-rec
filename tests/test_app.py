@@ -25,6 +25,7 @@ from exh_rec.app import (
     configured_dinov2_device,
     configured_language_filter,
     configured_model_mode,
+    configured_review_require_bootstrap_match,
     configured_visual_encoder,
     enrich_feedback_gallery,
     enrich_recommendations,
@@ -1399,6 +1400,7 @@ class AppTest(unittest.TestCase):
                         "network_proxy": "127.0.0.1:7890",
                         "recommend_language_filter": "language:japanese, Chinese",
                         "recommend_model_mode": "visual",
+                        "review_require_bootstrap_match": False,
                         "visual_encoder": "simple",
                         "dinov2_device": "CUDA:0",
                     }
@@ -1408,12 +1410,14 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(network_proxy(conn), "http://127.0.0.1:7890")
                     self.assertEqual(configured_language_filter(conn), "chinese,japanese")
                     self.assertEqual(configured_model_mode(conn), "visual")
+                    self.assertFalse(configured_review_require_bootstrap_match(conn))
                     self.assertEqual(configured_visual_encoder(conn), "simple")
                     self.assertEqual(configured_dinov2_device(conn), "cuda:0")
                 settings = get_settings()
                 self.assertEqual(settings["network_proxy_preview"], "http://127.0.0.1:7890")
                 self.assertEqual(settings["recommend_language_filter"], "chinese,japanese")
                 self.assertEqual(settings["recommend_model_mode"], "visual")
+                self.assertFalse(settings["review_require_bootstrap_match"])
                 self.assertEqual(settings["visual_encoder"], "simple")
                 self.assertEqual(settings["visual"]["default_encoder"], "simple")
                 self.assertEqual(settings["dinov2_device"], "cuda:0")
