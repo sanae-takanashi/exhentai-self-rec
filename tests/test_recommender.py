@@ -645,6 +645,7 @@ class RecommenderTest(unittest.TestCase):
                 gid=f"explore-{idx}",
                 token="e",
                 title=f"Bootstrap Seed {idx}",
+                tags=["female:seed"],
                 source_query="female:seed",
             )
             for idx in range(10)
@@ -666,6 +667,64 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(len(explored_items), 3)
         self.assertTrue(all(item["reasons"][0] == "bootstrap explore" for item in explored_items))
         self.assertEqual(explored["bootstrap_explore_count"], 3)
+
+    def test_bootstrap_exploration_skips_source_only_or_negative_items(self):
+        strong = [
+            Gallery(
+                url=f"https://exhentai.org/g/strong-source-{idx}/e/",
+                gid=f"strong-source-{idx}",
+                token="e",
+                title=f"Strong Source Match {idx}",
+                tags=["artist:strongsource"],
+            )
+            for idx in range(12)
+        ]
+        source_only = Gallery(
+            url="https://exhentai.org/g/source-only/e/",
+            gid="source-only",
+            token="e",
+            title="Source Only",
+            source_query="female:seed",
+        )
+        negative = Gallery(
+            url="https://exhentai.org/g/negative-seed/e/",
+            gid="negative-seed",
+            token="e",
+            title="Negative Seed",
+            tags=["female:seed", "artist:avoid"],
+            source_query="female:seed",
+        )
+        relevant = Gallery(
+            url="https://exhentai.org/g/relevant-seed/e/",
+            gid="relevant-seed",
+            token="e",
+            title="Relevant Seed",
+            tags=["female:seed"],
+            source_query="female:seed",
+        )
+        disliked = Gallery(
+            url="https://exhentai.org/g/disliked-seed/e/",
+            gid="disliked-seed",
+            token="e",
+            title="Disliked Seed",
+            tags=["artist:avoid"],
+        )
+        store_galleries(self.conn, [*strong, source_only, negative, relevant, disliked])
+        upsert_bootstrap_tags(self.conn, [("artist:strongsource", 2.0), ("female:seed", 1.0)])
+        record_feedback(self.conn, disliked.url, vote=-1)
+
+        explored = recommend_page(
+            self.conn,
+            limit=10,
+            candidate_limit=100,
+            bootstrap_explore_count=3,
+            explore_seed="fixed-source-only-seed",
+        )
+        explored_urls = [item["url"] for item in explored["items"]]
+
+        self.assertIn(relevant.url, explored_urls)
+        self.assertNotIn(source_only.url, explored_urls)
+        self.assertNotIn(negative.url, explored_urls)
 
     def test_latest_feedback_retrain_replaces_old_signal(self):
         gallery_url = "https://exhentai.org/g/6/f/"

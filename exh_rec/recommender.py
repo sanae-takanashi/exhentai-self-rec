@@ -29,6 +29,7 @@ VISUAL_MAX_DIMS = 2048
 MIN_CORPUS_TAG_STRENGTH_GALLERIES = 10
 MIN_TAG_STRENGTH = 0.55
 MAX_TAG_STRENGTH = 1.2
+MIN_BOOTSTRAP_EXPLORE_SCORE = 1.0
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -1018,6 +1019,8 @@ def mix_bootstrap_exploration(
         item
         for item in scored[keep_count:]
         if normalize_source_query(item.get("source_query")) in bootstrap_queries
+        and float(item.get("score") or 0) >= MIN_BOOTSTRAP_EXPLORE_SCORE
+        and has_bootstrap_score_reason(item)
     ]
     rng = random.Random(str(seed)) if seed else random.Random()
     rng.shuffle(pool)
@@ -1034,6 +1037,10 @@ def mix_bootstrap_exploration(
         return scored
     remainder = [item for item in scored[keep_count:] if item["url"] not in selected_urls]
     return [*protected, *selected, *remainder]
+
+
+def has_bootstrap_score_reason(item: dict) -> bool:
+    return any(str(reason).startswith("bootstrap ") for reason in item.get("reasons") or [])
 
 
 def bootstrap_source_queries(bootstrap: dict[str, float]) -> set[str]:
