@@ -494,6 +494,59 @@ class RecommenderTest(unittest.TestCase):
         self.assertGreater(weights["uploader:uploadername"], weights["category:manga"])
         self.assertGreater(weights["category:manga"], weights["title:generic"])
 
+    def test_thumb_down_only_trains_identity_negative_features(self):
+        gallery_url = "https://exhentai.org/g/5q/e/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=gallery_url,
+                    gid="5q",
+                    token="e",
+                    title="Quality Miss",
+                    uploader="WeakUploader",
+                    tags=["artist:weakartist", "female:latex", "parody:likedseries"],
+                )
+            ],
+        )
+
+        record_feedback(self.conn, gallery_url, vote=-1)
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute("SELECT feature, weight FROM feature_weights")
+        }
+
+        self.assertLess(weights["tag:artist:weakartist"], 0)
+        self.assertLess(weights["uploader:weakuploader"], 0)
+        self.assertNotIn("tag:female:latex", weights)
+        self.assertNotIn("tag:parody:likedseries", weights)
+        self.assertNotIn("title:quality", weights)
+
+    def test_low_score_trains_content_negative_features(self):
+        gallery_url = "https://exhentai.org/g/5r/e/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=gallery_url,
+                    gid="5r",
+                    token="e",
+                    title="Content Miss",
+                    tags=["artist:weakartist", "female:latex", "parody:likedseries"],
+                )
+            ],
+        )
+
+        record_feedback(self.conn, gallery_url, score=1)
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute("SELECT feature, weight FROM feature_weights")
+        }
+
+        self.assertLess(weights["tag:artist:weakartist"], 0)
+        self.assertLess(weights["tag:female:latex"], 0)
+        self.assertLess(weights["tag:parody:likedseries"], 0)
+
     def test_visual_feedback_changes_ranking_from_image_embeddings(self):
         liked_url = "https://exhentai.org/g/5v/a/"
         similar_url = "https://exhentai.org/g/5v/b/"
@@ -715,7 +768,7 @@ class RecommenderTest(unittest.TestCase):
         )
         store_galleries(self.conn, [*strong, source_only, negative, relevant, disliked])
         upsert_bootstrap_tags(self.conn, [("artist:strongsource", 2.0), ("female:seed", 1.0)])
-        record_feedback(self.conn, disliked.url, vote=-1)
+        record_feedback(self.conn, disliked.url, score=1)
 
         explored = recommend_page(
             self.conn,

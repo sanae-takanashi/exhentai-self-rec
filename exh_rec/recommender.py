@@ -32,6 +32,7 @@ MIN_CORPUS_TAG_STRENGTH_GALLERIES = 10
 MIN_TAG_STRENGTH = 0.55
 MAX_TAG_STRENGTH = 1.2
 MIN_BOOTSTRAP_EXPLORE_SCORE = 1.0
+IDENTITY_TAG_NAMESPACES = {"artist", "group", "cosplayer"}
 FEATURE_LEARNING_MULTIPLIERS = {
     "tag:artist": 1.45,
     "tag:group": 1.35,
@@ -628,7 +629,7 @@ def retrain_model(conn: sqlite3.Connection) -> None:
     tag_strengths = tag_corpus_strengths(conn)
     rows = conn.execute(
         """
-        SELECT g.*, f.id AS feedback_id, f.vote AS feedback_signal
+        SELECT g.*, f.id AS feedback_id, f.vote AS feedback_signal, f.score AS feedback_score
         FROM feedback f
         JOIN galleries g ON g.url = f.gallery_url
         JOIN (
@@ -643,10 +644,11 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         gallery = dict(row)
         signal = float(gallery.pop("feedback_signal") or 0)
         feedback_id = int(gallery.pop("feedback_id"))
+        score = gallery.pop("feedback_score")
         signal *= feedback_confidence(conn, gallery["url"], feedback_id, signal)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
-        apply_feedback_features(conn, gallery, signal, tag_strengths=tag_strengths)
+        apply_feedback_features(conn, gallery, signal, score=score, tag_strengths=tag_strengths)
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
@@ -748,11 +750,14 @@ def apply_feedback_features(
     conn: sqlite3.Connection,
     gallery: dict,
     signal: float,
+    score: int | None = None,
     tag_strengths: dict[str, float] | None = None,
 ) -> None:
     if signal == 0:
         return
     for feature, strength in gallery_feature_values(gallery, tag_strengths=tag_strengths):
+        if not feedback_updates_feature(feature, signal=signal, score=score):
+            continue
         weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature) * strength
         conn.execute(
             """
@@ -771,6 +776,20 @@ def apply_feedback_features(
                 1 if signal < 0 else 0,
             ),
         )
+
+
+def feedback_updates_feature(feature: str, signal: float, score: int | None = None) -> bool:
+    if signal >= 0 or score is not None:
+        return True
+    return is_identity_feature(feature)
+
+
+def is_identity_feature(feature: str) -> bool:
+    if feature.startswith("tag:"):
+        tag = feature[4:]
+        namespace = tag_namespace(tag)
+        return namespace in IDENTITY_TAG_NAMESPACES
+    return feature.startswith("uploader:")
 
 
 def tag_corpus_strengths(conn: sqlite3.Connection) -> dict[str, float]:
