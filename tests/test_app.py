@@ -690,7 +690,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["gallery"]["title"], "Feedback Payload")
         self.assertEqual(len(payload["items"]), 2)
         self.assertEqual(payload["latest"]["score"], 4)
-        self.assertEqual(payload["latest"]["vote"], 0.5)
+        self.assertEqual(payload["latest"]["vote"], 0.75)
         conn.close()
 
     def test_feedback_update_summary_reports_retrain_effects(self):

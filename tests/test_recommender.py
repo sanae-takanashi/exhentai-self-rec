@@ -280,9 +280,13 @@ class RecommenderTest(unittest.TestCase):
         self.assertGreater(weights["tag:female:specific"], weights["tag:female:common"])
 
     def test_score_feedback_uses_scaled_signal(self):
-        self.assertEqual(feedback_signal(score=1), -1.0)
+        self.assertEqual(feedback_signal(vote=-1), -1.0)
+        self.assertEqual(feedback_signal(vote=1), 1.0)
+        self.assertEqual(feedback_signal(score=1), -1.5)
+        self.assertEqual(feedback_signal(score=2), -0.75)
         self.assertEqual(feedback_signal(score=3), 0.0)
-        self.assertEqual(feedback_signal(score=5), 1.0)
+        self.assertEqual(feedback_signal(score=4), 0.75)
+        self.assertEqual(feedback_signal(score=5), 1.5)
 
         gallery_url = "https://exhentai.org/g/3/c/"
         store_galleries(
@@ -292,7 +296,7 @@ class RecommenderTest(unittest.TestCase):
         record_feedback(self.conn, gallery_url, score=4)
         row = self.conn.execute("SELECT vote, score FROM feedback WHERE gallery_url = ?", (gallery_url,)).fetchone()
         self.assertEqual(row["score"], 4)
-        self.assertEqual(row["vote"], 0.5)
+        self.assertEqual(row["vote"], 0.75)
 
     def test_store_galleries_marks_detail_fetch(self):
         gallery_url = "https://exhentai.org/g/4/d/"
@@ -921,7 +925,7 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual(len(history), 2)
         self.assertEqual(history[0]["score"], 2)
-        self.assertEqual(history[0]["vote"], -0.5)
+        self.assertEqual(history[0]["vote"], -0.75)
         self.assertEqual(history[1]["vote"], 1.0)
 
     def test_reaction_history_page_returns_latest_reacted_galleries(self):
@@ -1092,6 +1096,7 @@ class RecommenderTest(unittest.TestCase):
         self.assertIsNone(history[0]["score"])
         self.assertEqual(history[0]["vote"], 0.5)
         self.assertEqual(history[1]["score"], 5)
+        self.assertEqual(history[1]["vote"], 1.5)
 
     def test_import_preferences_derives_vote_from_score_only_feedback(self):
         liked_url = "https://exhentai.org/g/12f/e/"
@@ -1114,8 +1119,8 @@ class RecommenderTest(unittest.TestCase):
         disliked_history = feedback_history(self.conn, disliked_url)
 
         self.assertEqual(result["feedback"], 2)
-        self.assertEqual(liked_history[0]["vote"], 1.0)
-        self.assertEqual(disliked_history[0]["vote"], -1.0)
+        self.assertEqual(liked_history[0]["vote"], 1.5)
+        self.assertEqual(disliked_history[0]["vote"], -1.5)
         self.assertIn("artist:scoreliked", learned_query_tags(self.conn, limit=5))
         self.assertNotIn("artist:scoredisliked", learned_query_tags(self.conn, limit=5))
 

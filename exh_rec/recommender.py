@@ -15,7 +15,9 @@ from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embe
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
 LEARNING_RATE = 0.35
-MAX_FEEDBACK_SIGNAL = 1.0
+THUMB_FEEDBACK_SIGNAL = 1.0
+SCORE_FEEDBACK_MULTIPLIER = 1.5
+MAX_FEEDBACK_SIGNAL = SCORE_FEEDBACK_MULTIPLIER
 FEEDBACK_CONFIDENCE_STEP = 0.15
 MAX_FEEDBACK_CONFIDENCE_BOOST = 0.45
 MAX_FEEDBACK_CONFIDENCE_HISTORY = 5
@@ -527,9 +529,10 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         if not exists:
             continue
         score = import_feedback_score(item.get("score"))
-        vote = import_feedback_vote(item.get("vote")) if "vote" in item else None
-        if vote is None and score is not None:
+        if score is not None:
             vote = feedback_signal(score=score)
+        else:
+            vote = import_feedback_vote(item.get("vote")) if "vote" in item else None
         if vote is None:
             continue
         conn.execute(
@@ -815,12 +818,12 @@ def feature_learning_multiplier(feature: str) -> float:
 def feedback_signal(vote: float | None = None, score: int | None = None) -> float:
     if score is not None:
         bounded = max(1, min(5, int(score)))
-        return round((bounded - 3) / 2, 3)
+        return round(((bounded - 3) / 2) * SCORE_FEEDBACK_MULTIPLIER, 3)
     if vote is None:
         raise ValueError("vote or score is required")
     if vote == 0:
         return 0.0
-    return MAX_FEEDBACK_SIGNAL if vote > 0 else -MAX_FEEDBACK_SIGNAL
+    return THUMB_FEEDBACK_SIGNAL if vote > 0 else -THUMB_FEEDBACK_SIGNAL
 
 
 def recommend(
