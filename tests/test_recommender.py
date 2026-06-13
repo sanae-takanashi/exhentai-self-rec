@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 from exh_rec import db
 from exh_rec.exhentai import Gallery
@@ -297,6 +298,33 @@ class RecommenderTest(unittest.TestCase):
         row = self.conn.execute("SELECT vote, score FROM feedback WHERE gallery_url = ?", (gallery_url,)).fetchone()
         self.assertEqual(row["score"], 4)
         self.assertEqual(row["vote"], 0.75)
+
+    def test_neutral_score_on_unrated_gallery_does_not_retrain(self):
+        gallery_url = "https://exhentai.org/g/3n/a/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="3n", token="a", title="Neutral Skip", tags=["female:keep"])],
+        )
+
+        with patch("exh_rec.recommender.retrain_model") as retrain:
+            record_feedback(self.conn, gallery_url, score=3)
+
+        retrain.assert_not_called()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
+
+    def test_neutral_score_after_rating_retrains_to_clear_old_signal(self):
+        gallery_url = "https://exhentai.org/g/3p/a/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="3p", token="a", title="Neutral Clears", tags=["artist:oldsignal"])],
+        )
+
+        record_feedback(self.conn, gallery_url, vote=1)
+        self.assertGreater(self.conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
+        record_feedback(self.conn, gallery_url, score=3)
+
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
 
     def test_store_galleries_marks_detail_fetch(self):
         gallery_url = "https://exhentai.org/g/4/d/"

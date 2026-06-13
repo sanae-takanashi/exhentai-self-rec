@@ -226,6 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
                 vote, score = parse_feedback_request(payload)
+                signal = feedback_signal(vote=vote, score=score)
                 require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
@@ -236,6 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                     record_feedback(conn, gallery_url, vote=vote, score=score, note=payload.get("note"))
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
                     after_model = model_snapshot(conn)
+                    after_signature = model_signature(conn)
                     feedback_update = feedback_update_summary(
                         conn,
                         action="record",
@@ -245,11 +247,15 @@ class Handler(BaseHTTPRequestHandler):
                         before_model=before_model,
                         before_signature=before_signature,
                         after_model=after_model,
-                        after_signature=model_signature(conn),
+                        after_signature=after_signature,
+                        retrained=signal != 0 or before_signature != after_signature,
                         elapsed_ms=elapsed_ms,
                     )
                     log_feedback_update(feedback_update)
-                feedback_enrichment = enrich_feedback_gallery(gallery_url)
+                if signal == 0:
+                    feedback_enrichment = {"status": "skipped", "reason": "neutral feedback"}
+                else:
+                    feedback_enrichment = enrich_feedback_gallery(gallery_url)
                 with db.connect() as conn:
                     page = recommendation_payload(
                         conn,
@@ -748,6 +754,7 @@ def feedback_update_summary(
     after_model: dict,
     after_signature: dict,
     removed: int | None = None,
+    retrained: bool = True,
     elapsed_ms: float | None = None,
 ) -> dict:
     latest = feedback_history(conn, gallery_url, limit=1)
@@ -775,7 +782,7 @@ def feedback_update_summary(
         "visual_rated_before": before_visual.get("rated_embedded_galleries", 0),
         "visual_rated_after": after_visual.get("rated_embedded_galleries", 0),
         "model_changed": before_signature != after_signature,
-        "retrained": True,
+        "retrained": retrained,
         "elapsed_ms": elapsed_ms,
     }
 

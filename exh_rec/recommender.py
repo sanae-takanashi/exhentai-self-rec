@@ -361,12 +361,24 @@ def record_feedback(
     note: str | None = None,
     score: int | None = None,
 ) -> None:
+    previous = conn.execute(
+        """
+        SELECT vote
+        FROM feedback
+        WHERE gallery_url = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (gallery_url,),
+    ).fetchone()
+    previous_signal = float(previous["vote"] or 0) if previous else 0.0
     signal = feedback_signal(vote=vote, score=score)
     conn.execute(
         "INSERT INTO feedback(gallery_url, vote, score, note) VALUES (?, ?, ?, ?)",
         (gallery_url, signal, score, note),
     )
-    retrain_model(conn)
+    if signal != 0 or previous_signal != 0:
+        retrain_model(conn)
 
 
 def clear_feedback(conn: sqlite3.Connection, gallery_url: str) -> int:

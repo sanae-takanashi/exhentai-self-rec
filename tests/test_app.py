@@ -727,6 +727,39 @@ class AppTest(unittest.TestCase):
         self.assertIsNotNone(summary["latest_feedback_id"])
         conn.close()
 
+    def test_feedback_update_summary_can_report_no_retrain_for_neutral_skip(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery_url = "https://exhentai.org/g/10n/a/"
+        store_galleries(conn, [Gallery(url=gallery_url, gid="10n", token="a", title="Neutral Skip")])
+        before_model = model_snapshot(conn)
+        before_signature = model_signature(conn)
+
+        record_feedback(conn, gallery_url, score=3)
+        after_model = model_snapshot(conn)
+        after_signature = model_signature(conn)
+        summary = feedback_update_summary(
+            conn,
+            action="record",
+            gallery_url=gallery_url,
+            vote=None,
+            score=3,
+            before_model=before_model,
+            before_signature=before_signature,
+            after_model=after_model,
+            after_signature=after_signature,
+            retrained=False,
+            elapsed_ms=1.23,
+        )
+
+        self.assertFalse(summary["retrained"])
+        self.assertFalse(summary["model_changed"])
+        self.assertEqual(summary["signal"], 0.0)
+        self.assertEqual(summary["feedback_events_after"], 1)
+        self.assertEqual(summary["rated_galleries_after"], 1)
+        conn.close()
+
     def test_reaction_history_payload_returns_reacted_gallery_cards(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
