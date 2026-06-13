@@ -733,9 +733,9 @@ function renderGalleryCards(items, append = false) {
     const feedbackControls = mode === "preview"
       ? ""
       : `<div class="votes">
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
-          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}">Skip</button>
           <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}">Thumb down</button>
+          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}">Skip</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
         </div>
         <div class="scorebar" aria-label="Score">
           ${[1, 2, 3, 4, 5]
