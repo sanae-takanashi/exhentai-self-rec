@@ -522,7 +522,7 @@ class RecommenderTest(unittest.TestCase):
         self.assertGreater(weights["uploader:uploadername"], weights["category:manga"])
         self.assertGreater(weights["category:manga"], weights["title:generic"])
 
-    def test_thumb_down_only_trains_identity_negative_features(self):
+    def test_thumb_down_trains_identity_and_title_negative_features(self):
         gallery_url = "https://exhentai.org/g/5q/e/"
         store_galleries(
             self.conn,
@@ -546,9 +546,10 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertLess(weights["tag:artist:weakartist"], 0)
         self.assertLess(weights["uploader:weakuploader"], 0)
+        self.assertLess(weights["title:quality"], 0)
+        self.assertLess(weights["title:miss"], 0)
         self.assertNotIn("tag:female:latex", weights)
         self.assertNotIn("tag:parody:likedseries", weights)
-        self.assertNotIn("title:quality", weights)
 
     def test_low_score_trains_content_negative_features(self):
         gallery_url = "https://exhentai.org/g/5r/e/"

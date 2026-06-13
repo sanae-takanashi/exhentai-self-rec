@@ -793,7 +793,11 @@ def apply_feedback_features(
 def feedback_updates_feature(feature: str, signal: float, score: int | None = None) -> bool:
     if signal >= 0 or score is not None:
         return True
-    return is_identity_feature(feature)
+    return is_identity_feature(feature) or is_title_feature(feature)
+
+
+def is_title_feature(feature: str) -> bool:
+    return feature.startswith("title:")
 
 
 def is_identity_feature(feature: str) -> bool:
