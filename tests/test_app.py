@@ -44,12 +44,15 @@ from exh_rec.app import (
     import_preferences_payload,
     is_allowed_thumbnail_url,
     is_remote_search_preference,
+    marked_gallery_payload,
+    mark_update_summary,
     missing_common_cookie_keys,
     model_snapshot,
     model_signature,
     network_proxy,
     parse_bool,
     parse_feedback_request,
+    parse_mark_kind,
     query_float,
     query_int,
     reaction_history_payload,
@@ -71,6 +74,7 @@ from exh_rec.recommender import (
     learned_query_tags,
     parse_bootstrap_tags,
     record_feedback,
+    record_gallery_mark,
     store_galleries,
     store_gallery_samples,
     upsert_bootstrap_tags,
@@ -515,6 +519,15 @@ class AppTest(unittest.TestCase):
             self.assertEqual(ctx.exception.status.value, 400)
             self.assertEqual(ctx.exception.message, message)
 
+    def test_parse_mark_kind_validates_known_bookmark_types(self):
+        self.assertEqual(parse_mark_kind("favorite"), "favorite")
+        self.assertEqual(parse_mark_kind("ban"), "ban")
+
+        with self.assertRaises(ApiError) as ctx:
+            parse_mark_kind("other")
+        self.assertEqual(ctx.exception.status.value, 400)
+        self.assertEqual(ctx.exception.message, "kind must be favorite or ban")
+
     def test_format_generated_query(self):
         self.assertEqual(format_generated_query("artist:one"), "artist:one")
         self.assertEqual(format_generated_query("artist:two words"), 'artist:"two words"')
@@ -785,6 +798,47 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
         self.assertEqual(payload["items"][0]["user_score"], 5)
         self.assertTrue(payload["items"][0]["rated"])
+        conn.close()
+
+    def test_marked_gallery_payload_returns_bookmark_cards(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        favorite_url = "https://exhentai.org/g/10fav/a/"
+        ban_url = "https://exhentai.org/g/10ban/a/"
+        store_galleries(
+            conn,
+            [
+                Gallery(url=favorite_url, gid="10fav", token="a", title="Favorite Payload"),
+                Gallery(url=ban_url, gid="10ban", token="a", title="Ban Payload"),
+            ],
+        )
+        before_model = model_snapshot(conn)
+        before_signature = model_signature(conn)
+
+        record_gallery_mark(conn, favorite_url, "favorite")
+        record_gallery_mark(conn, ban_url, "ban")
+        after_model = model_snapshot(conn)
+        after_signature = model_signature(conn)
+        payload = marked_gallery_payload(conn, kind="favorite", limit=10)
+        summary = mark_update_summary(
+            conn,
+            action="record",
+            gallery_url=favorite_url,
+            kind="favorite",
+            before_model=before_model,
+            before_signature=before_signature,
+            after_model=after_model,
+            after_signature=after_signature,
+        )
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["url"], favorite_url)
+        self.assertEqual(payload["items"][0]["user_mark_kind"], "favorite")
+        self.assertTrue(payload["items"][0]["marked"])
+        self.assertEqual(summary["favorite_galleries_after"], 1)
+        self.assertEqual(summary["banned_galleries_after"], 1)
+        self.assertTrue(summary["model_changed"])
         conn.close()
 
     def test_ensure_gallery_exists_raises_not_found_for_missing_feedback_target(self):

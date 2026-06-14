@@ -17,7 +17,10 @@ TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
 LEARNING_RATE = 0.35
 THUMB_FEEDBACK_SIGNAL = 1.0
 SCORE_FEEDBACK_MULTIPLIER = 1.5
-MAX_FEEDBACK_SIGNAL = SCORE_FEEDBACK_MULTIPLIER
+FAVORITE_MARK_SIGNAL = 3.0
+BAN_MARK_SIGNAL = -3.0
+MARK_KINDS = {"favorite", "ban"}
+MAX_FEEDBACK_SIGNAL = FAVORITE_MARK_SIGNAL
 FEEDBACK_CONFIDENCE_STEP = 0.15
 MAX_FEEDBACK_CONFIDENCE_BOOST = 0.45
 MAX_FEEDBACK_CONFIDENCE_HISTORY = 5
@@ -387,6 +390,52 @@ def clear_feedback(conn: sqlite3.Connection, gallery_url: str) -> int:
     return cursor.rowcount
 
 
+def record_gallery_mark(conn: sqlite3.Connection, gallery_url: str, kind: str, note: str | None = None) -> None:
+    kind = normalize_mark_kind(kind)
+    existing = conn.execute("SELECT kind FROM gallery_marks WHERE gallery_url = ?", (gallery_url,)).fetchone()
+    if existing and existing["kind"] == kind:
+        conn.execute(
+            """
+            UPDATE gallery_marks
+            SET note = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE gallery_url = ?
+            """,
+            (note, gallery_url),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO gallery_marks(gallery_url, kind, note, created_at, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(gallery_url) DO UPDATE SET
+                kind = excluded.kind,
+                note = excluded.note,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (gallery_url, kind, note),
+        )
+    retrain_model(conn)
+
+
+def clear_gallery_mark(conn: sqlite3.Connection, gallery_url: str) -> int:
+    cursor = conn.execute("DELETE FROM gallery_marks WHERE gallery_url = ?", (gallery_url,))
+    if cursor.rowcount:
+        retrain_model(conn)
+    return cursor.rowcount
+
+
+def normalize_mark_kind(kind: str) -> str:
+    value = str(kind or "").strip().lower()
+    if value not in MARK_KINDS:
+        raise ValueError("mark kind must be favorite or ban")
+    return value
+
+
+def gallery_mark_signal(kind: str) -> float:
+    kind = normalize_mark_kind(kind)
+    return FAVORITE_MARK_SIGNAL if kind == "favorite" else BAN_MARK_SIGNAL
+
+
 def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     """Wipe fetched galleries, votes, learned weights, and fetch history.
 
@@ -394,7 +443,7 @@ def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     so both survive untouched.
     """
     removed: dict[str, int] = {}
-    for table in ("feedback", "feature_weights", "fetch_runs", "galleries"):
+    for table in ("gallery_marks", "feedback", "feature_weights", "fetch_runs", "galleries"):
         cursor = conn.execute(f"DELETE FROM {table}")
         removed[table] = cursor.rowcount
     return removed
@@ -428,10 +477,22 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
             """
         )
     ]
+    mark_rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT gallery_url, kind, note, created_at, updated_at
+            FROM gallery_marks
+            ORDER BY updated_at, gallery_url
+            """
+        )
+    ]
     feedback_urls = [row["gallery_url"] for row in feedback_rows]
+    marked_urls = [row["gallery_url"] for row in mark_rows]
+    gallery_urls = sorted(set([*feedback_urls, *marked_urls]))
     galleries = []
-    if feedback_urls:
-        placeholders = ",".join("?" for _ in feedback_urls)
+    if gallery_urls:
+        placeholders = ",".join("?" for _ in gallery_urls)
         galleries = [
             dict(row)
             for row in conn.execute(
@@ -442,7 +503,7 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
                 WHERE url IN ({placeholders})
                 ORDER BY url
                 """,
-                feedback_urls,
+                gallery_urls,
             )
         ]
     return {
@@ -451,6 +512,7 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
         "bootstrap_tags": get_bootstrap_tags(conn),
         "galleries": galleries,
         "feedback": feedback_rows,
+        "gallery_marks": mark_rows,
     }
 
 
@@ -459,6 +521,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         raise ValueError("Unsupported preference export schema")
     if replace:
         conn.execute("DELETE FROM feedback")
+        conn.execute("DELETE FROM gallery_marks")
         conn.execute("DELETE FROM bootstrap_tags")
 
     galleries = import_rows(payload, "galleries")
@@ -563,11 +626,43 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         )
         imported_feedback += 1
 
+    imported_marks = 0
+    for item in import_rows(payload, "gallery_marks"):
+        gallery_url = item.get("gallery_url")
+        if not gallery_url:
+            continue
+        try:
+            kind = normalize_mark_kind(str(item.get("kind") or ""))
+        except ValueError:
+            continue
+        exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        if not exists:
+            continue
+        conn.execute(
+            """
+            INSERT INTO gallery_marks(gallery_url, kind, note, created_at, updated_at)
+            VALUES (?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+            ON CONFLICT(gallery_url) DO UPDATE SET
+                kind = excluded.kind,
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (
+                gallery_url,
+                kind,
+                item.get("note"),
+                item.get("created_at"),
+                item.get("updated_at"),
+            ),
+        )
+        imported_marks += 1
+
     retrain_model(conn)
     return {
         "bootstrap_tags": imported_tags,
         "galleries": imported_galleries,
         "feedback": imported_feedback,
+        "gallery_marks": imported_marks,
     }
 
 
@@ -661,10 +756,23 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
         apply_feedback_features(conn, gallery, signal, score=score, tag_strengths=tag_strengths)
+    mark_rows = conn.execute(
+        """
+        SELECT g.*, m.kind AS mark_kind
+        FROM gallery_marks m
+        JOIN galleries g ON g.url = m.gallery_url
+        """
+    ).fetchall()
+    for row in mark_rows:
+        gallery = dict(row)
+        signal = gallery_mark_signal(str(gallery.pop("mark_kind") or ""))
+        gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
+        apply_feedback_features(conn, gallery, signal, score=5 if signal > 0 else 1, tag_strengths=tag_strengths)
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
-    rows = conn.execute(
+    feedback_rows = conn.execute(
         """
         SELECT g.url, g.visual_embedding_json, g.visual_embedding_version, f.id AS feedback_id, f.vote AS feedback_signal
         FROM feedback f
@@ -679,6 +787,36 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
           AND g.visual_embedding_json != ''
         """
     ).fetchall()
+    rows: list[dict] = []
+    for row in feedback_rows:
+        signal = float(row["feedback_signal"] or 0)
+        signal *= feedback_confidence(conn, row["url"], int(row["feedback_id"]), signal)
+        rows.append(
+            {
+                "url": row["url"],
+                "visual_embedding_json": row["visual_embedding_json"],
+                "visual_embedding_version": row["visual_embedding_version"],
+                "signal": signal,
+            }
+        )
+    mark_rows = conn.execute(
+        """
+        SELECT g.url, g.visual_embedding_json, g.visual_embedding_version, m.kind AS mark_kind
+        FROM gallery_marks m
+        JOIN galleries g ON g.url = m.gallery_url
+        WHERE g.visual_embedding_json IS NOT NULL
+          AND g.visual_embedding_json != ''
+        """
+    ).fetchall()
+    for row in mark_rows:
+        rows.append(
+            {
+                "url": row["url"],
+                "visual_embedding_json": row["visual_embedding_json"],
+                "visual_embedding_version": row["visual_embedding_version"],
+                "signal": gallery_mark_signal(str(row["mark_kind"] or "")),
+            }
+        )
     version = active_visual_version(rows)
     if not version:
         return None
@@ -692,8 +830,7 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
         embedding = parse_visual_embedding(row["visual_embedding_json"])
         if not embedding:
             continue
-        signal = float(row["feedback_signal"] or 0)
-        signal *= feedback_confidence(conn, row["url"], int(row["feedback_id"]), signal)
+        signal = float(row["signal"] or 0)
         if signal > 0:
             positive_count += 1
         elif signal < 0:
@@ -720,7 +857,7 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
     }
 
 
-def active_visual_version(rows: list[sqlite3.Row]) -> str | None:
+def active_visual_version(rows: list[sqlite3.Row] | list[dict]) -> str | None:
     versions = {
         str(row["visual_embedding_version"] or "")
         for row in rows
@@ -923,7 +1060,8 @@ def recommend_page(
     tag_strengths = tag_corpus_strengths(conn)
     rows = conn.execute(
         """
-        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote
+        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
         FROM galleries g
         LEFT JOIN (
             SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote, feedback.score AS user_score
@@ -934,6 +1072,7 @@ def recommend_page(
                 GROUP BY gallery_url
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
         ORDER BY g.last_seen_at DESC
         LIMIT ?
         """,
@@ -957,7 +1096,9 @@ def recommend_page(
             score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
-        gallery["rated"] = gallery.get("feedback_id") is not None
+        gallery["user_mark_kind"] = gallery.get("user_mark_kind")
+        gallery["marked"] = gallery["user_mark_kind"] in MARK_KINDS
+        gallery["rated"] = gallery.get("feedback_id") is not None or gallery["marked"]
         if gallery["rated"] and not include_rated:
             continue
         if not gallery_matches_language_filter(gallery, language_filter_values):
@@ -967,7 +1108,13 @@ def recommend_page(
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
         if model_mode != MODEL_MODE_VISUAL:
-            if gallery["user_vote"] < 0:
+            if gallery["user_mark_kind"] == "ban":
+                score -= 5.0
+                reasons.append("banned")
+            elif gallery["user_mark_kind"] == "favorite":
+                score += 2.5
+                reasons.append("favorite")
+            elif gallery["user_vote"] < 0:
                 score -= 2.0
                 reasons.append("previous downvote")
             elif gallery["user_vote"] > 0:
@@ -1135,7 +1282,8 @@ def reaction_history_page(
     rows = conn.execute(
         """
         SELECT g.*, f.id AS feedback_id, f.vote AS user_vote, f.score AS user_score,
-               f.note AS feedback_note, f.created_at AS feedback_created_at
+               f.note AS feedback_note, f.created_at AS feedback_created_at,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
         FROM feedback f
         JOIN (
             SELECT gallery_url, MAX(id) AS latest_id
@@ -1143,6 +1291,7 @@ def reaction_history_page(
             GROUP BY gallery_url
         ) latest ON latest.gallery_url = f.gallery_url AND latest.latest_id = f.id
         JOIN galleries g ON g.url = f.gallery_url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
         ORDER BY f.id DESC
         LIMIT 10000
         """
@@ -1162,8 +1311,16 @@ def reaction_history_page(
         score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
+        gallery["user_mark_kind"] = gallery.get("user_mark_kind")
+        gallery["marked"] = gallery["user_mark_kind"] in MARK_KINDS
         gallery["rated"] = True
-        if gallery["user_vote"] < 0:
+        if gallery["user_mark_kind"] == "ban":
+            score -= 5.0
+            reasons.append("banned")
+        elif gallery["user_mark_kind"] == "favorite":
+            score += 2.5
+            reasons.append("favorite")
+        elif gallery["user_vote"] < 0:
             score -= 2.0
             reasons.append("previous downvote")
         elif gallery["user_vote"] > 0:
@@ -1182,6 +1339,82 @@ def reaction_history_page(
         "next_offset": next_offset,
         "total": len(items),
         "has_more": next_offset < len(items),
+    }
+
+
+def marked_gallery_page(
+    conn: sqlite3.Connection,
+    kind: str,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    kind = normalize_mark_kind(kind)
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    filter_text = (filter_text or "").strip().lower()
+    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(conn)
+    tag_strengths = tag_corpus_strengths(conn)
+    rows = conn.execute(
+        """
+        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+        FROM gallery_marks m
+        JOIN galleries g ON g.url = m.gallery_url
+        LEFT JOIN (
+            SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote, feedback.score AS user_score
+            FROM feedback
+            JOIN (
+                SELECT gallery_url, MAX(id) AS latest_id
+                FROM feedback
+                GROUP BY gallery_url
+            ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
+        ) f ON f.gallery_url = g.url
+        WHERE m.kind = ?
+        ORDER BY m.updated_at DESC, m.created_at DESC
+        LIMIT 10000
+        """,
+        (kind,),
+    ).fetchall()
+
+    items = []
+    for row in rows:
+        gallery = dict(row)
+        gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
+        gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
+        gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
+        gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
+        gallery["visual_ready"] = bool(gallery["visual_embedding"])
+        if filter_text and not gallery_matches_filter(gallery, filter_text):
+            continue
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
+        gallery.pop("visual_embedding", None)
+        gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
+        gallery["marked"] = True
+        gallery["rated"] = True
+        if kind == "ban":
+            score -= 5.0
+            reasons.append("banned")
+        else:
+            score += 2.5
+            reasons.append("favorite")
+        gallery["score"] = round(score, 3)
+        gallery["reasons"] = reasons[:5]
+        items.append(gallery)
+
+    page_items = items[offset : offset + limit]
+    next_offset = offset + len(page_items)
+    return {
+        "items": page_items,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(items),
+        "has_more": next_offset < len(items),
+        "mark_kind": kind,
     }
 
 
@@ -1399,6 +1632,9 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "galleries": conn.execute("SELECT COUNT(*) AS c FROM galleries").fetchone()["c"],
             "feedback_events": conn.execute("SELECT COUNT(*) AS c FROM feedback").fetchone()["c"],
             "rated_galleries": conn.execute("SELECT COUNT(DISTINCT gallery_url) AS c FROM feedback").fetchone()["c"],
+            "marked_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks").fetchone()["c"],
+            "favorite_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks WHERE kind = 'favorite'").fetchone()["c"],
+            "banned_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks WHERE kind = 'ban'").fetchone()["c"],
             "model_features": conn.execute("SELECT COUNT(*) AS c FROM feature_weights").fetchone()["c"],
         },
     }

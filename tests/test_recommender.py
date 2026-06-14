@@ -7,6 +7,7 @@ from exh_rec.exhentai import Gallery
 from exh_rec.recommender import (
     LEARNING_RATE,
     clear_feedback,
+    clear_gallery_mark,
     clear_shared_thumbnail_metadata,
     bootstrap_search_text,
     export_preferences,
@@ -17,6 +18,7 @@ from exh_rec.recommender import (
     gallery_feature_values,
     import_preferences,
     learned_query_tags,
+    marked_gallery_page,
     model_snapshot,
     normalize_model_mode,
     parse_bootstrap_tags,
@@ -25,6 +27,7 @@ from exh_rec.recommender import (
     recommend,
     recommend_page,
     record_feedback,
+    record_gallery_mark,
     retrain_model,
     score_gallery,
     store_gallery_samples,
@@ -894,6 +897,74 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn("tag:artist:disliked", negative_features)
         self.assertNotIn("tag:artist:disliked", positive_features)
 
+    def test_gallery_marks_train_as_strong_signals(self):
+        favorite_url = "https://exhentai.org/g/6f/f/"
+        banned_url = "https://exhentai.org/g/6b/f/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=favorite_url, gid="6f", token="f", title="Favorite Mark", tags=["female:favorite"]),
+                Gallery(url=banned_url, gid="6b", token="f", title="Banned Mark", tags=["female:banned"]),
+            ],
+        )
+
+        record_gallery_mark(self.conn, favorite_url, "favorite")
+        record_gallery_mark(self.conn, banned_url, "ban")
+        weights = {
+            row["feature"]: row["weight"]
+            for row in self.conn.execute(
+                "SELECT feature, weight FROM feature_weights WHERE feature IN (?, ?)",
+                ("tag:female:favorite", "tag:female:banned"),
+            )
+        }
+        snapshot = model_snapshot(self.conn)
+
+        self.assertGreater(weights["tag:female:favorite"], 1.0)
+        self.assertLess(weights["tag:female:banned"], -1.0)
+        self.assertEqual(snapshot["counts"]["favorite_galleries"], 1)
+        self.assertEqual(snapshot["counts"]["banned_galleries"], 1)
+
+    def test_gallery_marks_hide_from_review_and_have_pages(self):
+        favorite_url = "https://exhentai.org/g/6fa/f/"
+        banned_url = "https://exhentai.org/g/6ba/f/"
+        open_url = "https://exhentai.org/g/6op/f/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=favorite_url, gid="6fa", token="f", title="Favorite Page", tags=["artist:fav"]),
+                Gallery(url=banned_url, gid="6ba", token="f", title="Banned Page", tags=["artist:ban"]),
+                Gallery(url=open_url, gid="6op", token="f", title="Open Page", tags=["artist:open"]),
+            ],
+        )
+
+        record_gallery_mark(self.conn, favorite_url, "favorite")
+        record_gallery_mark(self.conn, banned_url, "ban")
+        review_urls = [item["url"] for item in recommend_page(self.conn, include_rated=False)["items"]]
+        favorite_page = marked_gallery_page(self.conn, "favorite")
+        ban_page = marked_gallery_page(self.conn, "ban")
+
+        self.assertNotIn(favorite_url, review_urls)
+        self.assertNotIn(banned_url, review_urls)
+        self.assertIn(open_url, review_urls)
+        self.assertEqual([item["url"] for item in favorite_page["items"]], [favorite_url])
+        self.assertEqual(favorite_page["items"][0]["user_mark_kind"], "favorite")
+        self.assertEqual([item["url"] for item in ban_page["items"]], [banned_url])
+        self.assertEqual(ban_page["items"][0]["user_mark_kind"], "ban")
+
+    def test_clear_gallery_mark_removes_bookmark_and_retrains(self):
+        gallery_url = "https://exhentai.org/g/6cl/f/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="6cl", token="f", title="Clear Mark", tags=["artist:clear"])],
+        )
+
+        record_gallery_mark(self.conn, gallery_url, "favorite")
+        removed = clear_gallery_mark(self.conn, gallery_url)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(marked_gallery_page(self.conn, "favorite")["items"], [])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
+
     def test_recommend_hides_rated_by_default(self):
         rated_url = "https://exhentai.org/g/7/a/"
         unrated_url = "https://exhentai.org/g/8/b/"
@@ -1064,6 +1135,7 @@ class RecommenderTest(unittest.TestCase):
         )
         upsert_bootstrap_tags(self.conn, [("artist:portable", 2.0)])
         record_feedback(self.conn, gallery_url, score=5)
+        record_gallery_mark(self.conn, gallery_url, "favorite")
         exported = export_preferences(self.conn)
 
         target = sqlite3.connect(":memory:")
@@ -1074,7 +1146,9 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(result["bootstrap_tags"], 1)
         self.assertEqual(result["galleries"], 1)
         self.assertEqual(result["feedback"], 1)
+        self.assertEqual(result["gallery_marks"], 1)
         self.assertIn("artist:portable", learned_query_tags(target, limit=5))
+        self.assertEqual(marked_gallery_page(target, "favorite")["items"][0]["url"], gallery_url)
         self.assertEqual(recommend(target, include_rated=True)[0]["url"], gallery_url)
         target.close()
 

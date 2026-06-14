@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS gallery_marks (
+    gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('favorite', 'ban')),
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS fetch_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     trigger TEXT NOT NULL,
@@ -83,6 +91,7 @@ CREATE TABLE IF NOT EXISTS feature_weights (
 
 CREATE INDEX IF NOT EXISTS idx_galleries_last_seen ON galleries(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_feedback_gallery ON feedback(gallery_url, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gallery_marks_kind ON gallery_marks(kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fetch_runs_started ON fetch_runs(started_at DESC);
 """
 

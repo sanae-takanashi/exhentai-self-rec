@@ -33,18 +33,21 @@ from .exhentai import (
 from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url_with_retry, proxy_preview
 from .recommender import (
     clear_feedback,
+    clear_gallery_mark,
     export_preferences,
     feedback_history,
     feedback_signal,
     get_bootstrap_tags,
     import_preferences,
     learned_query_tags,
+    marked_gallery_page,
     model_snapshot,
     normalize_language_filter,
     normalize_model_mode,
     parse_bootstrap_tags,
     reaction_history_page,
     recommend_page,
+    record_gallery_mark,
     record_feedback,
     reset_library,
     retrain_model,
@@ -170,6 +173,14 @@ class Handler(BaseHTTPRequestHandler):
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(reaction_history_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
+            elif path == "/api/marks":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                kind = parse_mark_kind(query.get("kind", ["favorite"])[0])
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(marked_gallery_payload(conn, kind=kind, limit=limit, offset=offset, filter_text=filter_text))
             elif path == "/api/feedback":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 gallery_url = str(query.get("gallery_url", [""])[0])
@@ -257,14 +268,66 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     feedback_enrichment = enrich_feedback_gallery(gallery_url)
                 with db.connect() as conn:
-                    page = recommendation_payload(
-                        conn,
-                        limit=40,
-                        include_rated=parse_bool(payload.get("include_rated")),
-                        filter_text=payload.get("filter_text"),
-                        require_bootstrap_match=require_bootstrap_match,
-                    )
+                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "feedback_update": feedback_update, "feedback_enrichment": feedback_enrichment, **page})
+            elif path == "/api/mark":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "")
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                kind = parse_mark_kind(payload.get("kind"))
+                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
+                with db.connect() as conn:
+                    ensure_gallery_exists(conn, gallery_url)
+                    before_model = model_snapshot(conn)
+                    before_signature = model_signature(conn)
+                    update_started = time.perf_counter()
+                    record_gallery_mark(conn, gallery_url, kind=kind, note=payload.get("note"))
+                    elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
+                    after_model = model_snapshot(conn)
+                    after_signature = model_signature(conn)
+                    mark_update = mark_update_summary(
+                        conn,
+                        action="record",
+                        gallery_url=gallery_url,
+                        kind=kind,
+                        before_model=before_model,
+                        before_signature=before_signature,
+                        after_model=after_model,
+                        after_signature=after_signature,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
+                self.send_json({"ok": True, "mark_update": mark_update, **page})
+            elif path == "/api/mark/clear":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "")
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
+                with db.connect() as conn:
+                    ensure_gallery_exists(conn, gallery_url)
+                    before_model = model_snapshot(conn)
+                    before_signature = model_signature(conn)
+                    update_started = time.perf_counter()
+                    removed = clear_gallery_mark(conn, gallery_url)
+                    elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
+                    after_model = model_snapshot(conn)
+                    after_signature = model_signature(conn)
+                    mark_update = mark_update_summary(
+                        conn,
+                        action="clear",
+                        gallery_url=gallery_url,
+                        kind=None,
+                        before_model=before_model,
+                        before_signature=before_signature,
+                        after_model=after_model,
+                        after_signature=after_signature,
+                        removed=removed,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
+                self.send_json({"ok": True, "removed": removed, "mark_update": mark_update, **page})
             elif path == "/api/feedback/clear":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -294,13 +357,7 @@ class Handler(BaseHTTPRequestHandler):
                         elapsed_ms=elapsed_ms,
                     )
                     log_feedback_update(feedback_update)
-                    page = recommendation_payload(
-                        conn,
-                        limit=40,
-                        include_rated=parse_bool(payload.get("include_rated")),
-                        filter_text=payload.get("filter_text"),
-                        require_bootstrap_match=require_bootstrap_match,
-                    )
+                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "removed": removed, "feedback_update": feedback_update, **page})
             elif path == "/api/retrain":
                 payload = self.read_json()
@@ -783,6 +840,50 @@ def feedback_update_summary(
         "visual_rated_after": after_visual.get("rated_embedded_galleries", 0),
         "model_changed": before_signature != after_signature,
         "retrained": retrained,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def mark_update_summary(
+    conn,
+    action: str,
+    gallery_url: str,
+    kind: str | None,
+    before_model: dict,
+    before_signature: dict,
+    after_model: dict,
+    after_signature: dict,
+    removed: int | None = None,
+    elapsed_ms: float | None = None,
+) -> dict:
+    before_counts = before_model.get("counts", {})
+    after_counts = after_model.get("counts", {})
+    row = conn.execute(
+        """
+        SELECT kind, created_at, updated_at
+        FROM gallery_marks
+        WHERE gallery_url = ?
+        """,
+        (gallery_url,),
+    ).fetchone()
+    return {
+        "action": action,
+        "gallery_url": gallery_url,
+        "kind": kind,
+        "removed": removed,
+        "current_kind": row["kind"] if row else None,
+        "marked_at": row["created_at"] if row else None,
+        "updated_at": row["updated_at"] if row else None,
+        "marked_galleries_before": before_counts.get("marked_galleries", 0),
+        "marked_galleries_after": after_counts.get("marked_galleries", 0),
+        "favorite_galleries_before": before_counts.get("favorite_galleries", 0),
+        "favorite_galleries_after": after_counts.get("favorite_galleries", 0),
+        "banned_galleries_before": before_counts.get("banned_galleries", 0),
+        "banned_galleries_after": after_counts.get("banned_galleries", 0),
+        "model_features_before": before_counts.get("model_features", 0),
+        "model_features_after": after_counts.get("model_features", 0),
+        "model_changed": before_signature != after_signature,
+        "retrained": True if action != "clear" else removed != 0,
         "elapsed_ms": elapsed_ms,
     }
 
@@ -1527,6 +1628,13 @@ def parse_feedback_request(payload: dict[str, Any]) -> tuple[int | None, int | N
     raise ApiError(HTTPStatus.BAD_REQUEST, "vote or score is required")
 
 
+def parse_mark_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    if kind not in {"favorite", "ban"}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "kind must be favorite or ban")
+    return kind
+
+
 def strict_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1635,6 +1743,38 @@ def reaction_history_payload(
     page = reaction_history_page(conn, limit=limit, offset=offset, filter_text=filter_text)
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def marked_gallery_payload(
+    conn,
+    kind: str,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    page = marked_gallery_page(conn, kind=kind, limit=limit, offset=offset, filter_text=filter_text)
+    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match: bool = False) -> dict:
+    view = str(payload.get("view") or "").strip().lower()
+    if view in {"favorite", "ban"}:
+        return marked_gallery_payload(
+            conn,
+            kind=view,
+            limit=40,
+            filter_text=payload.get("filter_text"),
+        )
+    if view == "history":
+        return reaction_history_payload(conn, limit=40, filter_text=payload.get("filter_text"))
+    return recommendation_payload(
+        conn,
+        limit=40,
+        include_rated=parse_bool(payload.get("include_rated")),
+        filter_text=payload.get("filter_text"),
+        require_bootstrap_match=require_bootstrap_match,
+    )
 
 
 def recommendation_item_with_image_fallback(item: dict) -> dict:

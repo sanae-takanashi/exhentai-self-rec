@@ -360,6 +360,22 @@ function viewCopy(view) {
       loaded: "history items loaded",
     };
   }
+  if (view === "favorite") {
+    return {
+      title: "Favorite Galleries",
+      subtitle: "Bookmarked galleries that train the model as strong positive signals.",
+      empty: "No favorite galleries yet.",
+      loaded: "favorite galleries loaded",
+    };
+  }
+  if (view === "ban") {
+    return {
+      title: "Banned Galleries",
+      subtitle: "Bookmarked rejects that train the model as strong negative signals.",
+      empty: "No banned galleries yet.",
+      loaded: "banned galleries loaded",
+    };
+  }
   if (view === "preview") {
     return {
       title: "Model Preview",
@@ -392,6 +408,9 @@ async function loadCurrentPage(offset = 0, append = false) {
   if (currentView === "history") {
     return loadReactionHistory(offset, append);
   }
+  if (currentView === "favorite" || currentView === "ban") {
+    return loadMarkedGalleries(currentView, offset, append);
+  }
   return loadRecommendations(offset, append);
 }
 
@@ -399,6 +418,15 @@ async function loadReactionHistory(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/reactions?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
+async function loadMarkedGalleries(kind, offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const payload = await api(
+    `/api/marks?kind=${encodeURIComponent(kind)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -536,6 +564,7 @@ async function vote(galleryUrl, voteValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         vote: voteValue,
+        view: currentView,
         include_rated: false,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
@@ -554,6 +583,7 @@ async function score(galleryUrl, scoreValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: scoreValue,
+        view: currentView,
         include_rated: false,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
@@ -572,6 +602,7 @@ async function skip(galleryUrl) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: 3,
+        view: currentView,
         include_rated: false,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
@@ -582,6 +613,44 @@ async function skip(galleryUrl) {
   });
 }
 
+async function markGallery(galleryUrl, kind) {
+  await withPendingFeedback(galleryUrl, async () => {
+    const label = kind === "ban" ? "Banning gallery" : "Adding favorite";
+    setStatus(label);
+    const payload = await api("/api/mark", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        kind,
+        view: currentView,
+        include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    await applyFeedbackResult(payload);
+    setStatus(markStatusMessage(kind === "ban" ? "Gallery banned" : "Favorite saved", payload));
+  });
+}
+
+async function clearMark(galleryUrl) {
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus("Clearing bookmark");
+    const payload = await api("/api/mark/clear", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        view: currentView,
+        include_rated: false,
+        require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    await applyFeedbackResult(payload);
+    setStatus(payload.removed ? "Bookmark cleared" : "No bookmark to clear");
+  });
+}
+
 async function clearRating(galleryUrl) {
   await withPendingFeedback(galleryUrl, async () => {
     setStatus("Clearing rating");
@@ -589,6 +658,7 @@ async function clearRating(galleryUrl) {
       method: "POST",
       body: JSON.stringify({
         gallery_url: galleryUrl,
+        view: currentView,
         include_rated: false,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
@@ -714,22 +784,41 @@ function renderGalleryCards(items, append = false) {
       : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
-    const userFeedback = item.rated
+    const hasFeedback = Boolean(item.feedback_id);
+    const userFeedback = hasFeedback
       ? item.user_score
         ? `Your score ${item.user_score}`
         : `Your signal ${item.user_vote || 0}`
       : "No reaction";
+    const markStatus = item.user_mark_kind === "favorite"
+      ? "Bookmarked favorite"
+      : item.user_mark_kind === "ban"
+        ? "Bookmarked ban"
+        : "";
     const detailStatus = item.detail_fetched_at ? "Full metadata" : "List metadata";
     const uploader = item.uploader ? `Uploader ${item.uploader}` : "Uploader unknown";
     const postedAt = item.posted_at ? `Posted ${item.posted_at}` : "";
     const reactionAt = item.feedback_created_at ? `Reacted ${item.feedback_created_at}` : "";
-    const clearButton = item.rated && mode !== "preview"
+    const markAt = item.mark_updated_at ? `Bookmarked ${item.mark_updated_at}` : "";
+    const clearButton = hasFeedback && mode !== "preview"
       ? `<button class="clear" type="button" data-clear="1" data-url="${escapeAttr(item.url)}">Clear</button>`
       : "";
-    const historyButton = item.rated && mode !== "preview"
+    const historyButton = hasFeedback && mode !== "preview"
       ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}">History</button>`
       : "";
     const feedbackActions = historyButton || clearButton ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
+    const favoriteButton = item.user_mark_kind === "favorite"
+      ? ""
+      : `<button class="up" type="button" data-mark="favorite" data-url="${escapeAttr(item.url)}">Favorite</button>`;
+    const banButton = item.user_mark_kind === "ban"
+      ? ""
+      : `<button class="down" type="button" data-mark="ban" data-url="${escapeAttr(item.url)}">Ban</button>`;
+    const clearMarkButton = item.marked
+      ? `<button class="clear" type="button" data-clear-mark="1" data-url="${escapeAttr(item.url)}">Clear bookmark</button>`
+      : "";
+    const markActions = mode === "preview"
+      ? ""
+      : `<div class="card-actions">${banButton}${favoriteButton}${clearMarkButton}</div>`;
     const feedbackControls = mode === "preview"
       ? ""
       : `<div class="votes">
@@ -742,6 +831,7 @@ function renderGalleryCards(items, append = false) {
             .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}">${value}</button>`)
             .join("")}
         </div>
+        ${markActions}
         ${feedbackActions}`;
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
     card.innerHTML = `
@@ -755,7 +845,9 @@ function renderGalleryCards(items, append = false) {
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
         <div class="meta">${escapeHtml(userFeedback)}</div>
+        ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
+        ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
         <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
         ${feedbackControls}
@@ -798,6 +890,27 @@ function feedbackStatusMessage(base, payload) {
   return details.length ? `${base}; ${details.join("; ")}` : base;
 }
 
+function markStatusMessage(base, payload) {
+  const update = payload.mark_update || {};
+  const details = [];
+  if (update.current_kind) {
+    details.push(update.current_kind);
+  }
+  if (update.model_changed) {
+    details.push("model changed");
+  }
+  if (Number.isFinite(update.elapsed_ms)) {
+    details.push(`update ${update.elapsed_ms}ms`);
+  }
+  if (Number.isFinite(update.favorite_galleries_after)) {
+    details.push(`favorites ${update.favorite_galleries_after}`);
+  }
+  if (Number.isFinite(update.banned_galleries_after)) {
+    details.push(`bans ${update.banned_galleries_after}`);
+  }
+  return details.length ? `${base}; ${details.join("; ")}` : base;
+}
+
 async function withPendingFeedback(galleryUrl, action) {
   if (pendingFeedbackUrls.has(galleryUrl)) {
     return;
@@ -817,7 +930,7 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
     if (button.dataset.url !== galleryUrl) {
       continue;
     }
-    if (button.dataset.vote || button.dataset.score || button.dataset.skip || button.dataset.clear) {
+    if (button.dataset.vote || button.dataset.score || button.dataset.skip || button.dataset.clear || button.dataset.mark || button.dataset.clearMark) {
       button.disabled = disabled;
     }
   }
@@ -981,6 +1094,11 @@ recommendationsEl.addEventListener("click", (event) => {
     vote(button.dataset.url, Number(button.dataset.vote)).catch((error) => setStatus(error.message, true));
     return;
   }
+  const markButton = event.target.closest("button[data-mark]");
+  if (markButton) {
+    markGallery(markButton.dataset.url, markButton.dataset.mark).catch((error) => setStatus(error.message, true));
+    return;
+  }
   const scoreButton = event.target.closest("button[data-score]");
   if (scoreButton) {
     score(scoreButton.dataset.url, Number(scoreButton.dataset.score)).catch((error) => setStatus(error.message, true));
@@ -994,6 +1112,11 @@ recommendationsEl.addEventListener("click", (event) => {
   const clearButton = event.target.closest("button[data-clear]");
   if (clearButton) {
     clearRating(clearButton.dataset.url).catch((error) => setStatus(error.message, true));
+    return;
+  }
+  const clearMarkButton = event.target.closest("button[data-clear-mark]");
+  if (clearMarkButton) {
+    clearMark(clearMarkButton.dataset.url).catch((error) => setStatus(error.message, true));
     return;
   }
   const historyButton = event.target.closest("button[data-history]");
