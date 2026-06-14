@@ -984,6 +984,25 @@ class RecommenderTest(unittest.TestCase):
         self.assertIn(unrated_url, default_urls)
         self.assertIn(rated_url, all_urls)
 
+    def test_review_pool_excludes_rated_before_candidate_limit(self):
+        rated = [
+            Gallery(url=f"https://exhentai.org/g/7r{i}/a/", gid=f"7r{i}", token="a", title=f"Rated {i}")
+            for i in range(105)
+        ]
+        old_unrated = Gallery(url="https://exhentai.org/g/7old/a/", gid="7old", token="a", title="Old Unrated")
+        store_galleries(self.conn, [*rated, old_unrated])
+        self.conn.executemany(
+            "INSERT INTO feedback(gallery_url, vote) VALUES (?, 1)",
+            [(gallery.url,) for gallery in rated],
+        )
+        self.conn.execute("UPDATE galleries SET last_seen_at = '2026-01-02 00:00:00' WHERE url != ?", (old_unrated.url,))
+        self.conn.execute("UPDATE galleries SET last_seen_at = '2026-01-01 00:00:00' WHERE url = ?", (old_unrated.url,))
+
+        page = recommend_page(self.conn, limit=1, candidate_limit=100)
+
+        self.assertEqual([item["url"] for item in page["items"]], [old_unrated.url])
+        self.assertEqual(page["total"], 1)
+
     def test_recommend_filters_explicit_language_tags(self):
         japanese_url = "https://exhentai.org/g/8j/b/"
         english_url = "https://exhentai.org/g/8e/b/"

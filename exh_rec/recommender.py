@@ -1058,8 +1058,9 @@ def recommend_page(
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
     tag_strengths = tag_corpus_strengths(conn)
+    unrated_where = "WHERE f.feedback_id IS NULL AND m.kind IS NULL" if not include_rated else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
                m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
         FROM galleries g
@@ -1073,6 +1074,7 @@ def recommend_page(
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        {unrated_where}
         ORDER BY g.last_seen_at DESC
         LIMIT ?
         """,
