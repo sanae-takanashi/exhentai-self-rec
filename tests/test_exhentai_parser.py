@@ -7,6 +7,7 @@ from exh_rec.exhentai import (
     apply_gallery_metadata,
     check_access,
     Gallery,
+    fetch_galleries,
     fetch_gallery_metadata,
     merge_gallery,
     normalize_cookie_header,
@@ -311,6 +312,16 @@ class ParserTest(unittest.TestCase):
             result = check_access("ipb_member_id=1")
         self.assertTrue(result["ok"])
         self.assertEqual(result["gallery_count"], 1)
+
+    def test_fetch_galleries_supports_start_page_offset(self):
+        html = '<a class="glink" href="https://exhentai.org/g/1/abcdef/">Visible Gallery</a>'
+        with patch("exh_rec.exhentai.fetch_page", return_value=html) as fetch:
+            galleries = fetch_galleries("ipb_member_id=1", query="artist:test", pages=2, start_page=5, delay=0)
+
+        self.assertEqual(len(galleries), 1)
+        fetched_urls = [call.args[1] for call in fetch.call_args_list]
+        self.assertIn("page=5", fetched_urls[0])
+        self.assertIn("page=6", fetched_urls[1])
 
     def test_check_access_reports_no_gallery_listings(self):
         with patch("exh_rec.exhentai.fetch_page", return_value="<html>login</html>"):

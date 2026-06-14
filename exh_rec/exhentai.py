@@ -265,18 +265,21 @@ def fetch_galleries(
     cookie_header: str,
     query: str | None,
     pages: int = 1,
+    start_page: int = 0,
     delay: float = 1.0,
     proxy_url: str = "",
 ) -> list[Gallery]:
     galleries: list[Gallery] = []
     seen: set[str] = set()
-    for page in range(max(1, pages)):
+    start_page = max(0, int(start_page))
+    page_count = max(1, int(pages))
+    for page in range(start_page, start_page + page_count):
         page_html = fetch_page(cookie_header, build_search_url(query, page), proxy_url=proxy_url)
         for gallery in parse_gallery_list(page_html, source_query=query):
             if gallery.url not in seen:
                 galleries.append(gallery)
                 seen.add(gallery.url)
-        if page + 1 < pages:
+        if page + 1 < start_page + page_count:
             time.sleep(delay)
     return galleries
 

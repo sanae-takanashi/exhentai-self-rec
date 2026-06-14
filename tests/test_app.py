@@ -1315,6 +1315,35 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["model_retrained"])
                 self.assertIn("artist:fetchdetail", learned)
 
+    def test_fetch_and_store_fetches_deeper_when_max_pages_are_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                old_gallery = Gallery(url="https://exhentai.org/g/80/a/", gid="80", token="a", title="Already Stored")
+                new_gallery = Gallery(url="https://exhentai.org/g/81/a/", gid="81", token="a", title="Deep New")
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "fetch_pages", "5")
+                    db.set_setting(conn, "stale_fetch_extra_pages", "5")
+                    db.set_setting(conn, "detail_fetch_limit", "0")
+                    store_galleries(conn, [old_gallery])
+
+                def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
+                    if start_page == 0:
+                        return [old_gallery]
+                    if start_page == 5:
+                        return [new_gallery]
+                    return []
+
+                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch:
+                    result = fetch_and_store()
+
+                self.assertEqual(result["stored"], 1)
+                self.assertIn(new_gallery.url, [item["url"] for item in result["items"]])
+                starts = [call.kwargs.get("start_page", 0) for call in fetch.call_args_list]
+                self.assertEqual(starts[:2], [0, 5])
+
     def test_fetch_and_store_marks_empty_recent_fetch_failed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
@@ -1614,6 +1643,7 @@ class AppTest(unittest.TestCase):
                     {
                         "refresh_interval_minutes": None,
                         "fetch_pages": "",
+                        "stale_fetch_extra_pages": "bad",
                         "detail_fetch_limit": "bad",
                         "learned_query_limit": None,
                         "recommend_candidate_limit": "bad",
@@ -1623,6 +1653,7 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     self.assertEqual(db.get_setting(conn, "refresh_interval_minutes", ""), "30")
                     self.assertEqual(db.get_setting(conn, "fetch_pages", ""), "1")
+                    self.assertEqual(db.get_setting(conn, "stale_fetch_extra_pages", ""), "20")
                     self.assertEqual(db.get_setting(conn, "detail_fetch_limit", ""), "8")
                     self.assertEqual(db.get_setting(conn, "learned_query_limit", ""), "6")
                     self.assertEqual(recommend_candidate_limit(conn), 2000)
@@ -1635,6 +1666,7 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     db.set_setting(conn, "refresh_interval_minutes", "bad")
                     db.set_setting(conn, "fetch_pages", "bad")
+                    db.set_setting(conn, "stale_fetch_extra_pages", "bad")
                     db.set_setting(conn, "detail_fetch_limit", "bad")
                     db.set_setting(conn, "learned_query_limit", "bad")
                     db.set_setting(conn, "recommend_candidate_limit", "bad")
@@ -1643,6 +1675,7 @@ class AppTest(unittest.TestCase):
 
                 self.assertEqual(settings["refresh_interval_minutes"], 30)
                 self.assertEqual(settings["fetch_pages"], 1)
+                self.assertEqual(settings["stale_fetch_extra_pages"], 20)
                 self.assertEqual(settings["detail_fetch_limit"], 8)
                 self.assertEqual(settings["learned_query_limit"], 6)
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)

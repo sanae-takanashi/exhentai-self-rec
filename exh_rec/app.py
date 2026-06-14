@@ -474,6 +474,7 @@ def get_settings() -> dict:
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
             "refresh_interval_minutes": refresh_interval_minutes(conn),
             "fetch_pages": fetch_pages(conn),
+            "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
             "detail_fetch_limit": detail_fetch_limit(conn),
             "learned_query_limit": learned_query_limit(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
@@ -506,6 +507,7 @@ def get_status() -> dict:
                 "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
                 "refresh_interval_minutes": refresh_interval_minutes(conn),
                 "fetch_pages": fetch_pages(conn),
+                "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
                 "detail_fetch_limit": detail_fetch_limit(conn),
                 "learned_query_limit": learned_query_limit(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
@@ -549,6 +551,10 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "fetch_pages" in payload:
             pages = bounded_int(payload["fetch_pages"], default=1, lower=1, upper=5)
             db.set_setting(conn, "fetch_pages", str(pages))
+            refresh_relevant_change = True
+        if "stale_fetch_extra_pages" in payload:
+            pages = bounded_int(payload["stale_fetch_extra_pages"], default=20, lower=0, upper=50)
+            db.set_setting(conn, "stale_fetch_extra_pages", str(pages))
             refresh_relevant_change = True
         if "detail_fetch_limit" in payload:
             limit = bounded_int(payload["detail_fetch_limit"], default=8, lower=0, upper=50)
@@ -938,6 +944,7 @@ def plan_fetch(force_query: str | None = None) -> dict:
 
 def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
     pages = fetch_pages(conn)
+    extra_pages = stale_fetch_extra_pages(conn)
     detail_limit = detail_fetch_limit(conn)
     learned_limit = learned_query_limit(conn)
     tags = get_bootstrap_tags(conn)
@@ -947,6 +954,7 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
         "queries": [entry["query"] for entry in entries],
         "entries": entries,
         "pages": pages,
+        "stale_fetch_extra_pages": extra_pages,
         "detail_fetch_limit": detail_limit,
         "learned_query_limit": learned_limit,
         "recommend_candidate_limit": recommend_candidate_limit(conn),
@@ -997,9 +1005,10 @@ def fetch_and_store(
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         pages = fetch_pages(conn)
+        stale_extra_pages = stale_fetch_extra_pages(conn)
         detail_limit = detail_fetch_limit(conn)
         learned_limit = learned_query_limit(conn)
-        extra_pages = sample_extra_pages(conn)
+        sample_pages = sample_extra_pages(conn)
         proxy_url = network_proxy(conn)
         tags = get_bootstrap_tags(conn)
         learned_tags = learned_query_tags(conn, learned_limit)
@@ -1038,21 +1047,37 @@ def fetch_and_store(
 
         for query in queries:
             try:
-                galleries = fetch_galleries(cookie, query=query, pages=pages, proxy_url=proxy_url)
-                fetched += len(galleries)
-                try:
-                    enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
-                except Exception as exc:
-                    errors.append(f"covers {query or 'recent'}: {exc}")
-                    FETCH_STATE["errors"] = list(errors)
-                with db.connect() as conn:
-                    stored += store_galleries(conn, galleries)
-                    candidates = select_detail_candidates(conn, galleries, detail_limit - len(selected_for_detail))
-                for gallery in candidates:
-                    if gallery.url not in selected_urls:
-                        selected_for_detail.append(gallery)
-                        selected_urls.add(gallery.url)
-                FETCH_STATE.update({"fetched": fetched, "stored": stored})
+                start_page = 0
+                batch_pages = pages
+                remaining_extra_pages = stale_extra_pages if pages >= 5 else 0
+                while True:
+                    galleries = fetch_galleries(
+                        cookie,
+                        query=query,
+                        pages=batch_pages,
+                        start_page=start_page,
+                        proxy_url=proxy_url,
+                    )
+                    fetched += len(galleries)
+                    try:
+                        enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
+                    except Exception as exc:
+                        errors.append(f"covers {query or 'recent'}: {exc}")
+                        FETCH_STATE["errors"] = list(errors)
+                    with db.connect() as conn:
+                        batch_stored = store_galleries(conn, galleries)
+                        stored += batch_stored
+                        candidates = select_detail_candidates(conn, galleries, detail_limit - len(selected_for_detail))
+                    for gallery in candidates:
+                        if gallery.url not in selected_urls:
+                            selected_for_detail.append(gallery)
+                            selected_urls.add(gallery.url)
+                    FETCH_STATE.update({"fetched": fetched, "stored": stored})
+                    if batch_stored > 0 or not galleries or remaining_extra_pages <= 0:
+                        break
+                    start_page += batch_pages
+                    batch_pages = min(5, remaining_extra_pages)
+                    remaining_extra_pages -= batch_pages
             except Exception as exc:
                 errors.append(str(exc))
                 FETCH_STATE["errors"] = list(errors)
@@ -1061,7 +1086,7 @@ def fetch_and_store(
             try:
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
-                samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
+                samples = collect_gallery_samples(cookie, detailed, sample_pages, proxy_url=proxy_url)
                 cache_sample_thumbnails(detailed.url, samples)
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
@@ -1664,6 +1689,10 @@ def bounded_float(value: Any, default: float, lower: float, upper: float) -> flo
 
 def fetch_pages(conn) -> int:
     return bounded_int(db.get_setting(conn, "fetch_pages", "1"), default=1, lower=1, upper=5)
+
+
+def stale_fetch_extra_pages(conn) -> int:
+    return bounded_int(db.get_setting(conn, "stale_fetch_extra_pages", "20"), default=20, lower=0, upper=50)
 
 
 def detail_fetch_limit(conn) -> int:

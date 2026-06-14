@@ -3,6 +3,7 @@ const cookieEl = document.querySelector("#cookie");
 const cookiePreviewEl = document.querySelector("#cookiePreview");
 const tagsEl = document.querySelector("#tags");
 const pagesEl = document.querySelector("#pages");
+const staleFetchExtraPagesEl = document.querySelector("#staleFetchExtraPages");
 const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
@@ -279,6 +280,7 @@ async function loadSettings() {
   cookiePreviewEl.textContent = cookiePreviewText(settings);
   tagsEl.value = bootstrapText(settings.bootstrap_tags);
   pagesEl.value = settings.fetch_pages;
+  staleFetchExtraPagesEl.value = settings.stale_fetch_extra_pages;
   detailLimitEl.value = settings.detail_fetch_limit;
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
@@ -314,6 +316,7 @@ async function saveSettings() {
     cookie_header: cookieEl.value,
     bootstrap_tags_raw: tagsEl.value,
     fetch_pages: Number(pagesEl.value),
+    stale_fetch_extra_pages: Number(staleFetchExtraPagesEl.value),
     detail_fetch_limit: Number(detailLimitEl.value),
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
@@ -996,7 +999,7 @@ function renderStatus(payload) {
   const plan = payload.plan;
   if (plan && plan.entries) {
     rows.push(["Plan", plan.entries.map((entry) => entry.query || "recent").join(", ")]);
-    rows.push(["Scope", `${plan.pages} page(s), ${plan.detail_fetch_limit} details`]);
+    rows.push(["Scope", `${plan.pages} page(s), +${plan.stale_fetch_extra_pages || 0} stale fallback, ${plan.detail_fetch_limit} details`]);
     rows.push(["Pool", `${plan.recommend_candidate_limit} local candidates`]);
   }
   if (payload.refresh) {

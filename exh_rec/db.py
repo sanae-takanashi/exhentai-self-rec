@@ -126,6 +126,7 @@ def init_db() -> None:
             "auto_refresh": "1",
             "refresh_interval_minutes": "30",
             "fetch_pages": "1",
+            "stale_fetch_extra_pages": "20",
             "detail_fetch_limit": "8",
             "learned_query_limit": "6",
             "recommend_candidate_limit": "2000",
