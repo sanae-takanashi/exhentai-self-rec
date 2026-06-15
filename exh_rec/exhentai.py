@@ -255,13 +255,13 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str =
             charset = response.headers.get_content_charset() or "utf-8"
             page_html = response.read().decode(charset, errors="replace")
             if temporary_ban_detected(page_html):
-                pause_after_temporary_ban()
+                pause_after_temporary_ban(page_html, sleep_now=False)
                 raise RuntimeError("Temporary ExHentai request-rate ban detected")
             return page_html
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:500]
         if temporary_ban_detected(body):
-            pause_after_temporary_ban()
+            pause_after_temporary_ban(body, sleep_now=False)
             raise RuntimeError("Temporary ExHentai request-rate ban detected") from exc
         raise RuntimeError(f"HTTP {exc.code} while fetching {url}: {body}") from exc
     except urllib.error.URLError as exc:
@@ -310,13 +310,13 @@ def post_api_json(cookie_header: str, payload: dict, timeout: int = 30, proxy_ur
             charset = response.headers.get_content_charset() or "utf-8"
             body = response.read().decode(charset, errors="replace")
             if temporary_ban_detected(body):
-                pause_after_temporary_ban()
+                pause_after_temporary_ban(body, sleep_now=False)
                 raise RuntimeError("Temporary E-Hentai API request-rate ban detected")
             return json.loads(body)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
         if temporary_ban_detected(detail):
-            pause_after_temporary_ban()
+            pause_after_temporary_ban(detail, sleep_now=False)
             raise RuntimeError("Temporary E-Hentai API request-rate ban detected") from exc
         raise RuntimeError(f"HTTP {exc.code} from gdata API: {detail}") from exc
     except urllib.error.URLError as exc:

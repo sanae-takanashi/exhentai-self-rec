@@ -17,7 +17,9 @@ from exh_rec.net import (
     rate_limited_url,
     proxy_preview,
     request_rate_limit_settings,
+    pause_after_temporary_ban,
     temporary_ban_detected,
+    temporary_ban_wait_seconds,
     wait_for_request_slot,
 )
 
@@ -85,6 +87,23 @@ class NetTest(unittest.TestCase):
         self.assertTrue(temporary_ban_detected("This IP address has been temporarily banned due to an excessive request rate."))
         self.assertFalse(temporary_ban_detected("normal page"))
 
+    def test_temporary_ban_wait_seconds_parses_expiry_text(self):
+        self.assertEqual(
+            temporary_ban_wait_seconds(
+                "This IP address has been temporarily banned due to an excessive request rate. "
+                "The ban expires in 52 minutes and 57 seconds."
+            ),
+            3177.0,
+        )
+        self.assertEqual(
+            temporary_ban_wait_seconds(
+                "This IP address has been temporarily banned due to an excessive request rate. "
+                "The ban expires in 1 hour and 2 minutes and 3 seconds."
+            ),
+            3723.0,
+        )
+        self.assertIsNone(temporary_ban_wait_seconds("The ban expires in 52 minutes and 57 seconds."))
+
     def test_configure_request_rate_limit_updates_settings(self):
         configure_request_rate_limit(2.5, 90)
 
@@ -103,6 +122,22 @@ class NetTest(unittest.TestCase):
 
         self.assertEqual(len(sleeps), 1)
         self.assertGreaterEqual(sleeps[0], 0)
+
+    def test_temporary_ban_expiry_sets_shared_cooldown_without_blocking(self):
+        sleeps: list[float] = []
+        configure_request_rate_limit(0, 0)
+
+        paused = pause_after_temporary_ban(
+            "This IP address has been temporarily banned due to an excessive request rate. "
+            "The ban expires in 52 minutes and 57 seconds.",
+            sleep=sleeps.append,
+            sleep_now=False,
+        )
+        wait_for_request_slot("https://exhentai.org/", sleep=sleeps.append)
+
+        self.assertEqual(paused, 3182.0)
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 3177.0)
 
     def test_open_url_uses_proxy_handler_for_http_proxy(self):
         request = urllib.request.Request("https://example.test/")

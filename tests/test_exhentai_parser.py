@@ -347,7 +347,10 @@ class ParserTest(unittest.TestCase):
                 exhentai.fetch_page("ipb_member_id=1", "https://exhentai.org/")
 
         self.assertIn("request-rate ban", str(ctx.exception))
-        pause.assert_called_once()
+        pause.assert_called_once_with(
+            "This IP address has been temporarily banned due to an excessive request rate.",
+            sleep_now=False,
+        )
 
     def test_check_access_reports_no_gallery_listings(self):
         with patch("exh_rec.exhentai.fetch_page", return_value="<html>login</html>"):

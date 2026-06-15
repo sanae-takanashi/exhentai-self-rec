@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
@@ -18,6 +19,7 @@ _RATE_LOCK = threading.Lock()
 _RATE_LIMIT_SECONDS = 0.0
 _TEMPORARY_BAN_PAUSE_SECONDS = 0.0
 _NEXT_REQUEST_AT = 0.0
+_TEMPORARY_BAN_BUFFER_SECONDS = 5.0
 RATE_LIMIT_HOST_SUFFIXES = (
     "exhentai.org",
     "e-hentai.org",
@@ -26,6 +28,11 @@ RATE_LIMIT_HOST_SUFFIXES = (
     "hath.network",
 )
 TEMPORARY_BAN_TEXT = "temporarily banned due to an excessive request rate"
+TEMPORARY_BAN_EXPIRES_RE = re.compile(r"\bban\s+expires\s+in\s+(?P<duration>[^.]+)", re.I)
+TEMPORARY_BAN_DURATION_RE = re.compile(
+    r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
+    re.I,
+)
 
 
 def configure_request_rate_limit(interval_seconds: float = 0.0, temporary_ban_pause_seconds: float = 0.0) -> None:
@@ -169,8 +176,6 @@ def get_request_url(request: urllib.request.Request) -> str:
 
 
 def wait_for_request_slot(url: str, sleep=time.sleep) -> None:
-    if _RATE_LIMIT_SECONDS <= 0:
-        return
     if not rate_limited_url(url):
         return
     global _NEXT_REQUEST_AT
@@ -179,7 +184,8 @@ def wait_for_request_slot(url: str, sleep=time.sleep) -> None:
         if _NEXT_REQUEST_AT > now:
             sleep(_NEXT_REQUEST_AT - now)
             now = time.monotonic()
-        _NEXT_REQUEST_AT = now + _RATE_LIMIT_SECONDS
+        if _RATE_LIMIT_SECONDS > 0:
+            _NEXT_REQUEST_AT = now + _RATE_LIMIT_SECONDS
 
 
 def rate_limited_url(url: str) -> bool:
@@ -187,13 +193,41 @@ def rate_limited_url(url: str) -> bool:
     return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in RATE_LIMIT_HOST_SUFFIXES)
 
 
-def pause_after_temporary_ban(sleep=time.sleep) -> None:
-    if _TEMPORARY_BAN_PAUSE_SECONDS > 0:
-        sleep(_TEMPORARY_BAN_PAUSE_SECONDS)
+def pause_after_temporary_ban(text: str = "", sleep=time.sleep, sleep_now: bool = True) -> float:
+    parsed_seconds = temporary_ban_wait_seconds(text)
+    parsed_with_buffer = (parsed_seconds + _TEMPORARY_BAN_BUFFER_SECONDS) if parsed_seconds else 0.0
+    seconds = max(_TEMPORARY_BAN_PAUSE_SECONDS, parsed_with_buffer)
+    if seconds <= 0:
+        return 0.0
+
+    global _NEXT_REQUEST_AT
+    with _RATE_LOCK:
+        _NEXT_REQUEST_AT = max(_NEXT_REQUEST_AT, time.monotonic() + seconds)
+    if sleep_now:
+        sleep(seconds)
+    return seconds
 
 
 def temporary_ban_detected(text: str) -> bool:
     return TEMPORARY_BAN_TEXT in str(text or "").lower()
+
+
+def temporary_ban_wait_seconds(text: str) -> float | None:
+    if not temporary_ban_detected(text):
+        return None
+    value = str(text or "")
+    match = TEMPORARY_BAN_EXPIRES_RE.search(value)
+    duration_text = match.group("duration") if match else value
+    total = 0
+    for amount, unit in TEMPORARY_BAN_DURATION_RE.findall(duration_text):
+        normalized_unit = unit.lower()
+        if normalized_unit.startswith("h"):
+            total += int(amount) * 3600
+        elif normalized_unit.startswith("m"):
+            total += int(amount) * 60
+        else:
+            total += int(amount)
+    return float(total) if total > 0 else None
 
 
 def open_url_with_socks_proxy(

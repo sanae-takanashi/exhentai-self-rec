@@ -2123,7 +2123,7 @@ def fetch_thumbnail_bytes(
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
         if temporary_ban_detected(body):
-            pause_after_temporary_ban()
+            pause_after_temporary_ban(body, sleep_now=False)
             raise ApiError(HTTPStatus.BAD_GATEWAY, "Temporary ExHentai request-rate ban detected") from exc
         raise ApiError(HTTPStatus.BAD_GATEWAY, f"Thumbnail fetch failed with HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -2131,8 +2131,9 @@ def fetch_thumbnail_bytes(
 
     if len(data) > THUMB_MAX_BYTES:
         raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail is too large")
-    if temporary_ban_detected(data.decode("utf-8", errors="ignore")):
-        pause_after_temporary_ban()
+    decoded_data = data.decode("utf-8", errors="ignore")
+    if temporary_ban_detected(decoded_data):
+        pause_after_temporary_ban(decoded_data, sleep_now=False)
         raise ApiError(HTTPStatus.BAD_GATEWAY, "Temporary ExHentai request-rate ban detected")
     if not content_type.startswith("image/"):
         raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail response was not an image")
