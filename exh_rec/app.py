@@ -30,7 +30,16 @@ from .exhentai import (
     usable_thumb,
     valid_cookie_header,
 )
-from .net import apply_proxy_environment, default_proxy_url, normalize_proxy_url, open_url_with_retry, proxy_preview
+from .net import (
+    apply_proxy_environment,
+    configure_request_rate_limit,
+    default_proxy_url,
+    normalize_proxy_url,
+    open_url_with_retry,
+    pause_after_temporary_ban,
+    proxy_preview,
+    temporary_ban_detected,
+)
 from .recommender import (
     clear_feedback,
     clear_gallery_mark,
@@ -477,6 +486,8 @@ def get_settings() -> dict:
             "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
             "detail_fetch_limit": detail_fetch_limit(conn),
             "learned_query_limit": learned_query_limit(conn),
+            "request_interval_seconds": request_interval_seconds(conn),
+            "temporary_ban_pause_seconds": temporary_ban_pause_seconds(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
             "recommend_language_filter": configured_language_filter(conn),
             "recommend_model_mode": configured_model_mode(conn),
@@ -510,6 +521,8 @@ def get_status() -> dict:
                 "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
                 "detail_fetch_limit": detail_fetch_limit(conn),
                 "learned_query_limit": learned_query_limit(conn),
+                "request_interval_seconds": request_interval_seconds(conn),
+                "temporary_ban_pause_seconds": temporary_ban_pause_seconds(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
                 "recommend_language_filter": configured_language_filter(conn),
                 "recommend_model_mode": configured_model_mode(conn),
@@ -564,6 +577,14 @@ def save_settings(payload: dict[str, Any]) -> None:
             limit = bounded_int(payload["learned_query_limit"], default=6, lower=0, upper=20)
             db.set_setting(conn, "learned_query_limit", str(limit))
             refresh_relevant_change = True
+        if "request_interval_seconds" in payload:
+            seconds = bounded_float(payload["request_interval_seconds"], default=3.0, lower=0.0, upper=30.0)
+            db.set_setting(conn, "request_interval_seconds", str(seconds))
+            refresh_relevant_change = True
+        if "temporary_ban_pause_seconds" in payload:
+            seconds = bounded_float(payload["temporary_ban_pause_seconds"], default=90.0, lower=0.0, upper=600.0)
+            db.set_setting(conn, "temporary_ban_pause_seconds", str(seconds))
+            refresh_relevant_change = True
         if "recommend_candidate_limit" in payload:
             limit = bounded_int(payload["recommend_candidate_limit"], default=2000, lower=100, upper=10000)
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
@@ -601,6 +622,7 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
             refresh_relevant_change = True
+        configure_request_rate_limit_from_conn(conn)
     if refresh_relevant_change:
         wake_background_refresh()
 
@@ -1703,6 +1725,21 @@ def learned_query_limit(conn) -> int:
     return bounded_int(db.get_setting(conn, "learned_query_limit", "6"), default=6, lower=0, upper=20)
 
 
+def request_interval_seconds(conn) -> float:
+    return bounded_float(db.get_setting(conn, "request_interval_seconds", "3.0"), default=3.0, lower=0.0, upper=30.0)
+
+
+def temporary_ban_pause_seconds(conn) -> float:
+    return bounded_float(db.get_setting(conn, "temporary_ban_pause_seconds", "90.0"), default=90.0, lower=0.0, upper=600.0)
+
+
+def configure_request_rate_limit_from_conn(conn) -> None:
+    configure_request_rate_limit(
+        interval_seconds=request_interval_seconds(conn),
+        temporary_ban_pause_seconds=temporary_ban_pause_seconds(conn),
+    )
+
+
 def refresh_interval_minutes(conn) -> int:
     return bounded_int(db.get_setting(conn, "refresh_interval_minutes", "30"), default=30, lower=5, upper=240)
 
@@ -2084,12 +2121,19 @@ def fetch_thumbnail_bytes(
             content_type = response_content_type(response.headers)
             data = response.read(THUMB_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        if temporary_ban_detected(body):
+            pause_after_temporary_ban()
+            raise ApiError(HTTPStatus.BAD_GATEWAY, "Temporary ExHentai request-rate ban detected") from exc
         raise ApiError(HTTPStatus.BAD_GATEWAY, f"Thumbnail fetch failed with HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(HTTPStatus.BAD_GATEWAY, f"Thumbnail fetch failed: {exc.reason}") from exc
 
     if len(data) > THUMB_MAX_BYTES:
         raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail is too large")
+    if temporary_ban_detected(data.decode("utf-8", errors="ignore")):
+        pause_after_temporary_ban()
+        raise ApiError(HTTPStatus.BAD_GATEWAY, "Temporary ExHentai request-rate ban detected")
     if not content_type.startswith("image/"):
         raise ApiError(HTTPStatus.BAD_GATEWAY, "Thumbnail response was not an image")
     return data, content_type
@@ -2244,6 +2288,7 @@ def main() -> None:
     db.init_db()
     with db.connect() as conn:
         apply_proxy_environment(network_proxy(conn))
+        configure_request_rate_limit_from_conn(conn)
         finish_interrupted_fetch_runs(conn)
         clear_shared_thumbnail_metadata(conn)
         retrain_model(conn)

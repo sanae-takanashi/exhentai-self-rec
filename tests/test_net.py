@@ -9,15 +9,23 @@ from unittest.mock import patch
 
 from exh_rec.net import (
     apply_proxy_environment,
+    configure_request_rate_limit,
     environment_proxy_url,
     normalize_proxy_url,
     open_url,
     open_url_with_retry,
+    rate_limited_url,
     proxy_preview,
+    request_rate_limit_settings,
+    temporary_ban_detected,
+    wait_for_request_slot,
 )
 
 
 class NetTest(unittest.TestCase):
+    def tearDown(self):
+        configure_request_rate_limit(0, 0)
+
     def test_environment_proxy_url_upgrades_socks5_to_socks5h(self):
         # Plain socks5:// makes requests/huggingface_hub resolve DNS locally; socks5h
         # routes the lookup through the proxy so blocked hosts stay reachable.
@@ -66,6 +74,35 @@ class NetTest(unittest.TestCase):
 
     def test_proxy_preview_hides_password(self):
         self.assertEqual(proxy_preview("socks5://user:secret@proxy.test:1080"), "socks5://user@proxy.test:1080")
+
+    def test_rate_limited_url_matches_exhentai_hosts(self):
+        self.assertTrue(rate_limited_url("https://exhentai.org/"))
+        self.assertTrue(rate_limited_url("https://s.exhentai.org/t/1.jpg"))
+        self.assertTrue(rate_limited_url("https://foo.hath.network/x"))
+        self.assertFalse(rate_limited_url("https://example.test/"))
+
+    def test_temporary_ban_detected_matches_exhentai_message(self):
+        self.assertTrue(temporary_ban_detected("This IP address has been temporarily banned due to an excessive request rate."))
+        self.assertFalse(temporary_ban_detected("normal page"))
+
+    def test_configure_request_rate_limit_updates_settings(self):
+        configure_request_rate_limit(2.5, 90)
+
+        self.assertEqual(
+            request_rate_limit_settings(),
+            {"interval_seconds": 2.5, "temporary_ban_pause_seconds": 90.0},
+        )
+
+    def test_wait_for_request_slot_only_sleeps_for_limited_hosts(self):
+        sleeps: list[float] = []
+        configure_request_rate_limit(2.0, 0)
+
+        wait_for_request_slot("https://exhentai.org/", sleep=sleeps.append)
+        wait_for_request_slot("https://exhentai.org/", sleep=sleeps.append)
+        wait_for_request_slot("https://example.test/", sleep=sleeps.append)
+
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0)
 
     def test_open_url_uses_proxy_handler_for_http_proxy(self):
         request = urllib.request.Request("https://example.test/")
@@ -129,6 +166,9 @@ class NetTest(unittest.TestCase):
 
 
 class RetryTest(unittest.TestCase):
+    def tearDown(self):
+        configure_request_rate_limit(0, 0)
+
     def _http_error(self, code: int) -> urllib.error.HTTPError:
         return urllib.error.HTTPError("https://api.test/", code, "err", hdrs=None, fp=None)
 
@@ -200,6 +240,25 @@ class RetryTest(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         self.assertEqual(attempts["count"], 2)
+
+    def test_temporary_ban_status_uses_configured_pause_before_retry(self):
+        sleeps: list[float] = []
+        attempts = {"count": 0}
+        configure_request_rate_limit(0, 77)
+
+        def banned_once(request, timeout, proxy_url=""):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise self._http_error(429)
+            return "ok"
+
+        with patch("exh_rec.net.open_url", banned_once):
+            result = open_url_with_retry(
+                urllib.request.Request("https://api.test/"), timeout=10, sleep=sleeps.append
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(sleeps, [77.0])
 
 
 if __name__ == "__main__":

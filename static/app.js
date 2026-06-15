@@ -8,6 +8,8 @@ const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
+const requestIntervalEl = document.querySelector("#requestInterval");
+const banPauseEl = document.querySelector("#banPause");
 const minutesEl = document.querySelector("#minutes");
 const networkProxyEl = document.querySelector("#networkProxy");
 const languageFilterEl = document.querySelector("#languageFilter");
@@ -285,6 +287,8 @@ async function loadSettings() {
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
   sampleExtraPagesEl.value = settings.sample_extra_pages;
+  requestIntervalEl.value = settings.request_interval_seconds;
+  banPauseEl.value = settings.temporary_ban_pause_seconds;
   minutesEl.value = settings.refresh_interval_minutes;
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
@@ -321,6 +325,8 @@ async function saveSettings() {
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
     sample_extra_pages: Number(sampleExtraPagesEl.value),
+    request_interval_seconds: Number(requestIntervalEl.value),
+    temporary_ban_pause_seconds: Number(banPauseEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
     network_proxy: networkProxyEl.value.trim(),
     recommend_language_filter: languageFilterEl.value.trim(),

@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-from .net import open_url, open_url_with_retry
+from .net import open_url, open_url_with_retry, pause_after_temporary_ban, temporary_ban_detected
 
 
 BASE_URL = "https://exhentai.org/"
@@ -253,9 +253,16 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str =
     try:
         with open_url_with_retry(request, timeout=timeout, proxy_url=proxy_url) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
+            page_html = response.read().decode(charset, errors="replace")
+            if temporary_ban_detected(page_html):
+                pause_after_temporary_ban()
+                raise RuntimeError("Temporary ExHentai request-rate ban detected")
+            return page_html
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:500]
+        if temporary_ban_detected(body):
+            pause_after_temporary_ban()
+            raise RuntimeError("Temporary ExHentai request-rate ban detected") from exc
         raise RuntimeError(f"HTTP {exc.code} while fetching {url}: {body}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
@@ -301,9 +308,16 @@ def post_api_json(cookie_header: str, payload: dict, timeout: int = 30, proxy_ur
     try:
         with open_url_with_retry(request, timeout=timeout, proxy_url=proxy_url) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return json.loads(response.read().decode(charset, errors="replace"))
+            body = response.read().decode(charset, errors="replace")
+            if temporary_ban_detected(body):
+                pause_after_temporary_ban()
+                raise RuntimeError("Temporary E-Hentai API request-rate ban detected")
+            return json.loads(body)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
+        if temporary_ban_detected(detail):
+            pause_after_temporary_ban()
+            raise RuntimeError("Temporary E-Hentai API request-rate ban detected") from exc
         raise RuntimeError(f"HTTP {exc.code} from gdata API: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach gdata API: {exc.reason}") from exc

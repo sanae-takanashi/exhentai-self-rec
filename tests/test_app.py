@@ -1646,6 +1646,8 @@ class AppTest(unittest.TestCase):
                         "stale_fetch_extra_pages": "bad",
                         "detail_fetch_limit": "bad",
                         "learned_query_limit": None,
+                        "request_interval_seconds": "bad",
+                        "temporary_ban_pause_seconds": "bad",
                         "recommend_candidate_limit": "bad",
                     }
                 )
@@ -1656,6 +1658,8 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(db.get_setting(conn, "stale_fetch_extra_pages", ""), "20")
                     self.assertEqual(db.get_setting(conn, "detail_fetch_limit", ""), "8")
                     self.assertEqual(db.get_setting(conn, "learned_query_limit", ""), "6")
+                    self.assertEqual(db.get_setting(conn, "request_interval_seconds", ""), "3.0")
+                    self.assertEqual(db.get_setting(conn, "temporary_ban_pause_seconds", ""), "90.0")
                     self.assertEqual(recommend_candidate_limit(conn), 2000)
 
     def test_get_settings_defaults_corrupt_numeric_values(self):
@@ -1669,6 +1673,8 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "stale_fetch_extra_pages", "bad")
                     db.set_setting(conn, "detail_fetch_limit", "bad")
                     db.set_setting(conn, "learned_query_limit", "bad")
+                    db.set_setting(conn, "request_interval_seconds", "bad")
+                    db.set_setting(conn, "temporary_ban_pause_seconds", "bad")
                     db.set_setting(conn, "recommend_candidate_limit", "bad")
 
                 settings = get_settings()
@@ -1678,6 +1684,8 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["stale_fetch_extra_pages"], 20)
                 self.assertEqual(settings["detail_fetch_limit"], 8)
                 self.assertEqual(settings["learned_query_limit"], 6)
+                self.assertEqual(settings["request_interval_seconds"], 3.0)
+                self.assertEqual(settings["temporary_ban_pause_seconds"], 90.0)
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)
 
     def test_get_settings_reports_missing_common_cookie_keys(self):

@@ -129,6 +129,8 @@ def init_db() -> None:
             "stale_fetch_extra_pages": "20",
             "detail_fetch_limit": "8",
             "learned_query_limit": "6",
+            "request_interval_seconds": "3.0",
+            "temporary_ban_pause_seconds": "90.0",
             "recommend_candidate_limit": "2000",
             "recommend_language_filter": "japanese,chinese",
             "recommend_model_mode": "hybrid",

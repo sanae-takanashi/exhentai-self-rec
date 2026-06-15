@@ -100,6 +100,7 @@ In the settings panel:
 - Set `Details` to the maximum number of fetched galleries that should be opened for full tag metadata per refresh. The app spends this budget on newly fetched galleries that already look promising under your bootstrap and learned model. `0` disables detail-page enrichment.
 - Set `Pages` for the normal result-page depth per query, up to 5. Set `Fetch more` to allow extra deeper pages when `Pages` is already 5 and a fetched batch contains no new gallery URLs; this helps when the first pages are all duplicates.
 - Set `Learned` to the maximum number of positive learned tags that should be added to each refresh query plan. `0` disables learned query expansion.
+- Set `Request delay` to throttle ExHentai/E-Hentai/API/thumbnail request starts. Set `Ban pause` to wait after a temporary request-rate ban is detected before retrying or continuing.
 - Set `Pool` to the number of recent local galleries that should be scored before the recommendation page is sliced. Higher values let older fetched galleries compete with newer ones.
 - Blank or invalid numeric settings fall back to safe defaults and are clamped to the supported ranges.
 - Click `Save`, then `Fetch`.

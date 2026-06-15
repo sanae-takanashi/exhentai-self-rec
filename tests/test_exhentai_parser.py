@@ -323,6 +323,32 @@ class ParserTest(unittest.TestCase):
         self.assertIn("page=5", fetched_urls[0])
         self.assertIn("page=6", fetched_urls[1])
 
+    def test_fetch_page_detects_temporary_rate_ban_body(self):
+        class Headers:
+            def get_content_charset(self):
+                return "utf-8"
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"This IP address has been temporarily banned due to an excessive request rate."
+
+        with patch("exh_rec.exhentai.open_url_with_retry", return_value=Response()), patch(
+            "exh_rec.exhentai.pause_after_temporary_ban"
+        ) as pause:
+            with self.assertRaises(RuntimeError) as ctx:
+                exhentai.fetch_page("ipb_member_id=1", "https://exhentai.org/")
+
+        self.assertIn("request-rate ban", str(ctx.exception))
+        pause.assert_called_once()
+
     def test_check_access_reports_no_gallery_listings(self):
         with patch("exh_rec.exhentai.fetch_page", return_value="<html>login</html>"):
             result = check_access("bad=cookie")

@@ -14,6 +14,32 @@ from typing import Any
 PROXY_ENV_KEYS = ("EXH_REC_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 _SOCKS_LOCK = threading.Lock()
+_RATE_LOCK = threading.Lock()
+_RATE_LIMIT_SECONDS = 0.0
+_TEMPORARY_BAN_PAUSE_SECONDS = 0.0
+_NEXT_REQUEST_AT = 0.0
+RATE_LIMIT_HOST_SUFFIXES = (
+    "exhentai.org",
+    "e-hentai.org",
+    "s.exhentai.org",
+    "ehgt.org",
+    "hath.network",
+)
+TEMPORARY_BAN_TEXT = "temporarily banned due to an excessive request rate"
+
+
+def configure_request_rate_limit(interval_seconds: float = 0.0, temporary_ban_pause_seconds: float = 0.0) -> None:
+    global _RATE_LIMIT_SECONDS, _TEMPORARY_BAN_PAUSE_SECONDS, _NEXT_REQUEST_AT
+    _RATE_LIMIT_SECONDS = max(0.0, float(interval_seconds or 0.0))
+    _TEMPORARY_BAN_PAUSE_SECONDS = max(0.0, float(temporary_ban_pause_seconds or 0.0))
+    _NEXT_REQUEST_AT = 0.0
+
+
+def request_rate_limit_settings() -> dict[str, float]:
+    return {
+        "interval_seconds": _RATE_LIMIT_SECONDS,
+        "temporary_ban_pause_seconds": _TEMPORARY_BAN_PAUSE_SECONDS,
+    }
 
 
 def default_proxy_url() -> str:
@@ -107,6 +133,10 @@ def open_url_with_retry(
         try:
             return open_url(request, timeout=timeout, proxy_url=proxy_url)
         except urllib.error.HTTPError as exc:
+            if exc.code in (429, 509) and index < attempts - 1:
+                pause_after_temporary_ban(sleep=sleep)
+                last_exc = exc
+                continue
             if exc.code not in retry_statuses or index == attempts - 1:
                 raise
             last_exc = exc
@@ -121,6 +151,7 @@ def open_url_with_retry(
 
 def open_url(request: urllib.request.Request, timeout: int, proxy_url: str = "") -> Any:
     proxy_url = normalize_proxy_url(proxy_url or "")
+    wait_for_request_slot(get_request_url(request))
     if not proxy_url:
         return urllib.request.urlopen(request, timeout=timeout)
     parsed = urllib.parse.urlparse(proxy_url)
@@ -131,6 +162,38 @@ def open_url(request: urllib.request.Request, timeout: int, proxy_url: str = "")
     if parsed.scheme in {"socks5", "socks5h"}:
         return open_url_with_socks_proxy(request, timeout, parsed)
     raise ValueError("unsupported proxy scheme")
+
+
+def get_request_url(request: urllib.request.Request) -> str:
+    return str(getattr(request, "full_url", "") or request.get_full_url())
+
+
+def wait_for_request_slot(url: str, sleep=time.sleep) -> None:
+    if _RATE_LIMIT_SECONDS <= 0:
+        return
+    if not rate_limited_url(url):
+        return
+    global _NEXT_REQUEST_AT
+    with _RATE_LOCK:
+        now = time.monotonic()
+        if _NEXT_REQUEST_AT > now:
+            sleep(_NEXT_REQUEST_AT - now)
+            now = time.monotonic()
+        _NEXT_REQUEST_AT = now + _RATE_LIMIT_SECONDS
+
+
+def rate_limited_url(url: str) -> bool:
+    hostname = (urllib.parse.urlparse(str(url or "")).hostname or "").lower()
+    return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in RATE_LIMIT_HOST_SUFFIXES)
+
+
+def pause_after_temporary_ban(sleep=time.sleep) -> None:
+    if _TEMPORARY_BAN_PAUSE_SECONDS > 0:
+        sleep(_TEMPORARY_BAN_PAUSE_SECONDS)
+
+
+def temporary_ban_detected(text: str) -> bool:
+    return TEMPORARY_BAN_TEXT in str(text or "").lower()
 
 
 def open_url_with_socks_proxy(
