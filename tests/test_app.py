@@ -34,6 +34,7 @@ from exh_rec.app import (
     render_sample_entry,
     SpriteCropUnavailable,
     fetch_and_store,
+    feedback_enrichment_plan,
     feedback_history_payload,
     feedback_update_summary,
     finish_interrupted_fetch_runs,
@@ -772,6 +773,22 @@ class AppTest(unittest.TestCase):
         self.assertEqual(summary["feedback_events_after"], 1)
         self.assertEqual(summary["rated_galleries_after"], 1)
         conn.close()
+
+    def test_feedback_enrichment_plan_defers_remote_fetch_by_default(self):
+        with patch("exh_rec.app.enrich_feedback_gallery", side_effect=AssertionError("must not fetch during feedback")):
+            result = feedback_enrichment_plan(1.0, {"gallery_url": "https://exhentai.org/g/10/a/"})
+
+        self.assertEqual(result["status"], "deferred")
+
+    def test_feedback_enrichment_plan_can_opt_in_to_remote_fetch(self):
+        with patch("exh_rec.app.enrich_feedback_gallery", return_value={"status": "success"}) as enrich:
+            result = feedback_enrichment_plan(
+                1.0,
+                {"gallery_url": "https://exhentai.org/g/10/a/", "enrich_feedback": True},
+            )
+
+        self.assertEqual(result["status"], "success")
+        enrich.assert_called_once_with("https://exhentai.org/g/10/a/")
 
     def test_reaction_history_payload_returns_reacted_gallery_cards(self):
         conn = sqlite3.connect(":memory:")

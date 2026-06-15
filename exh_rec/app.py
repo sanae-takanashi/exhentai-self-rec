@@ -272,10 +272,7 @@ class Handler(BaseHTTPRequestHandler):
                         elapsed_ms=elapsed_ms,
                     )
                     log_feedback_update(feedback_update)
-                if signal == 0:
-                    feedback_enrichment = {"status": "skipped", "reason": "neutral feedback"}
-                else:
-                    feedback_enrichment = enrich_feedback_gallery(gallery_url)
+                feedback_enrichment = feedback_enrichment_plan(signal, payload)
                 with db.connect() as conn:
                     page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "feedback_update": feedback_update, "feedback_enrichment": feedback_enrichment, **page})
@@ -1465,6 +1462,14 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
         retrain_model(conn)
     return {"status": "success", "gallery_url": gallery_url}
+
+
+def feedback_enrichment_plan(signal: float, payload: dict[str, Any]) -> dict:
+    if signal == 0:
+        return {"status": "skipped", "reason": "neutral feedback"}
+    if not parse_bool(payload.get("enrich_feedback")):
+        return {"status": "deferred", "reason": "review feedback does not fetch remote detail before responding"}
+    return enrich_feedback_gallery(str(payload.get("gallery_url") or ""))
 
 
 def ensure_gallery_exists(conn, gallery_url: str) -> None:
