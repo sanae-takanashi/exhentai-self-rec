@@ -134,6 +134,8 @@ def init_db() -> None:
             "recommend_candidate_limit": "2000",
             "recommend_language_filter": "japanese,chinese",
             "recommend_model_mode": "hybrid",
+            "preview_freshness_weight": "8.0",
+            "preview_posted_after": "",
             "review_require_bootstrap_match": "1",
             "sample_extra_pages": "2",
         }

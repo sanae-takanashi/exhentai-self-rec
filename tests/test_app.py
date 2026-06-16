@@ -1561,6 +1561,8 @@ class AppTest(unittest.TestCase):
                         "network_proxy": "127.0.0.1:7890",
                         "recommend_language_filter": "language:japanese, Chinese",
                         "recommend_model_mode": "visual",
+                        "preview_freshness_weight": "14.5",
+                        "preview_posted_after": "2026-06-01",
                         "review_require_bootstrap_match": False,
                         "visual_encoder": "simple",
                         "dinov2_device": "CUDA:0",
@@ -1578,6 +1580,8 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["network_proxy_preview"], "http://127.0.0.1:7890")
                 self.assertEqual(settings["recommend_language_filter"], "chinese,japanese")
                 self.assertEqual(settings["recommend_model_mode"], "visual")
+                self.assertEqual(settings["preview_freshness_weight"], 14.5)
+                self.assertEqual(settings["preview_posted_after"], "2026-06-01")
                 self.assertFalse(settings["review_require_bootstrap_match"])
                 self.assertEqual(settings["visual_encoder"], "simple")
                 self.assertEqual(settings["visual"]["default_encoder"], "simple")
@@ -1694,6 +1698,8 @@ class AppTest(unittest.TestCase):
                         "request_interval_seconds": "bad",
                         "temporary_ban_pause_seconds": "bad",
                         "recommend_candidate_limit": "bad",
+                        "preview_freshness_weight": "bad",
+                        "preview_posted_after": "not-a-date",
                     }
                 )
 
@@ -1706,6 +1712,8 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(db.get_setting(conn, "request_interval_seconds", ""), "3.0")
                     self.assertEqual(db.get_setting(conn, "temporary_ban_pause_seconds", ""), "90.0")
                     self.assertEqual(recommend_candidate_limit(conn), 2000)
+                    self.assertEqual(db.get_setting(conn, "preview_freshness_weight", ""), "8.0")
+                    self.assertEqual(db.get_setting(conn, "preview_posted_after", "missing"), "")
 
     def test_get_settings_defaults_corrupt_numeric_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1721,6 +1729,8 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "request_interval_seconds", "bad")
                     db.set_setting(conn, "temporary_ban_pause_seconds", "bad")
                     db.set_setting(conn, "recommend_candidate_limit", "bad")
+                    db.set_setting(conn, "preview_freshness_weight", "bad")
+                    db.set_setting(conn, "preview_posted_after", "not-a-date")
 
                 settings = get_settings()
 
@@ -1732,6 +1742,8 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["request_interval_seconds"], 3.0)
                 self.assertEqual(settings["temporary_ban_pause_seconds"], 90.0)
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)
+                self.assertEqual(settings["preview_freshness_weight"], 8.0)
+                self.assertEqual(settings["preview_posted_after"], "")
 
     def test_get_settings_reports_missing_common_cookie_keys(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -718,6 +718,33 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(fresh_top["url"], galleries[0].url)
         self.assertEqual(fresh_top["reasons"][0], "fresh +1.00")
 
+    def test_recommend_page_can_filter_by_posted_after(self):
+        old = Gallery(
+            url="https://exhentai.org/g/posted-old/e/",
+            gid="posted-old",
+            token="e",
+            title="Old Posted",
+            posted_at="2026-05-31 23:59",
+        )
+        fresh = Gallery(
+            url="https://exhentai.org/g/posted-fresh/e/",
+            gid="posted-fresh",
+            token="e",
+            title="Fresh Posted",
+            posted_at="2026-06-01 00:00",
+        )
+        unknown = Gallery(
+            url="https://exhentai.org/g/posted-unknown/e/",
+            gid="posted-unknown",
+            token="e",
+            title="Unknown Posted",
+        )
+        store_galleries(self.conn, [old, fresh, unknown])
+
+        page = recommend_page(self.conn, include_rated=True, posted_after="2026-06-01")
+
+        self.assertEqual([item["url"] for item in page["items"]], [fresh.url])
+
     def test_bootstrap_exploration_mixes_seed_galleries_into_review_page(self):
         strong = [
             Gallery(

@@ -1011,6 +1011,7 @@ def recommend(
     language_filter: list[str] | str | None = None,
     model_mode: str = MODEL_MODE_HYBRID,
     require_bootstrap_match: bool = False,
+    posted_after: str | None = None,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -1025,6 +1026,7 @@ def recommend(
         language_filter=language_filter,
         model_mode=model_mode,
         require_bootstrap_match=require_bootstrap_match,
+        posted_after=posted_after,
     )["items"]
 
 
@@ -1041,16 +1043,18 @@ def recommend_page(
     language_filter: list[str] | str | None = None,
     model_mode: str = MODEL_MODE_HYBRID,
     require_bootstrap_match: bool = False,
+    posted_after: str | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
     candidate_limit = max(limit + offset, candidate_limit)
-    freshness_weight = max(0.0, min(10.0, float(freshness_weight)))
+    freshness_weight = max(0.0, min(50.0, float(freshness_weight)))
     bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
     language_filter_values = normalize_language_filter(language_filter)
     model_mode = normalize_model_mode(model_mode)
+    posted_after = normalize_posted_after(posted_after)
     if model_mode == MODEL_MODE_VISUAL:
         bootstrap_explore_count = 0
         require_bootstrap_match = False
@@ -1107,6 +1111,8 @@ def recommend_page(
             continue
         if require_bootstrap_match and not gallery_matches_positive_bootstrap(gallery, bootstrap):
             continue
+        if posted_after and not gallery_posted_on_or_after(gallery, posted_after):
+            continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
         if model_mode != MODEL_MODE_VISUAL:
@@ -1160,6 +1166,26 @@ def recommend_page(
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
     }
+
+
+def normalize_posted_after(value: str | None) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+    if not match:
+        return ""
+    year, month, day = (int(part) for part in match.groups())
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return ""
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def gallery_posted_on_or_after(gallery: dict, posted_after: str) -> bool:
+    posted_at = str(gallery.get("posted_at") or "").strip()
+    if not posted_at:
+        return False
+    return posted_at[:10] >= posted_after
 
 
 def normalize_model_mode(value: object) -> str:

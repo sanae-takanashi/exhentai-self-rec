@@ -7,6 +7,8 @@ const staleFetchExtraPagesEl = document.querySelector("#staleFetchExtraPages");
 const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
+const previewFreshnessWeightEl = document.querySelector("#previewFreshnessWeight");
+const previewPostedAfterEl = document.querySelector("#previewPostedAfter");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const requestIntervalEl = document.querySelector("#requestInterval");
 const banPauseEl = document.querySelector("#banPause");
@@ -66,6 +68,8 @@ const staticTooltips = {
   detailLimit: "Maximum galleries per fetch to enrich with full detail metadata and sample thumbnails.",
   learnedLimit: "Maximum learned positive tags to add as extra remote fetch queries.",
   candidateLimit: "Number of local candidate galleries considered when ranking recommendations.",
+  previewFreshnessWeight: "Freshness boost used only in Preview. Higher values push newer galleries above older strong matches.",
+  previewPostedAfter: "Optional Preview cutoff. When set, Preview only shows galleries posted on or after this date.",
   sampleExtraPages: "Additional gallery sample pages to inspect for preview images on large galleries.",
   requestInterval: "Minimum delay in seconds between ExHentai-related network requests.",
   banPause: "Fallback pause in seconds after a request-rate ban when the ban page does not state an expiry.",
@@ -349,6 +353,8 @@ async function loadSettings() {
   detailLimitEl.value = settings.detail_fetch_limit;
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
+  previewFreshnessWeightEl.value = settings.preview_freshness_weight ?? 8;
+  previewPostedAfterEl.value = settings.preview_posted_after || "";
   sampleExtraPagesEl.value = settings.sample_extra_pages;
   requestIntervalEl.value = settings.request_interval_seconds;
   banPauseEl.value = settings.temporary_ban_pause_seconds;
@@ -387,6 +393,8 @@ async function saveSettings() {
     detail_fetch_limit: Number(detailLimitEl.value),
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
+    preview_freshness_weight: Number(previewFreshnessWeightEl.value),
+    preview_posted_after: previewPostedAfterEl.value,
     sample_extra_pages: Number(sampleExtraPagesEl.value),
     request_interval_seconds: Number(requestIntervalEl.value),
     temporary_ban_pause_seconds: Number(banPauseEl.value),
@@ -507,7 +515,8 @@ async function loadMarkedGalleries(kind, offset = 0, append = false) {
 async function loadRecommendations(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const includeRated = currentView === "preview" ? "1" : "0";
-  const freshnessWeight = currentView === "preview" ? "4" : "1";
+  const freshnessWeight = currentView === "preview" ? previewFreshnessWeightEl.value || "8" : "1";
+  const postedAfter = currentView === "preview" ? previewPostedAfterEl.value || "" : "";
   const bootstrapExploreCount = currentView === "review" ? "6" : "0";
   const requireBootstrapMatch = currentView === "review" && reviewRequireBootstrapMatchEl.checked ? "1" : "0";
   const languageFilter = languageFilterEl.value.trim();
@@ -516,7 +525,7 @@ async function loadRecommendations(offset = 0, append = false) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${freshnessWeight}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -1144,6 +1153,10 @@ function renderStatus(payload) {
   }
   if (payload.settings && payload.settings.recommend_model_mode) {
     rows.push(["Model", payload.settings.recommend_model_mode]);
+  }
+  if (payload.settings && Number.isFinite(payload.settings.preview_freshness_weight)) {
+    const cutoff = payload.settings.preview_posted_after || "none";
+    rows.push(["Preview", `freshness ${payload.settings.preview_freshness_weight}, after ${cutoff}`]);
   }
   if (payload.settings && typeof payload.settings.review_require_bootstrap_match === "boolean") {
     rows.push(["Review", payload.settings.review_require_bootstrap_match ? "Bootstrap match required" : "Any model match"]);

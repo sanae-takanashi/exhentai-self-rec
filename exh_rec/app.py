@@ -53,6 +53,7 @@ from .recommender import (
     model_snapshot,
     normalize_language_filter,
     normalize_model_mode,
+    normalize_posted_after,
     parse_bootstrap_tags,
     reaction_history_page,
     recommend_page,
@@ -152,7 +153,8 @@ class Handler(BaseHTTPRequestHandler):
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
                 offset = query_int(query, "offset", default=0, lower=0, upper=10000)
                 include_rated = parse_bool(query.get("include_rated", ["0"])[0])
-                freshness_weight = query_float(query, "freshness_weight", default=1.0, lower=0.0, upper=10.0)
+                freshness_weight = query_float(query, "freshness_weight", default=1.0, lower=0.0, upper=50.0)
+                posted_after = query.get("posted_after", [""])[0]
                 bootstrap_explore_count = query_int(query, "bootstrap_explore_count", default=0, lower=0, upper=20)
                 explore_seed = str(query.get("explore_seed", [""])[0])[:80]
                 language_filter = query.get("language_filter", [None])[0]
@@ -168,6 +170,7 @@ class Handler(BaseHTTPRequestHandler):
                             offset=offset,
                             filter_text=filter_text,
                             freshness_weight=freshness_weight,
+                            posted_after=posted_after,
                             bootstrap_explore_count=bootstrap_explore_count,
                             explore_seed=explore_seed,
                             language_filter=language_filter,
@@ -488,6 +491,8 @@ def get_settings() -> dict:
             "recommend_candidate_limit": recommend_candidate_limit(conn),
             "recommend_language_filter": configured_language_filter(conn),
             "recommend_model_mode": configured_model_mode(conn),
+            "preview_freshness_weight": preview_freshness_weight(conn),
+            "preview_posted_after": preview_posted_after(conn),
             "review_require_bootstrap_match": configured_review_require_bootstrap_match(conn),
             "sample_extra_pages": sample_extra_pages(conn),
             "network_proxy": proxy_url,
@@ -523,6 +528,8 @@ def get_status() -> dict:
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
                 "recommend_language_filter": configured_language_filter(conn),
                 "recommend_model_mode": configured_model_mode(conn),
+                "preview_freshness_weight": preview_freshness_weight(conn),
+                "preview_posted_after": preview_posted_after(conn),
                 "review_require_bootstrap_match": configured_review_require_bootstrap_match(conn),
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "network_proxy": proxy_url,
@@ -590,6 +597,11 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "recommend_language_filter", ",".join(sorted(languages)))
         if "recommend_model_mode" in payload:
             db.set_setting(conn, "recommend_model_mode", normalize_model_mode(payload["recommend_model_mode"]))
+        if "preview_freshness_weight" in payload:
+            weight = bounded_float(payload["preview_freshness_weight"], default=8.0, lower=0.0, upper=50.0)
+            db.set_setting(conn, "preview_freshness_weight", str(weight))
+        if "preview_posted_after" in payload:
+            db.set_setting(conn, "preview_posted_after", normalize_posted_after(str(payload["preview_posted_after"])))
         if "review_require_bootstrap_match" in payload:
             db.set_setting(conn, "review_require_bootstrap_match", "1" if parse_bool(payload["review_require_bootstrap_match"]) else "0")
         if "sample_extra_pages" in payload:
@@ -1941,6 +1953,14 @@ def configured_model_mode(conn) -> str:
     return normalize_model_mode(db.get_setting(conn, "recommend_model_mode", "hybrid"))
 
 
+def preview_freshness_weight(conn) -> float:
+    return bounded_float(db.get_setting(conn, "preview_freshness_weight", "8.0"), default=8.0, lower=0.0, upper=50.0)
+
+
+def preview_posted_after(conn) -> str:
+    return normalize_posted_after(db.get_setting(conn, "preview_posted_after", ""))
+
+
 def configured_review_require_bootstrap_match(conn) -> bool:
     return db.get_setting(conn, "review_require_bootstrap_match", "1") == "1"
 
@@ -1961,6 +1981,7 @@ def recommendation_payload(
     language_filter: str | None = None,
     model_mode: str | None = None,
     require_bootstrap_match: bool = False,
+    posted_after: str | None = None,
 ) -> dict:
     if language_filter is None:
         language_filter = configured_language_filter(conn)
@@ -1979,6 +2000,7 @@ def recommendation_payload(
         language_filter=language_filter,
         model_mode=model_mode,
         require_bootstrap_match=require_bootstrap_match,
+        posted_after=posted_after,
     )
     page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
     return {**page, "last_fetch": last_fetch_run(conn)}
