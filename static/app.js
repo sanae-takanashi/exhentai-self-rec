@@ -51,10 +51,73 @@ const visualSavedUrls = new Set();
 const visualQueue = [];
 let visualActive = 0;
 let visualRefreshTimer = null;
+const staticTooltips = {
+  fetchBtn: "Fetch gallery list pages using recent, bootstrap, and learned queries. Stores new local galleries.",
+  enrichBtn: "Fetch full detail metadata and sample thumbnails for the current top recommendations.",
+  refreshThumbsBtn: "Refresh cover thumbnails for galleries currently shown on the page.",
+  retrainBtn: "Rebuild the recommendation model from your saved feedback, favorites, bans, and visual embeddings.",
+  modelBtn: "Open the current learned model weights, counts, and visual model summary.",
+  cookie: "Your ExHentai Cookie header. Leave blank when saving to keep the currently stored cookie.",
+  checkBtn: "Test whether the stored cookie can access ExHentai gallery listings.",
+  clearCookieBtn: "Remove the stored cookie and saved access-check result.",
+  tags: "Seed tags for initial fetching and scoring. Use negative lines for dislikes and :weight for stronger signals.",
+  pages: "Number of result pages to fetch for each query, from 1 to 5.",
+  staleFetchExtraPages: "If the first max-page batch has no new galleries, fetch this many additional older pages.",
+  detailLimit: "Maximum galleries per fetch to enrich with full detail metadata and sample thumbnails.",
+  learnedLimit: "Maximum learned positive tags to add as extra remote fetch queries.",
+  candidateLimit: "Number of local candidate galleries considered when ranking recommendations.",
+  sampleExtraPages: "Additional gallery sample pages to inspect for preview images on large galleries.",
+  requestInterval: "Minimum delay in seconds between ExHentai-related network requests.",
+  banPause: "Fallback pause in seconds after a request-rate ban when the ban page does not state an expiry.",
+  minutes: "Background auto-refresh interval in minutes when Auto refresh is enabled.",
+  networkProxy: "Optional HTTP, HTTPS, socks5, or socks5h proxy used for ExHentai and model downloads.",
+  languageFilter: "Comma-separated languages allowed in recommendations, for example japanese,chinese.",
+  modelMode: "Hybrid uses tags, title, marks, and visual signals. Visual only ranks by image embeddings.",
+  reviewRequireBootstrapMatch: "When enabled, Review only shows galleries that match at least one bootstrap tag or keyword.",
+  visualEncoder: "Simple is lightweight. DINOv2 is stronger visually but needs PyTorch and much more compute.",
+  dinov2Device: "Device for DINOv2 visual embedding, such as auto, cpu, cuda, or cuda:0.",
+  downloadDinov2Btn: "Download the DINOv2 model files into the local cache using the configured proxy.",
+  autoRefresh: "Periodically fetch new galleries in the background using the saved cookie and fetch plan.",
+  saveBtn: "Save all settings in this panel.",
+  exportBtn: "Download your preferences, feedback, bootstrap tags, marks, and model data as JSON.",
+  importBtn: "Import a JSON backup created by Export.",
+  replaceImport: "When importing, replace existing preference data instead of merging into it.",
+  resetBtn: "Delete fetched galleries, feedback, learned model, marks, visual embeddings, and fetch history. Cookie and bootstrap tags remain.",
+  reviewTab: "Show unrated recommendations to review and train the model.",
+  historyTab: "Show galleries you already rated, skipped, or voted on.",
+  favoriteTab: "Show favorite bookmarked galleries, which act as strong positive signals.",
+  banTab: "Show banned bookmarked galleries, which act as strong negative signals.",
+  previewTab: "Show the full model ranking, including already rated galleries, with stronger freshness weighting.",
+  query: "Optional one-off ExHentai search query. It is used alone when you click Fetch Query.",
+  searchFetchBtn: "Fetch galleries for only the one-off query in the search box.",
+  localFilter: "Filter already stored local galleries by title, tag, category, or uploader.",
+  loadMoreBtn: "Load the next page of local results for the current view.",
+};
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
   statusEl.style.color = isError ? "var(--danger)" : "var(--muted)";
+}
+
+function applyStaticTooltips() {
+  for (const [id, tooltip] of Object.entries(staticTooltips)) {
+    const element = document.getElementById(id);
+    if (!element) {
+      continue;
+    }
+    element.title = tooltip;
+    if (element.tagName === "INPUT" || element.tagName === "TEXTAREA" || element.tagName === "SELECT") {
+      element.setAttribute("aria-label", tooltip);
+      const label = element.closest("label");
+      if (label) {
+        label.title = tooltip;
+      }
+    }
+  }
+  const closeButton = modelDialog.querySelector('button[value="close"]');
+  if (closeButton) {
+    closeButton.title = "Close the model dialog.";
+  }
 }
 
 async function api(path, options = {}) {
@@ -765,6 +828,17 @@ async function importPreferences(file) {
   );
 }
 
+function scoreTooltip(value) {
+  const labels = {
+    1: "Record a strong negative score. Use this when you strongly dislike this gallery.",
+    2: "Record a weak negative score.",
+    3: "Record a neutral skip. It leaves the review queue without pushing the model positive or negative.",
+    4: "Record a weak positive score.",
+    5: "Record a strong positive score. Use this when you strongly like this gallery.",
+  };
+  return labels[value] || "Record a numeric preference score for this gallery.";
+}
+
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
   if (!append) {
@@ -813,20 +887,20 @@ function renderGalleryCards(items, append = false) {
     const reactionAt = item.feedback_created_at ? `Reacted ${item.feedback_created_at}` : "";
     const markAt = item.mark_updated_at ? `Bookmarked ${item.mark_updated_at}` : "";
     const clearButton = hasFeedback && mode !== "preview"
-      ? `<button class="clear" type="button" data-clear="1" data-url="${escapeAttr(item.url)}">Clear</button>`
+      ? `<button class="clear" type="button" data-clear="1" data-url="${escapeAttr(item.url)}" title="Remove your rating, vote, or skip for this gallery.">Clear</button>`
       : "";
     const historyButton = hasFeedback && mode !== "preview"
-      ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}">History</button>`
+      ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}" title="Show your feedback history for this gallery.">History</button>`
       : "";
     const feedbackActions = historyButton || clearButton ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
     const favoriteButton = item.user_mark_kind === "favorite"
       ? ""
-      : `<button class="up" type="button" data-mark="favorite" data-url="${escapeAttr(item.url)}">Favorite</button>`;
+      : `<button class="up" type="button" data-mark="favorite" data-url="${escapeAttr(item.url)}" title="Bookmark this gallery as a favorite and train it as a strong positive signal.">Favorite</button>`;
     const banButton = item.user_mark_kind === "ban"
       ? ""
-      : `<button class="down" type="button" data-mark="ban" data-url="${escapeAttr(item.url)}">Ban</button>`;
+      : `<button class="down" type="button" data-mark="ban" data-url="${escapeAttr(item.url)}" title="Bookmark this gallery as banned and train it as a strong negative signal.">Ban</button>`;
     const clearMarkButton = item.marked
-      ? `<button class="clear" type="button" data-clear-mark="1" data-url="${escapeAttr(item.url)}">Clear bookmark</button>`
+      ? `<button class="clear" type="button" data-clear-mark="1" data-url="${escapeAttr(item.url)}" title="Remove the favorite or ban bookmark from this gallery.">Clear bookmark</button>`
       : "";
     const markActions = mode === "preview"
       ? ""
@@ -834,13 +908,13 @@ function renderGalleryCards(items, append = false) {
     const feedbackControls = mode === "preview"
       ? ""
       : `<div class="votes">
-          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}">Thumb down</button>
-          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}">Skip</button>
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}">Thumb up</button>
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
+          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal for this gallery.">Thumb up</button>
         </div>
         <div class="scorebar" aria-label="Score">
           ${[1, 2, 3, 4, 5]
-            .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}">${value}</button>`)
+            .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))}">${value}</button>`)
             .join("")}
         </div>
         ${markActions}
@@ -1171,6 +1245,8 @@ recommendationsEl.addEventListener("click", (event) => {
     return;
   }
 });
+
+applyStaticTooltips();
 
 loadSettings()
   .then(loadStatus)
