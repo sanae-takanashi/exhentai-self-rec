@@ -1003,6 +1003,35 @@ def refresh_summary(conn) -> dict:
     }
 
 
+def update_fetch_progress(message: str, **fields: Any) -> None:
+    fields["message"] = message
+    fields["updated_at"] = current_timestamp()
+    FETCH_STATE.update(fields)
+    log_fields = dict(fields)
+    log_fields.pop("message", None)
+    fetch_log(message, **log_fields)
+
+
+def fetch_log(message: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={format_log_value(value)}" for key, value in fields.items())
+    line = f"[fetch] {message}"
+    if details:
+        line = f"{line} {details}"
+    print(line, flush=True)
+
+
+def format_log_value(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
+def display_query(query: str | None) -> str:
+    return query or "recent"
+
+
 def get_access_check(conn) -> dict | None:
     raw = db.get_setting(conn, "last_access_check", "")
     if not raw:
@@ -1044,17 +1073,22 @@ def fetch_and_store(
     selected_for_detail = []
     selected_urls: set[str] = set()
     errors: list[str] = []
-    FETCH_STATE.update(
-        {
-            "running": True,
-            "trigger": trigger,
-            "queries": queries,
-            "started_at": current_timestamp(),
-            "fetched": 0,
-            "stored": 0,
-            "enriched": 0,
-            "errors": [],
-        }
+    update_fetch_progress(
+        "fetch started",
+        running=True,
+        trigger=trigger,
+        stage="starting",
+        queries=queries,
+        query_total=len(queries),
+        page_count=pages,
+        stale_extra_pages=stale_extra_pages,
+        detail_limit=detail_limit,
+        sample_extra_pages=sample_pages,
+        started_at=current_timestamp(),
+        fetched=0,
+        stored=0,
+        enriched=0,
+        errors=[],
     )
     try:
         with db.connect() as conn:
@@ -1063,13 +1097,34 @@ def fetch_and_store(
                 (trigger, "running", json.dumps(queries, ensure_ascii=True)),
             )
             run_id = int(cursor.lastrowid)
+        update_fetch_progress("fetch run recorded", stage="running", run_id=run_id)
 
-        for query in queries:
+        for query_index, query in enumerate(queries, start=1):
             try:
                 start_page = 0
                 batch_pages = pages
                 remaining_extra_pages = stale_extra_pages if pages >= 5 else 0
+                update_fetch_progress(
+                    "query started",
+                    stage="fetching_pages",
+                    current_query=display_query(query),
+                    query_index=query_index,
+                    query_total=len(queries),
+                    page_start=start_page,
+                    page_count=batch_pages,
+                    remaining_extra_pages=remaining_extra_pages,
+                )
                 while True:
+                    update_fetch_progress(
+                        "fetching page batch",
+                        stage="fetching_pages",
+                        current_query=display_query(query),
+                        query_index=query_index,
+                        query_total=len(queries),
+                        page_start=start_page,
+                        page_count=batch_pages,
+                        remaining_extra_pages=remaining_extra_pages,
+                    )
                     galleries = fetch_galleries(
                         cookie,
                         query=query,
@@ -1078,11 +1133,30 @@ def fetch_and_store(
                         proxy_url=proxy_url,
                     )
                     fetched += len(galleries)
+                    update_fetch_progress(
+                        "page batch fetched",
+                        stage="fetching_pages",
+                        current_query=display_query(query),
+                        fetched_batch=len(galleries),
+                        fetched=fetched,
+                    )
                     try:
-                        enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
+                        cover_updated = enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
+                        update_fetch_progress(
+                            "cover metadata checked",
+                            stage="cover_metadata",
+                            current_query=display_query(query),
+                            cover_updated=cover_updated,
+                        )
                     except Exception as exc:
                         errors.append(f"covers {query or 'recent'}: {exc}")
-                        FETCH_STATE["errors"] = list(errors)
+                        update_fetch_progress(
+                            "cover metadata failed",
+                            stage="cover_metadata",
+                            current_query=display_query(query),
+                            error=str(exc),
+                            errors=list(errors),
+                        )
                     with db.connect() as conn:
                         batch_stored = store_galleries(conn, galleries)
                         stored += batch_stored
@@ -1091,18 +1165,53 @@ def fetch_and_store(
                         if gallery.url not in selected_urls:
                             selected_for_detail.append(gallery)
                             selected_urls.add(gallery.url)
-                    FETCH_STATE.update({"fetched": fetched, "stored": stored})
+                    update_fetch_progress(
+                        "page batch stored",
+                        stage="storing",
+                        current_query=display_query(query),
+                        fetched=fetched,
+                        stored=stored,
+                        stored_batch=batch_stored,
+                        detail_selected=len(selected_for_detail),
+                    )
                     if batch_stored > 0 or not galleries or remaining_extra_pages <= 0:
                         break
+                    update_fetch_progress(
+                        "page batch stale; fetching deeper",
+                        stage="fetching_pages",
+                        current_query=display_query(query),
+                        next_page_start=start_page + batch_pages,
+                        next_page_count=min(5, remaining_extra_pages),
+                    )
                     start_page += batch_pages
                     batch_pages = min(5, remaining_extra_pages)
                     remaining_extra_pages -= batch_pages
             except Exception as exc:
                 errors.append(str(exc))
-                FETCH_STATE["errors"] = list(errors)
+                update_fetch_progress(
+                    "query failed",
+                    stage="error",
+                    current_query=display_query(query),
+                    error=str(exc),
+                    errors=list(errors),
+                )
 
-        for gallery in selected_for_detail:
+        update_fetch_progress(
+            "detail enrichment selected",
+            stage="enriching_details",
+            detail_total=len(selected_for_detail),
+            detail_done=0,
+        )
+        for detail_index, gallery in enumerate(selected_for_detail, start=1):
             try:
+                update_fetch_progress(
+                    "detail fetch started",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(selected_for_detail),
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=gallery.title,
+                )
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, sample_pages, proxy_url=proxy_url)
@@ -1111,19 +1220,37 @@ def fetch_and_store(
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
-                FETCH_STATE.update({"enriched": enriched})
+                update_fetch_progress(
+                    "detail fetch finished",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(selected_for_detail),
+                    detail_done=detail_index,
+                    current_gallery_url=gallery.url,
+                    enriched=enriched,
+                    sample_count=len(samples),
+                )
             except Exception as exc:
                 errors.append(f"detail {gallery.url}: {exc}")
-                FETCH_STATE["errors"] = list(errors)
+                update_fetch_progress(
+                    "detail fetch failed",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(selected_for_detail),
+                    current_gallery_url=gallery.url,
+                    error=str(exc),
+                    errors=list(errors),
+                )
 
         if fetched == 0 and not errors:
             errors.append(empty_fetch_error(queries))
-            FETCH_STATE["errors"] = list(errors)
+            update_fetch_progress("fetch returned no galleries", stage="failed", errors=list(errors))
 
         status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
             clear_shared_thumbnail_metadata(conn)
             if enriched:
+                update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
                 retrain_model(conn)
                 model_retrained = True
             conn.execute(
@@ -1142,6 +1269,16 @@ def fetch_and_store(
                 filter_text=filter_text,
                 candidate_limit=recommend_candidate_limit(conn),
             )
+        update_fetch_progress(
+            "fetch finished",
+            stage="finished",
+            status=status,
+            fetched=fetched,
+            stored=stored,
+            enriched=enriched,
+            model_retrained=model_retrained,
+            errors=list(errors),
+        )
         return {
             "ok": not errors,
             "status": status,
@@ -1157,7 +1294,7 @@ def fetch_and_store(
     except Exception as exc:
         if run_id is not None:
             errors.append(f"internal: {exc}")
-            FETCH_STATE["errors"] = list(errors)
+            update_fetch_progress("fetch failed", stage="failed", error=str(exc), errors=list(errors))
             with db.connect() as conn:
                 finish_running_fetch_run(conn, run_id, "failed", fetched, stored, enriched, errors)
         raise
@@ -1167,7 +1304,7 @@ def fetch_and_store(
                 last = last_fetch_run(conn)
         else:
             last = None
-        FETCH_STATE.update({"running": False, "last_fetch": last})
+        FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
         FETCH_LOCK.release()
 
 
@@ -1188,17 +1325,18 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
     enriched = 0
     model_retrained = False
     errors: list[str] = []
-    FETCH_STATE.update(
-        {
-            "running": True,
-            "trigger": "enrich",
-            "queries": ["recommendation details"],
-            "started_at": current_timestamp(),
-            "fetched": 0,
-            "stored": 0,
-            "enriched": 0,
-            "errors": [],
-        }
+    update_fetch_progress(
+        "enrichment started",
+        running=True,
+        trigger="enrich",
+        stage="selecting_details",
+        queries=["recommendation details"],
+        detail_limit=requested_limit,
+        started_at=current_timestamp(),
+        fetched=0,
+        stored=0,
+        enriched=0,
+        errors=[],
     )
     try:
         with db.connect() as conn:
@@ -1207,6 +1345,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 ("enrich", "running", json.dumps(["recommendation details"], ensure_ascii=True)),
             )
             run_id = int(cursor.lastrowid)
+        update_fetch_progress("enrichment run recorded", stage="selecting_details", run_id=run_id)
 
         with db.connect() as conn:
             candidates = select_recommendation_detail_candidates(
@@ -1215,9 +1354,23 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 include_rated=include_rated,
                 filter_text=filter_text,
             )
+        update_fetch_progress(
+            "detail enrichment selected",
+            stage="enriching_details",
+            detail_total=len(candidates),
+            detail_done=0,
+        )
 
-        for gallery in candidates:
+        for detail_index, gallery in enumerate(candidates, start=1):
             try:
+                update_fetch_progress(
+                    "detail fetch started",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(candidates),
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=gallery.title,
+                )
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
@@ -1226,15 +1379,33 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
-                FETCH_STATE.update({"enriched": enriched})
+                update_fetch_progress(
+                    "detail fetch finished",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(candidates),
+                    detail_done=detail_index,
+                    current_gallery_url=gallery.url,
+                    enriched=enriched,
+                    sample_count=len(samples),
+                )
             except Exception as exc:
                 errors.append(f"detail {gallery.url}: {exc}")
-                FETCH_STATE["errors"] = list(errors)
+                update_fetch_progress(
+                    "detail fetch failed",
+                    stage="enriching_details",
+                    detail_index=detail_index,
+                    detail_total=len(candidates),
+                    current_gallery_url=gallery.url,
+                    error=str(exc),
+                    errors=list(errors),
+                )
 
         status = "failed" if errors and enriched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
             clear_shared_thumbnail_metadata(conn)
             if enriched:
+                update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
                 retrain_model(conn)
                 model_retrained = True
             conn.execute(
@@ -1253,6 +1424,14 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 filter_text=filter_text,
                 candidate_limit=recommend_candidate_limit(conn),
             )
+        update_fetch_progress(
+            "enrichment finished",
+            stage="finished",
+            status=status,
+            enriched=enriched,
+            model_retrained=model_retrained,
+            errors=list(errors),
+        )
         return {
             "ok": not errors,
             "status": status,
@@ -1265,7 +1444,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
     except Exception as exc:
         if run_id is not None:
             errors.append(f"internal: {exc}")
-            FETCH_STATE["errors"] = list(errors)
+            update_fetch_progress("enrichment failed", stage="failed", error=str(exc), errors=list(errors))
             with db.connect() as conn:
                 finish_running_fetch_run(conn, run_id, "failed", 0, 0, enriched, errors)
         raise
@@ -1275,7 +1454,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 last = last_fetch_run(conn)
         else:
             last = None
-        FETCH_STATE.update({"running": False, "last_fetch": last})
+        FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
         FETCH_LOCK.release()
 
 

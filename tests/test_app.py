@@ -12,6 +12,7 @@ from exh_rec import db
 from exh_rec.app import (
     ApiError,
     FETCH_LOCK,
+    FETCH_STATE,
     REFRESH_STATE,
     REFRESH_WAKE,
     Handler,
@@ -1360,6 +1361,33 @@ class AppTest(unittest.TestCase):
                 self.assertIn(new_gallery.url, [item["url"] for item in result["items"]])
                 starts = [call.kwargs.get("start_page", 0) for call in fetch.call_args_list]
                 self.assertEqual(starts[:2], [0, 5])
+
+    def test_fetch_and_store_logs_detailed_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery = Gallery(url="https://exhentai.org/g/82/a/", gid="82", token="a", title="Progress Item")
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "detail_fetch_limit", "0")
+
+                with patch("exh_rec.app.fetch_galleries", return_value=[gallery]), patch(
+                    "exh_rec.app.enrich_covers_via_api",
+                    return_value=1,
+                ), patch("builtins.print") as printed:
+                    result = fetch_and_store()
+
+                lines = [call.args[0] for call in printed.call_args_list]
+                self.assertTrue(any(line.startswith("[fetch] fetch started") for line in lines))
+                self.assertTrue(any(line.startswith("[fetch] query started") for line in lines))
+                self.assertTrue(any(line.startswith("[fetch] page batch fetched") for line in lines))
+                self.assertTrue(any(line.startswith("[fetch] fetch finished") for line in lines))
+                self.assertEqual(result["status"], "success")
+                self.assertFalse(FETCH_STATE["running"])
+                self.assertEqual(FETCH_STATE["stage"], "finished")
+                self.assertEqual(FETCH_STATE["fetched"], 1)
+                self.assertEqual(FETCH_STATE["stored"], 1)
 
     def test_fetch_and_store_marks_empty_recent_fetch_failed(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -983,8 +983,42 @@ function renderStatus(payload) {
   const fetchState = payload.fetch || {};
   const last = payload.last_fetch;
   const rows = [
-    ["State", fetchState.running ? `Fetching ${fetchState.fetched || 0}/${fetchState.stored || 0}` : "Idle"],
+    ["State", fetchState.running ? fetchState.message || fetchState.stage || "Running" : "Idle"],
   ];
+  if (fetchState.running) {
+    rows.push(["Counts", `${fetchState.fetched || 0} fetched, ${fetchState.stored || 0} stored, ${fetchState.enriched || 0} enriched`]);
+    if (fetchState.run_id) {
+      rows.push(["Run", `#${fetchState.run_id} ${fetchState.trigger || "manual"}`]);
+    } else if (fetchState.trigger) {
+      rows.push(["Run", fetchState.trigger]);
+    }
+    if (fetchState.query_total) {
+      rows.push([
+        "Query",
+        `${fetchState.query_index || 0}/${fetchState.query_total}: ${fetchState.current_query || "recent"}`,
+      ]);
+    }
+    if (Number.isFinite(fetchState.page_start) || Number.isFinite(fetchState.next_page_start)) {
+      const start = Number.isFinite(fetchState.page_start) ? fetchState.page_start : fetchState.next_page_start;
+      const count = Number.isFinite(fetchState.page_count) ? fetchState.page_count : fetchState.next_page_count;
+      rows.push(["Pages", `start ${start || 0}, count ${count || 0}, +${fetchState.remaining_extra_pages || 0} fallback left`]);
+    }
+    if (Number.isFinite(fetchState.fetched_batch) || Number.isFinite(fetchState.stored_batch)) {
+      rows.push(["Batch", `${fetchState.fetched_batch || 0} fetched, ${fetchState.stored_batch || 0} new`]);
+    }
+    if (Number.isFinite(fetchState.detail_total)) {
+      rows.push(["Details", `${fetchState.detail_done || 0}/${fetchState.detail_total}`]);
+    }
+    if (fetchState.current_gallery_title || fetchState.current_gallery_url) {
+      rows.push(["Current", fetchState.current_gallery_title || fetchState.current_gallery_url]);
+    }
+    if (fetchState.updated_at) {
+      rows.push(["Progress At", fetchState.updated_at]);
+    }
+    if (fetchState.errors && fetchState.errors.length) {
+      rows.push(["Current Errors", fetchState.errors.join(" | ")]);
+    }
+  }
   if (last) {
     rows.push(["Last", `${last.status} at ${last.finished_at || last.started_at}`]);
     rows.push(["Fetched", `${last.fetched_count} fetched, ${last.stored_count} stored`]);
