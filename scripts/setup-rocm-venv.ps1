@@ -47,13 +47,42 @@ function Get-PythonVersion {
     return $VersionText.Trim()
 }
 
+function Get-Python312RequiredMessage {
+    return @"
+Python 3.12 is required for AMD ROCm Windows PyTorch wheels, but the script could not find it.
+
+Install it, then rerun this script:
+  winget install -e --id Python.Python.3.12
+
+After install, open a new PowerShell window and check:
+  py -3.12 -V
+
+If Python 3.12 is installed outside the py launcher, pass it explicitly:
+  .\scripts\setup-rocm-venv.ps1 -Python "C:\Path\To\python.exe"
+"@
+}
+
 if (-not (Test-Path $PythonExe)) {
     if ($Python) {
+        if (-not (Test-Path $Python)) {
+            throw "The -Python path does not exist: $Python"
+        }
+        $SelectedPythonVersion = Get-PythonVersion $Python
+        if ($SelectedPythonVersion -ne "3.12") {
+            throw "ROCm Windows PyTorch wheels require Python 3.12, but -Python is Python $SelectedPythonVersion."
+        }
         & $Python -m venv $VenvFullPath
     } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3.12 -c "import sys; print(sys.executable)" *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw (Get-Python312RequiredMessage)
+        }
         & py -3.12 -m venv $VenvFullPath
     } else {
-        throw "Python 3.12 is required for AMD ROCm Windows PyTorch wheels. Install Python 3.12 or pass -Python C:\Path\To\python.exe."
+        throw (Get-Python312RequiredMessage)
+    }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $PythonExe)) {
+        throw "Failed to create virtual environment at $VenvFullPath."
     }
 }
 
