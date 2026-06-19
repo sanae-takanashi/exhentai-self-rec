@@ -15,6 +15,8 @@ class VisualTest(unittest.TestCase):
         self.assertEqual(normalize_dinov2_device(""), "auto")
         self.assertEqual(normalize_dinov2_device("AUTO"), "auto")
         self.assertEqual(normalize_dinov2_device("cuda:1"), "cuda:1")
+        self.assertEqual(normalize_dinov2_device("rocm"), "cuda")
+        self.assertEqual(normalize_dinov2_device("HIP:0"), "cuda:0")
 
     def test_normalize_dinov2_device_rejects_unknown_device(self):
         with self.assertRaises(ValueError):

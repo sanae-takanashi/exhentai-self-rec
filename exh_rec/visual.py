@@ -73,11 +73,18 @@ def normalize_dinov2_device(value: object) -> str:
     device = str(value or "auto").strip().lower()
     if not device:
         return "auto"
+    if device in {"rocm", "hip"}:
+        return "cuda"
+    if device.startswith("rocm:") or device.startswith("hip:"):
+        suffix = device.split(":", 1)[1]
+        if suffix.isdigit():
+            return f"cuda:{suffix}"
+        raise ValueError("DINOv2 device must be auto, cpu, cuda, cuda:N, rocm, rocm:N, hip, hip:N, or mps")
     if device in {"auto", "cpu", "cuda", "mps"}:
         return device
     if re_fullmatch_cuda_device(device):
         return device
-    raise ValueError("DINOv2 device must be auto, cpu, cuda, cuda:N, or mps")
+    raise ValueError("DINOv2 device must be auto, cpu, cuda, cuda:N, rocm, rocm:N, hip, hip:N, or mps")
 
 
 def re_fullmatch_cuda_device(device: str) -> bool:

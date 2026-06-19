@@ -79,7 +79,7 @@ const staticTooltips = {
   modelMode: "Hybrid uses tags, title, marks, and visual signals. Visual only ranks by image embeddings.",
   reviewRequireBootstrapMatch: "When enabled, Review only shows galleries that match at least one bootstrap tag or keyword.",
   visualEncoder: "Simple is lightweight. DINOv2 is stronger visually but needs PyTorch and much more compute.",
-  dinov2Device: "Device for DINOv2 visual embedding, such as auto, cpu, cuda, or cuda:0.",
+  dinov2Device: "Device for DINOv2 visual embedding. Use auto, cpu, cuda, cuda:0, rocm, or hip. ROCm/HIP map to PyTorch's cuda device API.",
   downloadDinov2Btn: "Download the DINOv2 model files into the local cache using the configured proxy.",
   autoRefresh: "Periodically fetch new galleries in the background using the saved cookie and fetch plan.",
   saveBtn: "Save all settings in this panel.",

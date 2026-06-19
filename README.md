@@ -74,6 +74,21 @@ For DINOv2 with CUDA, install a CUDA-enabled PyTorch build. If your PyTorch/CUDA
 .\scripts\run.ps1 -VisualEncoder dinov2 -DinoDevice cuda
 ```
 
+For DINOv2 with AMD ROCm on Windows 11, use AMD's ROCm PyTorch wheels in a Python 3.12 venv:
+
+```powershell
+.\scripts\setup-rocm-venv.ps1
+.\scripts\run.ps1 -VenvPath .venv-rocm -VisualEncoder dinov2 -DinoDevice rocm
+```
+
+If you need a proxy for the AMD and PyPI downloads:
+
+```powershell
+.\scripts\setup-rocm-venv.ps1 -Proxy "http://127.0.0.1:7890"
+```
+
+The ROCm helper creates `.venv-rocm` by default so your existing `.venv` can stay untouched. AMD's current Windows ROCm PyTorch wheels require Python 3.12 and supported Radeon hardware. In PyTorch, ROCm devices are still exposed through the `torch.cuda` API, so `DinoDevice rocm`, `hip`, `cuda`, and `auto` all target the same AMD GPU path when the ROCm build is installed.
+
 On a slow VPS, keep DINOv2 disabled and use browser/simple embeddings:
 
 ```powershell
@@ -175,9 +190,10 @@ Set `DINOv2 device` in the settings panel, or use `EXH_REC_DINOV2_DEVICE`, to co
 EXH_REC_DINOV2_DEVICE=cpu python3 -m exh_rec.app
 EXH_REC_DINOV2_DEVICE=cuda python3 -m exh_rec.app
 EXH_REC_DINOV2_DEVICE=cuda:0 python3 -m exh_rec.app
+EXH_REC_DINOV2_DEVICE=rocm python3 -m exh_rec.app
 ```
 
-`auto` is the default and uses CUDA when `torch.cuda.is_available()` is true, then falls back to CPU. Use a CUDA-enabled PyTorch install on your laptop if you want GPU acceleration; CPU-only PyTorch is enough when you want to avoid GPU packages.
+`auto` is the default and uses CUDA/ROCm when `torch.cuda.is_available()` is true, then falls back to CPU. Use a CUDA-enabled or ROCm-enabled PyTorch install on your laptop if you want GPU acceleration; CPU-only PyTorch is enough when you want to avoid GPU packages.
 
 To explicitly avoid DINOv2 on a VPS:
 
