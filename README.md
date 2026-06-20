@@ -81,6 +81,12 @@ For DINOv2 with AMD ROCm on Windows 11, use AMD's ROCm PyTorch wheels in a Pytho
 .\scripts\run.ps1 -VenvPath .venv-rocm -VisualEncoder dinov2 -DinoDevice rocm
 ```
 
+Check whether that venv can see ROCm:
+
+```powershell
+.\scripts\check-rocm.ps1
+```
+
 If you need a proxy for the AMD and PyPI downloads:
 
 ```powershell
