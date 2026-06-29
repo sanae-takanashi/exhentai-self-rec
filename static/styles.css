@@ -319,6 +319,43 @@ button.danger:hover {
   overflow-wrap: anywhere;
 }
 
+.related-feedback {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #111318;
+}
+
+.related-heading {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.related-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.related-item a {
+  color: var(--text);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.related-item a:hover {
+  color: var(--accent);
+}
+
+.related-item span {
+  color: var(--muted);
+}
+
 .samples {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(58px, 1fr));

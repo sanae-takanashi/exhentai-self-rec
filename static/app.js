@@ -88,6 +88,7 @@ const staticTooltips = {
   replaceImport: "When importing, replace existing preference data instead of merging into it.",
   resetBtn: "Delete fetched galleries, feedback, learned model, marks, visual embeddings, and fetch history. Cookie and bootstrap tags remain.",
   reviewTab: "Show unrated recommendations to review and train the model.",
+  shortRepeatsTab: "Show short new galleries that resemble older rated source-prefix galleries, with old reactions shown for reference.",
   historyTab: "Show galleries you already rated, skipped, or voted on.",
   favoriteTab: "Show favorite bookmarked galleries, which act as strong positive signals.",
   banTab: "Show banned bookmarked galleries, which act as strong negative signals.",
@@ -432,6 +433,14 @@ function cookiePreviewText(settings) {
 }
 
 function viewCopy(view) {
+  if (view === "short-repeats") {
+    return {
+      title: "Short Repeat Queue",
+      subtitle: "Short unrated galleries related to older reactions, separated from the main review queue.",
+      empty: "No short repeat galleries need review.",
+      loaded: "short repeat galleries loaded",
+    };
+  }
   if (view === "history") {
     return {
       title: "Reaction History",
@@ -485,6 +494,9 @@ function setActiveView(view) {
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
+  if (currentView === "short-repeats") {
+    return loadShortRepeats(offset, append);
+  }
   if (currentView === "history") {
     return loadReactionHistory(offset, append);
   }
@@ -498,6 +510,15 @@ async function loadReactionHistory(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/reactions?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
+async function loadShortRepeats(offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const payload = await api(
+    `/api/short-repeats?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -848,6 +869,49 @@ function scoreTooltip(value) {
   return labels[value] || "Record a numeric preference score for this gallery.";
 }
 
+function relatedFeedbackSummary(entry) {
+  const parts = [];
+  if (entry.user_score) {
+    parts.push(`score ${entry.user_score}`);
+  } else if (entry.feedback_id) {
+    parts.push(`signal ${entry.user_vote || 0}`);
+  }
+  if (entry.user_mark_kind === "favorite") {
+    parts.push("favorite");
+  } else if (entry.user_mark_kind === "ban") {
+    parts.push("ban");
+  }
+  if (entry.page_count) {
+    parts.push(`${entry.page_count} pages`);
+  }
+  if (entry.feedback_created_at) {
+    parts.push(entry.feedback_created_at);
+  } else if (entry.mark_updated_at) {
+    parts.push(entry.mark_updated_at);
+  }
+  return parts.join(" · ") || "old reaction";
+}
+
+function renderRelatedFeedback(item) {
+  const entries = item.related_feedback || [];
+  if (!entries.length) {
+    return "";
+  }
+  return `<div class="related-feedback">
+    <div class="related-heading">Old reactions</div>
+    ${entries
+      .map((entry) => {
+        const title = entry.title || entry.url || "Related gallery";
+        const summary = relatedFeedbackSummary(entry);
+        const href = entry.url
+          ? `<a href="${escapeAttr(entry.url)}" target="_blank" rel="noreferrer">${escapeHtml(title)}</a>`
+          : `<span>${escapeHtml(title)}</span>`;
+        return `<div class="related-item">${href}<span>${escapeHtml(summary)}</span></div>`;
+      })
+      .join("")}
+  </div>`;
+}
+
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
   if (!append) {
@@ -879,6 +943,7 @@ function renderGalleryCards(items, append = false) {
       : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
+    const relatedFeedback = renderRelatedFeedback(item);
     const hasFeedback = Boolean(item.feedback_id);
     const userFeedback = hasFeedback
       ? item.user_score
@@ -945,6 +1010,7 @@ function renderGalleryCards(items, append = false) {
         ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
         <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
+        ${relatedFeedback}
         ${feedbackControls}
       </div>
     `;

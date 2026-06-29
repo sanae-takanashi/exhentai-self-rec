@@ -30,6 +30,7 @@ from exh_rec.recommender import (
     record_gallery_mark,
     retrain_model,
     score_gallery,
+    short_repeat_page,
     store_gallery_samples,
     store_visual_embedding,
     store_galleries,
@@ -1029,6 +1030,75 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual([item["url"] for item in page["items"]], [old_unrated.url])
         self.assertEqual(page["total"], 1)
+
+    def test_short_repeat_page_separates_short_unrated_source_updates(self):
+        old_url = "https://exhentai.org/g/7oldsrc/a/"
+        repeat_url = "https://exhentai.org/g/7newsrc/a/"
+        normal_url = "https://exhentai.org/g/7normal/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=old_url,
+                    gid="7oldsrc",
+                    token="a",
+                    title="[Pixiv] Source Artist January",
+                    tags=["artist:source artist"],
+                ),
+                Gallery(
+                    url=repeat_url,
+                    gid="7newsrc",
+                    token="a",
+                    title="[Pixiv] Source Artist June Update",
+                    tags=["artist:source artist"],
+                ),
+                Gallery(
+                    url=normal_url,
+                    gid="7normal",
+                    token="a",
+                    title="[Pixiv] Other Artist June Update",
+                    tags=["artist:other artist"],
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 40, [])
+        store_gallery_samples(self.conn, repeat_url, 6, [])
+        store_gallery_samples(self.conn, normal_url, 6, [])
+        record_feedback(self.conn, old_url, vote=-1)
+
+        repeat_page = short_repeat_page(self.conn, limit=10)
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertEqual([item["url"] for item in repeat_page["items"]], [repeat_url])
+        self.assertEqual(repeat_page["items"][0]["related_feedback"][0]["url"], old_url)
+        self.assertEqual(repeat_page["items"][0]["related_feedback"][0]["user_vote"], -1.0)
+        self.assertNotIn(repeat_url, review_urls)
+        self.assertIn(normal_url, review_urls)
+
+    def test_short_repeat_page_uses_exact_titles_and_respects_page_limit(self):
+        old_url = "https://exhentai.org/g/7exactold/a/"
+        short_url = "https://exhentai.org/g/7exactshort/a/"
+        long_url = "https://exhentai.org/g/7exactlong/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="7exactold", token="a", title="[Fantia] Exact Pack"),
+                Gallery(url=short_url, gid="7exactshort", token="a", title="[Fantia] Exact Pack"),
+                Gallery(url=long_url, gid="7exactlong", token="a", title="[Fantia] Exact Pack"),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 30, [])
+        store_gallery_samples(self.conn, short_url, 10, [])
+        store_gallery_samples(self.conn, long_url, 11, [])
+        record_feedback(self.conn, old_url, score=5)
+
+        repeat_urls = [item["url"] for item in short_repeat_page(self.conn, limit=10)["items"]]
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertIn(short_url, repeat_urls)
+        self.assertNotIn(long_url, repeat_urls)
+        self.assertNotIn(short_url, review_urls)
+        self.assertIn(long_url, review_urls)
 
     def test_recommend_filters_explicit_language_tags(self):
         japanese_url = "https://exhentai.org/g/8j/b/"

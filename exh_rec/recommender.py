@@ -66,6 +66,11 @@ BOOTSTRAP_NAMESPACES = {
 MODEL_MODE_HYBRID = "hybrid"
 MODEL_MODE_VISUAL = "visual"
 MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL}
+SHORT_REPEAT_PAGE_LIMIT = 10
+RELATED_FEEDBACK_REFERENCE_LIMIT = 5
+SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist", "group", "cosplayer", "parody", "character"}
+SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]\)】」』]\s*)+)")
+SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
 
 
 def parse_bootstrap_tags(raw: str) -> list[tuple[str, float]]:
@@ -1044,6 +1049,7 @@ def recommend_page(
     model_mode: str = MODEL_MODE_HYBRID,
     require_bootstrap_match: bool = False,
     posted_after: str | None = None,
+    exclude_short_repeats: bool = True,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -1062,6 +1068,9 @@ def recommend_page(
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
     tag_strengths = tag_corpus_strengths(conn)
+    short_repeat_reference_index = (
+        related_feedback_reference_index(conn) if exclude_short_repeats and not include_rated else {}
+    )
     unrated_where = "WHERE f.feedback_id IS NULL AND m.kind IS NULL" if not include_rated else ""
     rows = conn.execute(
         f"""
@@ -1105,6 +1114,8 @@ def recommend_page(
         gallery["user_mark_kind"] = gallery.get("user_mark_kind")
         gallery["marked"] = gallery["user_mark_kind"] in MARK_KINDS
         gallery["rated"] = gallery.get("feedback_id") is not None or gallery["marked"]
+        if exclude_short_repeats and not include_rated and is_short_repeat_gallery(gallery, short_repeat_reference_index):
+            continue
         if gallery["rated"] and not include_rated:
             continue
         if not gallery_matches_language_filter(gallery, language_filter_values):
@@ -1165,6 +1176,8 @@ def recommend_page(
         "require_bootstrap_match": bool(require_bootstrap_match),
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
+        "exclude_short_repeats": bool(exclude_short_repeats),
+        "short_repeat_page_limit": SHORT_REPEAT_PAGE_LIMIT,
     }
 
 
@@ -1292,6 +1305,268 @@ def format_bootstrap_source_query(tag: str) -> str:
 
 def normalize_source_query(query: object) -> str:
     return str(query or "").strip().lower()
+
+
+def gallery_item_from_row(row: sqlite3.Row | dict) -> dict:
+    gallery = dict(row)
+    gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+    gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
+    gallery["samples"] = json.loads(gallery.pop("samples_json", None) or "[]")
+    gallery["visual_embedding"] = parse_visual_embedding(gallery.pop("visual_embedding_json", None))
+    gallery["visual_embedding_version"] = gallery.get("visual_embedding_version")
+    gallery["visual_ready"] = bool(gallery["visual_embedding"])
+    return gallery
+
+
+def apply_feedback_state(gallery: dict) -> dict:
+    gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
+    gallery["user_mark_kind"] = gallery.get("user_mark_kind")
+    gallery["marked"] = gallery["user_mark_kind"] in MARK_KINDS
+    gallery["rated"] = gallery.get("feedback_id") is not None or gallery["marked"]
+    return gallery
+
+
+def normalize_repeat_text(value: object) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", str(value or "").lower()).split())
+
+
+def repeat_title_key_usable(value: str) -> bool:
+    if not value:
+        return False
+    return len(value) >= 12 or (len(value) >= 6 and len(value.split()) >= 2)
+
+
+def title_source_labels(title: object) -> list[str]:
+    match = SOURCE_PREFIX_RE.match(str(title or ""))
+    if not match:
+        return []
+    labels: list[str] = []
+    for label_match in SOURCE_LABEL_RE.finditer(match.group(1)):
+        label = normalize_repeat_text(label_match.group(1))
+        if label:
+            labels.append(label)
+    return labels
+
+
+def short_repeat_identity_values(gallery: dict) -> list[str]:
+    values: list[str] = []
+    for raw_tag in gallery.get("tags") or []:
+        tag = normalize_bootstrap_value(str(raw_tag or "").strip().lower())
+        if not tag or ":" not in tag:
+            continue
+        namespace = tag.split(":", 1)[0]
+        if namespace in SHORT_REPEAT_IDENTITY_NAMESPACES:
+            values.append(f"tag:{tag}")
+    return sorted(set(values))
+
+
+def short_repeat_keys(gallery: dict) -> list[str]:
+    title = str(gallery.get("title") or "")
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    normalized = normalize_repeat_text(title)
+    if repeat_title_key_usable(normalized):
+        add(f"title:{normalized}")
+
+    prefix = SOURCE_PREFIX_RE.match(title)
+    if not prefix:
+        return keys
+
+    labels = title_source_labels(title)
+    stripped = normalize_repeat_text(title[prefix.end() :])
+    if stripped != normalized and repeat_title_key_usable(stripped):
+        add(f"title:{stripped}")
+        for label in labels:
+            add(f"source-title:{label}|{stripped}")
+
+    identities = short_repeat_identity_values(gallery)
+    for label in labels:
+        for identity in identities:
+            add(f"source-identity:{label}|{identity}")
+    return keys
+
+
+def short_repeat_page_count(gallery: dict) -> int | None:
+    try:
+        page_count = int(gallery.get("page_count") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return page_count if page_count > 0 else None
+
+
+def is_short_repeat_candidate(gallery: dict, page_limit: int = SHORT_REPEAT_PAGE_LIMIT) -> bool:
+    page_count = short_repeat_page_count(gallery)
+    return page_count is not None and page_count <= page_limit
+
+
+def related_feedback_payload(gallery: dict) -> dict:
+    return {
+        "url": gallery.get("url"),
+        "title": gallery.get("title"),
+        "category": gallery.get("category"),
+        "uploader": gallery.get("uploader"),
+        "page_count": gallery.get("page_count"),
+        "feedback_id": gallery.get("feedback_id"),
+        "user_vote": round(float(gallery.get("user_vote", 0) or 0), 3),
+        "user_score": gallery.get("user_score"),
+        "feedback_created_at": gallery.get("feedback_created_at"),
+        "user_mark_kind": gallery.get("user_mark_kind"),
+        "mark_updated_at": gallery.get("mark_updated_at"),
+    }
+
+
+def related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    rows = conn.execute(
+        """
+        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+               f.feedback_created_at,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+        FROM galleries g
+        LEFT JOIN (
+            SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote,
+                   feedback.score AS user_score, feedback.created_at AS feedback_created_at
+            FROM feedback
+            JOIN (
+                SELECT gallery_url, MAX(id) AS latest_id
+                FROM feedback
+                GROUP BY gallery_url
+            ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
+        ) f ON f.gallery_url = g.url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        WHERE f.feedback_id IS NOT NULL OR m.kind IS NOT NULL
+        ORDER BY COALESCE(f.feedback_id, 0) DESC, m.updated_at DESC, g.last_seen_at DESC
+        LIMIT 10000
+        """
+    ).fetchall()
+    index: dict[str, list[dict]] = {}
+    for row in rows:
+        gallery = apply_feedback_state(gallery_item_from_row(row))
+        payload = related_feedback_payload(gallery)
+        for key in short_repeat_keys(gallery):
+            index.setdefault(key, []).append(payload)
+    return index
+
+
+def short_repeat_related_references(
+    gallery: dict,
+    reference_index: dict[str, list[dict]],
+    limit: int = RELATED_FEEDBACK_REFERENCE_LIMIT,
+    page_limit: int = SHORT_REPEAT_PAGE_LIMIT,
+) -> list[dict]:
+    if not is_short_repeat_candidate(gallery, page_limit=page_limit):
+        return []
+    references: list[dict] = []
+    seen_urls = {gallery.get("url")}
+    for key in short_repeat_keys(gallery):
+        for reference in reference_index.get(key, []):
+            url = reference.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            item = dict(reference)
+            item["matched_key"] = key
+            references.append(item)
+            if len(references) >= limit:
+                return references
+    return references
+
+
+def is_short_repeat_gallery(gallery: dict, reference_index: dict[str, list[dict]]) -> bool:
+    return bool(short_repeat_related_references(gallery, reference_index, limit=1))
+
+
+def short_repeat_page(
+    conn: sqlite3.Connection,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+    candidate_limit: int = 2000,
+    page_limit: int = SHORT_REPEAT_PAGE_LIMIT,
+) -> dict:
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    filter_text = (filter_text or "").strip().lower()
+    page_limit = max(1, min(100, int(page_limit)))
+    candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
+    candidate_limit = max(limit + offset, candidate_limit)
+    reference_index = related_feedback_reference_index(conn)
+    if not reference_index:
+        return {
+            "items": [],
+            "limit": limit,
+            "offset": offset,
+            "next_offset": offset,
+            "total": 0,
+            "has_more": False,
+            "candidate_limit": candidate_limit,
+            "short_repeat_page_limit": page_limit,
+        }
+
+    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(conn)
+    tag_strengths = tag_corpus_strengths(conn)
+    rows = conn.execute(
+        """
+        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+        FROM galleries g
+        LEFT JOIN (
+            SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote, feedback.score AS user_score
+            FROM feedback
+            JOIN (
+                SELECT gallery_url, MAX(id) AS latest_id
+                FROM feedback
+                GROUP BY gallery_url
+            ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
+        ) f ON f.gallery_url = g.url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        WHERE f.feedback_id IS NULL AND m.kind IS NULL AND g.page_count IS NOT NULL AND g.page_count <= ?
+        ORDER BY g.last_seen_at DESC
+        LIMIT ?
+        """,
+        (page_limit, candidate_limit),
+    ).fetchall()
+
+    items: list[dict] = []
+    for idx, row in enumerate(rows):
+        gallery = apply_feedback_state(gallery_item_from_row(row))
+        if filter_text and not gallery_matches_filter(gallery, filter_text):
+            continue
+        related = short_repeat_related_references(gallery, reference_index, page_limit=page_limit)
+        if not related:
+            continue
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
+        gallery.pop("visual_embedding", None)
+        freshness = freshness_bonus(idx, candidate_limit)
+        score += freshness
+        if freshness:
+            reasons.append(f"fresh {freshness:+.2f}")
+        gallery["score"] = round(score, 3)
+        gallery["reasons"] = ["short repeat", *reasons][:5]
+        gallery["related_feedback"] = related
+        gallery["short_repeat"] = True
+        gallery["short_repeat_page_limit"] = page_limit
+        items.append(gallery)
+
+    page_items = items[offset : offset + limit]
+    next_offset = offset + len(page_items)
+    return {
+        "items": page_items,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(items),
+        "has_more": next_offset < len(items),
+        "candidate_limit": candidate_limit,
+        "short_repeat_page_limit": page_limit,
+    }
 
 
 def reaction_history_page(

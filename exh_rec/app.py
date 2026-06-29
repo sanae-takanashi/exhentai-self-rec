@@ -63,6 +63,7 @@ from .recommender import (
     retrain_model,
     clear_shared_thumbnail_metadata,
     score_gallery,
+    short_repeat_page,
     store_galleries,
     store_gallery_samples,
     store_visual_embedding,
@@ -185,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(reaction_history_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
+            elif path == "/api/short-repeats":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(short_repeat_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
             elif path == "/api/marks":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
@@ -2029,6 +2037,23 @@ def marked_gallery_payload(
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
+def short_repeat_payload(
+    conn,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    page = short_repeat_page(
+        conn,
+        limit=limit,
+        offset=offset,
+        filter_text=filter_text,
+        candidate_limit=recommend_candidate_limit(conn),
+    )
+    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
 def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match: bool = False) -> dict:
     view = str(payload.get("view") or "").strip().lower()
     if view in {"favorite", "ban"}:
@@ -2040,6 +2065,8 @@ def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match
         )
     if view == "history":
         return reaction_history_payload(conn, limit=40, filter_text=payload.get("filter_text"))
+    if view == "short-repeats":
+        return short_repeat_payload(conn, limit=40, filter_text=payload.get("filter_text"))
     return recommendation_payload(
         conn,
         limit=40,

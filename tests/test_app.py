@@ -69,6 +69,7 @@ from exh_rec.app import (
     select_detail_candidates,
     select_recommendation_detail_candidates,
     server_display_url,
+    short_repeat_payload,
     thumbnail_referer,
 )
 from exh_rec.exhentai import Gallery
@@ -816,6 +817,45 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
         self.assertEqual(payload["items"][0]["user_score"], 5)
         self.assertTrue(payload["items"][0]["rated"])
+        conn.close()
+
+    def test_short_repeat_payload_returns_related_old_feedback(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        old_url = "https://exhentai.org/g/10pixivold/a/"
+        repeat_url = "https://exhentai.org/g/10pixivnew/a/"
+        sample_url = "https://s.exhentai.org/t/repeat.jpg"
+        store_galleries(
+            conn,
+            [
+                Gallery(
+                    url=old_url,
+                    gid="10pixivold",
+                    token="a",
+                    title="[Pixiv] Payload Artist May",
+                    tags=["artist:payload artist"],
+                ),
+                Gallery(
+                    url=repeat_url,
+                    gid="10pixivnew",
+                    token="a",
+                    title="[Pixiv] Payload Artist June",
+                    tags=["artist:payload artist"],
+                ),
+            ],
+        )
+        store_gallery_samples(conn, old_url, 60, [])
+        store_gallery_samples(conn, repeat_url, 4, [sample_url])
+        record_feedback(conn, old_url, score=2)
+
+        payload = short_repeat_payload(conn, limit=10)
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["url"], repeat_url)
+        self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
+        self.assertEqual(payload["items"][0]["related_feedback"][0]["url"], old_url)
+        self.assertEqual(payload["items"][0]["related_feedback"][0]["user_score"], 2)
         conn.close()
 
     def test_marked_gallery_payload_returns_bookmark_cards(self):
