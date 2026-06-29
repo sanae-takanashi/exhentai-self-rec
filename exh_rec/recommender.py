@@ -71,6 +71,7 @@ RELATED_FEEDBACK_REFERENCE_LIMIT = 5
 SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist"}
 SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]\)】」』]\s*)+)")
 SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
+TITLE_ARTIST_ID_RE = re.compile(r"^\s*(?P<name>.+?)\s*[\(（](?P<artist_id>\d{4,})[\)）]\s*$")
 
 
 def parse_bootstrap_tags(raw: str) -> list[tuple[str, float]]:
@@ -1360,11 +1361,30 @@ def short_repeat_identity_values(gallery: dict) -> list[str]:
     return sorted(set(values))
 
 
+def short_repeat_title_identity_values(title: object) -> list[str]:
+    raw_title = str(title or "")
+    prefix = SOURCE_PREFIX_RE.match(raw_title)
+    if not prefix:
+        return []
+    stripped = raw_title[prefix.end() :].strip()
+    match = TITLE_ARTIST_ID_RE.match(stripped)
+    if not match:
+        return []
+    name = normalize_repeat_text(match.group("name"))
+    artist_id = match.group("artist_id")
+    stripped_key = normalize_repeat_text(stripped)
+    if not name or not artist_id or not repeat_title_key_usable(stripped_key):
+        return []
+    return sorted({f"title-artist:{label}|{stripped_key}" for label in title_source_labels(raw_title)})
+
+
 def short_repeat_keys(gallery: dict) -> list[str]:
     title = str(gallery.get("title") or "")
     keys: list[str] = []
     seen: set[str] = set()
     identities = short_repeat_identity_values(gallery)
+    if not identities:
+        identities = short_repeat_title_identity_values(title)
     if not identities:
         return []
 

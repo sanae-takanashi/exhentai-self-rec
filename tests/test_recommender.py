@@ -1120,6 +1120,31 @@ class RecommenderTest(unittest.TestCase):
         self.assertNotIn(short_url, repeat_urls)
         self.assertIn(short_url, review_urls)
 
+    def test_short_repeat_page_uses_source_artist_id_title_without_artist_tag(self):
+        old_url = "https://exhentai.org/g/7artisttitleold/a/"
+        short_url = "https://exhentai.org/g/7artisttitleshort/a/"
+        different_url = "https://exhentai.org/g/7artisttitledifferent/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="7artisttitleold", token="a", title="[Pixiv] Shimayuka (27678104)"),
+                Gallery(url=short_url, gid="7artisttitleshort", token="a", title="[Pixiv] Shimayuka (27678104)"),
+                Gallery(url=different_url, gid="7artisttitledifferent", token="a", title="[Pixiv] Shimayuka (99999999)"),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 40, [])
+        store_gallery_samples(self.conn, short_url, 6, [])
+        store_gallery_samples(self.conn, different_url, 6, [])
+        record_feedback(self.conn, old_url, vote=1)
+
+        repeat_urls = [item["url"] for item in short_repeat_page(self.conn, limit=10)["items"]]
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertIn(short_url, repeat_urls)
+        self.assertNotIn(different_url, repeat_urls)
+        self.assertNotIn(short_url, review_urls)
+        self.assertIn(different_url, review_urls)
+
     def test_recommend_filters_explicit_language_tags(self):
         japanese_url = "https://exhentai.org/g/8j/b/"
         english_url = "https://exhentai.org/g/8e/b/"
