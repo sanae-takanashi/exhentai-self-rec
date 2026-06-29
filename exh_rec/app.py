@@ -376,6 +376,11 @@ class Handler(BaseHTTPRequestHandler):
                     log_feedback_update(feedback_update)
                     page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "removed": removed, "feedback_update": feedback_update, **page})
+            elif path == "/api/short-repeats/recalculate":
+                payload = self.read_json()
+                with db.connect() as conn:
+                    page = short_repeat_payload(conn, limit=40, filter_text=payload.get("filter_text"))
+                self.send_json({"ok": True, "recalculated_at": current_timestamp(), **page})
             elif path == "/api/retrain":
                 payload = self.read_json()
                 with db.connect() as conn:

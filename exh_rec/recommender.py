@@ -68,7 +68,7 @@ MODEL_MODE_VISUAL = "visual"
 MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL}
 SHORT_REPEAT_PAGE_LIMIT = 10
 RELATED_FEEDBACK_REFERENCE_LIMIT = 5
-SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist", "group", "cosplayer", "parody", "character"}
+SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist"}
 SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]\)】」』]\s*)+)")
 SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
 
@@ -1364,6 +1364,9 @@ def short_repeat_keys(gallery: dict) -> list[str]:
     title = str(gallery.get("title") or "")
     keys: list[str] = []
     seen: set[str] = set()
+    identities = short_repeat_identity_values(gallery)
+    if not identities:
+        return []
 
     def add(key: str) -> None:
         if key and key not in seen:
@@ -1372,7 +1375,8 @@ def short_repeat_keys(gallery: dict) -> list[str]:
 
     normalized = normalize_repeat_text(title)
     if repeat_title_key_usable(normalized):
-        add(f"title:{normalized}")
+        for identity in identities:
+            add(f"title-identity:{normalized}|{identity}")
 
     prefix = SOURCE_PREFIX_RE.match(title)
     if not prefix:
@@ -1381,14 +1385,9 @@ def short_repeat_keys(gallery: dict) -> list[str]:
     labels = title_source_labels(title)
     stripped = normalize_repeat_text(title[prefix.end() :])
     if stripped != normalized and repeat_title_key_usable(stripped):
-        add(f"title:{stripped}")
         for label in labels:
-            add(f"source-title:{label}|{stripped}")
-
-    identities = short_repeat_identity_values(gallery)
-    for label in labels:
-        for identity in identities:
-            add(f"source-identity:{label}|{identity}")
+            for identity in identities:
+                add(f"source-title-identity:{label}|{stripped}|{identity}")
     return keys
 
 

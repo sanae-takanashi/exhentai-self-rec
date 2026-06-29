@@ -833,14 +833,14 @@ class AppTest(unittest.TestCase):
                     url=old_url,
                     gid="10pixivold",
                     token="a",
-                    title="[Pixiv] Payload Artist May",
+                    title="[Pixiv] Payload Artist Pack",
                     tags=["artist:payload artist"],
                 ),
                 Gallery(
                     url=repeat_url,
                     gid="10pixivnew",
                     token="a",
-                    title="[Pixiv] Payload Artist June",
+                    title="[Pixiv] Payload Artist Pack",
                     tags=["artist:payload artist"],
                 ),
             ],
@@ -856,6 +856,52 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
         self.assertEqual(payload["items"][0]["related_feedback"][0]["url"], old_url)
         self.assertEqual(payload["items"][0]["related_feedback"][0]["user_score"], 2)
+        conn.close()
+
+    def test_short_repeat_recalculate_endpoint_returns_fresh_payload(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        old_url = "https://exhentai.org/g/10recalcold/a/"
+        repeat_url = "https://exhentai.org/g/10recalcnew/a/"
+        store_galleries(
+            conn,
+            [
+                Gallery(
+                    url=old_url,
+                    gid="10recalcold",
+                    token="a",
+                    title="[Pixiv] Recalc Artist Pack",
+                    tags=["artist:recalc artist"],
+                ),
+                Gallery(
+                    url=repeat_url,
+                    gid="10recalcnew",
+                    token="a",
+                    title="[Pixiv] Recalc Artist Pack",
+                    tags=["artist:recalc artist"],
+                ),
+            ],
+        )
+        store_gallery_samples(conn, old_url, 50, [])
+        store_gallery_samples(conn, repeat_url, 5, [])
+        record_feedback(conn, old_url, vote=1)
+
+        sent = []
+        handler = Handler.__new__(Handler)
+        handler.path = "/api/short-repeats/recalculate"
+        handler.read_json = lambda: {"filter_text": "Recalc"}
+        handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+        handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        with patch("exh_rec.app.db.connect", return_value=conn):
+            handler.do_POST()
+
+        self.assertEqual(sent[0][1], HTTPStatus.OK)
+        self.assertTrue(sent[0][0]["ok"])
+        self.assertIn("recalculated_at", sent[0][0])
+        self.assertEqual(sent[0][0]["total"], 1)
+        self.assertEqual(sent[0][0]["items"][0]["url"], repeat_url)
         conn.close()
 
     def test_marked_gallery_payload_returns_bookmark_cards(self):

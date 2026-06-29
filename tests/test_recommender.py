@@ -1042,22 +1042,22 @@ class RecommenderTest(unittest.TestCase):
                     url=old_url,
                     gid="7oldsrc",
                     token="a",
-                    title="[Pixiv] Source Artist January",
+                    title="[Pixiv] Source Artist Pack",
                     tags=["artist:source artist"],
                 ),
                 Gallery(
                     url=repeat_url,
                     gid="7newsrc",
                     token="a",
-                    title="[Pixiv] Source Artist June Update",
+                    title="[Pixiv] Source Artist Pack",
                     tags=["artist:source artist"],
                 ),
                 Gallery(
                     url=normal_url,
                     gid="7normal",
                     token="a",
-                    title="[Pixiv] Other Artist June Update",
-                    tags=["artist:other artist"],
+                    title="[Pixiv] Different Source Artist Pack",
+                    tags=["artist:source artist"],
                 ),
             ],
         )
@@ -1082,9 +1082,9 @@ class RecommenderTest(unittest.TestCase):
         store_galleries(
             self.conn,
             [
-                Gallery(url=old_url, gid="7exactold", token="a", title="[Fantia] Exact Pack"),
-                Gallery(url=short_url, gid="7exactshort", token="a", title="[Fantia] Exact Pack"),
-                Gallery(url=long_url, gid="7exactlong", token="a", title="[Fantia] Exact Pack"),
+                Gallery(url=old_url, gid="7exactold", token="a", title="[Fantia] Exact Pack", tags=["artist:exact"]),
+                Gallery(url=short_url, gid="7exactshort", token="a", title="[Fantia] Exact Pack", tags=["artist:exact"]),
+                Gallery(url=long_url, gid="7exactlong", token="a", title="[Fantia] Exact Pack", tags=["artist:exact"]),
             ],
         )
         store_gallery_samples(self.conn, old_url, 30, [])
@@ -1099,6 +1099,26 @@ class RecommenderTest(unittest.TestCase):
         self.assertNotIn(long_url, repeat_urls)
         self.assertNotIn(short_url, review_urls)
         self.assertIn(long_url, review_urls)
+
+    def test_short_repeat_page_requires_artist_tag(self):
+        old_url = "https://exhentai.org/g/7noartistold/a/"
+        short_url = "https://exhentai.org/g/7noartistshort/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="7noartistold", token="a", title="[Pixiv] Untagged Pack"),
+                Gallery(url=short_url, gid="7noartistshort", token="a", title="[Pixiv] Untagged Pack"),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 40, [])
+        store_gallery_samples(self.conn, short_url, 6, [])
+        record_feedback(self.conn, old_url, vote=1)
+
+        repeat_urls = [item["url"] for item in short_repeat_page(self.conn, limit=10)["items"]]
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertNotIn(short_url, repeat_urls)
+        self.assertIn(short_url, review_urls)
 
     def test_recommend_filters_explicit_language_tags(self):
         japanese_url = "https://exhentai.org/g/8j/b/"

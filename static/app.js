@@ -23,6 +23,7 @@ const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const localFilterEl = document.querySelector("#localFilter");
+const recalcShortRepeatsBtn = document.querySelector("#recalcShortRepeatsBtn");
 const importFileEl = document.querySelector("#importFile");
 const replaceImportEl = document.querySelector("#replaceImport");
 const loadMoreBtn = document.querySelector("#loadMoreBtn");
@@ -96,6 +97,7 @@ const staticTooltips = {
   query: "Optional one-off ExHentai search query. It is used alone when you click Fetch Query.",
   searchFetchBtn: "Fetch galleries for only the one-off query in the search box.",
   localFilter: "Filter already stored local galleries by title, tag, category, or uploader.",
+  recalcShortRepeatsBtn: "Recompute the Short Repeats queue using the current strict title and artist matching rules.",
   loadMoreBtn: "Load the next page of local results for the current view.",
 };
 
@@ -491,6 +493,7 @@ function setActiveView(view) {
   const copy = viewCopy(view);
   viewTitleEl.textContent = copy.title;
   viewSubtitleEl.textContent = copy.subtitle;
+  recalcShortRepeatsBtn.classList.toggle("hidden", view !== "short-repeats");
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
@@ -522,6 +525,16 @@ async function loadShortRepeats(offset = 0, append = false) {
   );
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
+async function recalculateShortRepeats() {
+  setStatus("Recalculating short repeat groups");
+  const payload = await api("/api/short-repeats/recalculate", {
+    method: "POST",
+    body: JSON.stringify({ filter_text: localFilterEl.value.trim() }),
+  });
+  applyGalleryPage(payload);
+  setStatus(`Recalculated ${payload.total} short repeat galleries`);
 }
 
 async function loadMarkedGalleries(kind, offset = 0, append = false) {
@@ -1266,6 +1279,7 @@ document.querySelector("#downloadDinov2Btn").addEventListener("click", () => dow
 document.querySelector("#checkBtn").addEventListener("click", () => checkLogin().catch((error) => setStatus(error.message, true)));
 document.querySelector("#clearCookieBtn").addEventListener("click", () => clearCookie().catch((error) => setStatus(error.message, true)));
 document.querySelector("#searchFetchBtn").addEventListener("click", () => fetchNew(queryEl.value).catch((error) => setStatus(error.message, true)));
+recalcShortRepeatsBtn.addEventListener("click", () => recalculateShortRepeats().catch((error) => setStatus(error.message, true)));
 queryEl.addEventListener("change", () => previewPlan().catch((error) => setStatus(error.message, true)));
 document.querySelector("#modelBtn").addEventListener("click", () => showModel().catch((error) => setStatus(error.message, true)));
 document.querySelector("#retrainBtn").addEventListener("click", () => retrain().catch((error) => setStatus(error.message, true)));
