@@ -52,6 +52,7 @@ let reviewExploreSeed = "";
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
 let renderedGalleryUrls = [];
+let renderedGalleryItems = [];
 let parentProgressVisible = false;
 let parentProgressPollTimer = null;
 const pendingGalleryRefreshUrls = new Set();
@@ -723,7 +724,10 @@ async function refreshGalleryMetadata(galleryUrl) {
         gallery_url: galleryUrl,
       }),
     });
-    await loadCurrentPage();
+    const replaced = payload.item ? replaceRenderedGallery(payload.item) : false;
+    if (!replaced) {
+      await loadCurrentPage();
+    }
     const parentText = payload.parent_url ? "parent found" : "no parent found";
     setStatus(`Refreshed gallery metadata (${parentText}, ${payload.sample_count || 0} samples)`);
   } finally {
@@ -1048,10 +1052,12 @@ function renderGalleryCards(items, append = false) {
   const mode = currentView;
   if (!append) {
     renderedGalleryUrls = [];
+    renderedGalleryItems = [];
   }
   for (const item of items) {
     if (item && item.url) {
       renderedGalleryUrls.push(item.url);
+      renderedGalleryItems.push(item);
     }
   }
   if (!append && !items.length) {
@@ -1158,6 +1164,22 @@ function renderGalleryCards(items, append = false) {
       queueVisualEmbedding(item);
     }
   }
+}
+
+function replaceRenderedGallery(item) {
+  if (!item || !item.url) {
+    return false;
+  }
+  const index = renderedGalleryItems.findIndex((entry) => entry && entry.url === item.url);
+  if (index < 0) {
+    return false;
+  }
+  renderedGalleryItems[index] = {
+    ...renderedGalleryItems[index],
+    ...item,
+  };
+  renderGalleryCards(renderedGalleryItems);
+  return true;
 }
 
 function feedbackStatusMessage(base, payload) {

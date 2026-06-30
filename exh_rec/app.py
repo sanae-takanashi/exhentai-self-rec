@@ -2560,6 +2560,22 @@ def gallery_item_payloads(conn, items: list[dict]) -> list[dict]:
     return [gallery_item_payload(conn, item) for item in items]
 
 
+def gallery_db_row_payload(conn, row) -> dict:
+    item = db.row_to_dict(row)
+    if "tags_json" in item:
+        item["tags"] = safe_json_list(item.pop("tags_json", None))
+    if "samples_json" in item:
+        item["samples"] = safe_json_list(item.pop("samples_json", None))
+    if "tag_weights_json" in item:
+        try:
+            tag_weights = json.loads(item.pop("tag_weights_json", None) or "{}")
+        except json.JSONDecodeError:
+            tag_weights = {}
+        item["tag_weights"] = tag_weights if isinstance(tag_weights, dict) else {}
+    item.pop("visual_embedding_json", None)
+    return gallery_item_payload(conn, item)
+
+
 def gallery_item_payload(conn, item: dict) -> dict:
     updated = recommendation_item_with_image_fallback(item)
     parent_chain = gallery_parent_chain(conn, updated)
@@ -2812,7 +2828,7 @@ def refresh_gallery_metadata(gallery_url: str) -> dict:
         store_galleries(conn, [detailed], detail_fetched=True)
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
         row = conn.execute("SELECT * FROM galleries WHERE url = ?", (detailed.url,)).fetchone()
-        item = gallery_item_payload(conn, db.row_to_dict(row)) if row else None
+        item = gallery_db_row_payload(conn, row) if row else None
     return {
         "gallery_url": detailed.url,
         "parent_url": detailed.parent_url,
