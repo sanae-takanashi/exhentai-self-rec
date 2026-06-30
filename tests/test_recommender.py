@@ -1404,7 +1404,14 @@ class RecommenderTest(unittest.TestCase):
         store_galleries(
             self.conn,
             [
-                Gallery(url=alpha_url, gid="10f", token="d", title="Alpha Match", tags=["artist:alpha"]),
+                Gallery(
+                    url=alpha_url,
+                    gid="10f",
+                    token="d",
+                    title="Alpha Match",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    tags=["artist:alpha"],
+                ),
                 Gallery(url=beta_url, gid="10g", token="d", title="Beta Match", tags=["artist:beta"]),
             ],
         )
@@ -1412,9 +1419,11 @@ class RecommenderTest(unittest.TestCase):
         record_feedback(self.conn, beta_url, vote=-1)
 
         filtered = reaction_history_page(self.conn, filter_text="alpha")
+        filtered_alt_title = reaction_history_page(self.conn, filter_text="日枝御子")
         second_page = reaction_history_page(self.conn, limit=1, offset=1)
 
         self.assertEqual([item["url"] for item in filtered["items"]], [alpha_url])
+        self.assertEqual([item["url"] for item in filtered_alt_title["items"]], [alpha_url])
         self.assertEqual(filtered["total"], 1)
         self.assertEqual(second_page["items"][0]["url"], alpha_url)
         self.assertTrue(second_page["has_more"] is False)

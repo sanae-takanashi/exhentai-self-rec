@@ -47,6 +47,7 @@ from .recommender import (
     feedback_history,
     feedback_signal,
     get_bootstrap_tags,
+    gallery_matches_filter,
     import_preferences,
     learned_query_tags,
     marked_gallery_page,
@@ -381,6 +382,14 @@ class Handler(BaseHTTPRequestHandler):
                 with db.connect() as conn:
                     page = short_repeat_payload(conn, limit=40, filter_text=payload.get("filter_text"))
                 self.send_json({"ok": True, "recalculated_at": current_timestamp(), **page})
+            elif path == "/api/reactions/backfill-parents":
+                payload = self.read_json()
+                result = backfill_parent_metadata(
+                    scope=payload.get("scope") or "history",
+                    limit=payload.get("limit") or 100,
+                    filter_text=payload.get("filter_text"),
+                )
+                self.send_json(result)
             elif path == "/api/retrain":
                 payload = self.read_json()
                 with db.connect() as conn:
@@ -1484,6 +1493,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
 
 
 REFRESH_THUMBS_MAX = 60
+PARENT_METADATA_BACKFILL_MAX = 200
 
 
 def enrich_covers_via_api(cookie: str, galleries: list[Gallery], proxy_url: str = "") -> int:
@@ -1497,6 +1507,173 @@ def enrich_covers_via_api(cookie: str, galleries: list[Gallery], proxy_url: str 
         return 0
     metadata = fetch_gallery_metadata(cookie, pairs, proxy_url=proxy_url)
     return apply_gallery_metadata(galleries, metadata)
+
+
+def history_parent_metadata_candidates(
+    conn,
+    scope: str = "history",
+    limit: int = 100,
+    filter_text: str | None = None,
+) -> list[Gallery]:
+    limit = bounded_int(limit, default=100, lower=1, upper=PARENT_METADATA_BACKFILL_MAX)
+    scope = str(scope or "history").strip().lower()
+    if scope not in {"history", "all"}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "scope must be history or all")
+    filter_text = (filter_text or "").strip().lower()
+    fetch_limit = 10000 if filter_text else limit
+    history_filter = "AND (f.feedback_id IS NOT NULL OR m.kind IS NOT NULL)" if scope == "history" else ""
+    rows = conn.execute(
+        f"""
+        SELECT g.*, f.feedback_id, m.kind AS user_mark_kind
+        FROM galleries g
+        LEFT JOIN (
+            SELECT feedback.id AS feedback_id, feedback.gallery_url
+            FROM feedback
+            JOIN (
+                SELECT gallery_url, MAX(id) AS latest_id
+                FROM feedback
+                GROUP BY gallery_url
+            ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
+        ) f ON f.gallery_url = g.url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        WHERE g.gid IS NOT NULL AND g.gid != ''
+          AND g.token IS NOT NULL AND g.token != ''
+          AND (g.parent_url IS NULL OR g.parent_url = '' OR g.title_jpn IS NULL OR g.title_jpn = '')
+          {history_filter}
+        ORDER BY COALESCE(f.feedback_id, 0) DESC, m.updated_at DESC, g.last_seen_at DESC
+        LIMIT ?
+        """,
+        (fetch_limit,),
+    ).fetchall()
+    candidates: list[Gallery] = []
+    for row in rows:
+        item = db.row_to_dict(row)
+        if filter_text and not gallery_matches_filter(item, filter_text):
+            continue
+        candidates.append(gallery_from_item(item))
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def persist_gallery_metadata(conn, gallery: Gallery) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT title, title_jpn, category, uploader, posted_at, thumb_url, rating,
+               tags_json, tag_weights_json, parent_url, page_count
+        FROM galleries
+        WHERE url = ?
+        """,
+        (gallery.url,),
+    ).fetchone()
+    if not row:
+        return {"updated": 0, "parent_updated": 0, "title_jpn_updated": 0}
+
+    updates: dict[str, object] = {}
+    text_fields = {
+        "title": gallery.title if gallery.title and not gallery.title.startswith("Gallery ") else None,
+        "title_jpn": gallery.title_jpn,
+        "category": gallery.category,
+        "uploader": gallery.uploader,
+        "posted_at": gallery.posted_at,
+        "thumb_url": gallery.thumb_url,
+        "parent_url": gallery.parent_url,
+    }
+    for field, value in text_fields.items():
+        value = str(value or "").strip()
+        if value and value != (row[field] or ""):
+            updates[field] = value
+    if gallery.rating is not None and gallery.rating != row["rating"]:
+        updates["rating"] = gallery.rating
+    if gallery.page_count is not None and gallery.page_count != row["page_count"]:
+        updates["page_count"] = gallery.page_count
+    tags_json = json.dumps(gallery.tags, ensure_ascii=True)
+    if gallery.tags and tags_json != (row["tags_json"] or "[]"):
+        updates["tags_json"] = tags_json
+    tag_weights_json = json.dumps(normalize_gallery_tag_weights(gallery), ensure_ascii=True)
+    if gallery.tag_weights and tag_weights_json != (row["tag_weights_json"] or "{}"):
+        updates["tag_weights_json"] = tag_weights_json
+
+    if not updates:
+        return {"updated": 0, "parent_updated": 0, "title_jpn_updated": 0}
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    conn.execute(f"UPDATE galleries SET {assignments} WHERE url = ?", (*updates.values(), gallery.url))
+    return {
+        "updated": 1,
+        "parent_updated": 1 if "parent_url" in updates else 0,
+        "title_jpn_updated": 1 if "title_jpn" in updates else 0,
+    }
+
+
+def normalize_gallery_tag_weights(gallery: Gallery) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for tag, value in gallery.tag_weights.items():
+        try:
+            normalized[str(tag).strip().lower()] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def backfill_parent_metadata(
+    scope: str = "history",
+    limit: int = 100,
+    filter_text: str | None = None,
+) -> dict:
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
+    errors: list[str] = []
+    try:
+        with db.connect() as conn:
+            cookie = db.get_setting(conn, "cookie_header", "")
+            proxy_url = network_proxy(conn)
+            galleries = history_parent_metadata_candidates(conn, scope=scope, limit=limit, filter_text=filter_text)
+        if not cookie:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
+        if not galleries:
+            with db.connect() as conn:
+                page = reaction_history_payload(conn, limit=40, filter_text=filter_text)
+            return {
+                "ok": True,
+                "checked": 0,
+                "updated": 0,
+                "parent_updated": 0,
+                "title_jpn_updated": 0,
+                "errors": errors,
+                **page,
+            }
+
+        try:
+            metadata = fetch_gallery_metadata(
+                cookie,
+                [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token],
+                proxy_url=proxy_url,
+            )
+            apply_gallery_metadata(galleries, metadata)
+        except Exception as exc:
+            errors.append(f"gdata API: {exc}")
+
+        updated = 0
+        parent_updated = 0
+        title_jpn_updated = 0
+        with db.connect() as conn:
+            for gallery in galleries:
+                stats = persist_gallery_metadata(conn, gallery)
+                updated += stats["updated"]
+                parent_updated += stats["parent_updated"]
+                title_jpn_updated += stats["title_jpn_updated"]
+            page = reaction_history_payload(conn, limit=40, filter_text=filter_text)
+        return {
+            "ok": not errors,
+            "checked": len(galleries),
+            "updated": updated,
+            "parent_updated": parent_updated,
+            "title_jpn_updated": title_jpn_updated,
+            "errors": errors,
+            **page,
+        }
+    finally:
+        FETCH_LOCK.release()
 
 
 def ensure_api_cover(cookie: str, base: Gallery, detailed: Gallery, proxy_url: str = "") -> None:

@@ -16,6 +16,7 @@ from exh_rec.app import (
     REFRESH_STATE,
     REFRESH_WAKE,
     Handler,
+    backfill_parent_metadata,
     background_refresh,
     build_queries,
     build_query_plan,
@@ -818,6 +819,97 @@ class AppTest(unittest.TestCase):
         self.assertEqual(payload["items"][0]["user_score"], 5)
         self.assertTrue(payload["items"][0]["rated"])
         conn.close()
+
+    def test_backfill_parent_metadata_updates_reaction_history_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                history_url = "https://exhentai.org/g/4015079/def456/"
+                unrated_url = "https://exhentai.org/g/4015080/def457/"
+                parent_url = "https://exhentai.org/g/3974133/abc123/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(
+                        conn,
+                        [
+                            Gallery(url=history_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras"),
+                            Gallery(url=unrated_url, gid="4015080", token="def457", title="Unrated Missing Parent"),
+                        ],
+                    )
+                    record_feedback(conn, history_url, vote=1)
+
+                metadata = {
+                    history_url: {
+                        "title_jpn": "[日枝御子] コミックスとエクストラ",
+                        "parent_url": parent_url,
+                        "thumb": "https://ehgt.org/aa/bb/4015079.jpg",
+                        "tags": ["artist:hie himiko"],
+                    },
+                    unrated_url: {"parent_url": parent_url},
+                }
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata:
+                    result = backfill_parent_metadata(scope="history", limit=10, filter_text="Hie")
+
+                with db.connect() as conn:
+                    history = conn.execute(
+                        "SELECT title_jpn, parent_url, thumb_url, tags_json FROM galleries WHERE url = ?",
+                        (history_url,),
+                    ).fetchone()
+                    unrated = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (unrated_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["checked"], 1)
+                self.assertEqual(result["updated"], 1)
+                self.assertEqual(result["parent_updated"], 1)
+                self.assertEqual(result["title_jpn_updated"], 1)
+                fetch_metadata.assert_called_once_with(
+                    "ipb_member_id=123; ipb_pass_hash=abc",
+                    [("4015079", "def456")],
+                    proxy_url="",
+                )
+                self.assertEqual(history["title_jpn"], "[日枝御子] コミックスとエクストラ")
+                self.assertEqual(history["parent_url"], parent_url)
+                self.assertEqual(history["thumb_url"], "https://ehgt.org/aa/bb/4015079.jpg")
+                self.assertIn("artist:hie himiko", history["tags_json"])
+                self.assertIsNone(unrated["parent_url"])
+
+    def test_backfill_parent_metadata_endpoint_returns_history_payload(self):
+        sent = []
+        handler = Handler.__new__(Handler)
+        handler.path = "/api/reactions/backfill-parents"
+        handler.read_json = lambda: {"scope": "history", "limit": 25, "filter_text": "Hie"}
+        handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+        handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        with patch("exh_rec.app.backfill_parent_metadata", return_value={"ok": True, "items": []}) as backfill:
+            handler.do_POST()
+
+        backfill.assert_called_once_with(scope="history", limit=25, filter_text="Hie")
+        self.assertEqual(sent, [({"ok": True, "items": []}, HTTPStatus.OK)])
+
+    def test_backfill_parent_metadata_all_scope_updates_unrated_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                review_url = "https://exhentai.org/g/4015079/def456/"
+                parent_url = "https://exhentai.org/g/3974133/abc123/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=review_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras")])
+
+                metadata = {review_url: {"parent_url": parent_url}}
+                with patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata):
+                    result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (review_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["checked"], 1)
+                self.assertEqual(result["parent_updated"], 1)
+                self.assertEqual(row["parent_url"], parent_url)
 
     def test_short_repeat_payload_returns_related_old_feedback(self):
         conn = sqlite3.connect(":memory:")

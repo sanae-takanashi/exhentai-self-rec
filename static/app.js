@@ -23,6 +23,9 @@ const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const localFilterEl = document.querySelector("#localFilter");
+const defaultLocalFilterPlaceholder = localFilterEl.placeholder;
+const historySearchBtn = document.querySelector("#historySearchBtn");
+const backfillHistoryParentsBtn = document.querySelector("#backfillHistoryParentsBtn");
 const recalcShortRepeatsBtn = document.querySelector("#recalcShortRepeatsBtn");
 const importFileEl = document.querySelector("#importFile");
 const replaceImportEl = document.querySelector("#replaceImport");
@@ -97,6 +100,8 @@ const staticTooltips = {
   query: "Optional one-off ExHentai search query. It is used alone when you click Fetch Query.",
   searchFetchBtn: "Fetch galleries for only the one-off query in the search box.",
   localFilter: "Filter already stored local galleries by title, tag, category, or uploader.",
+  historySearchBtn: "Search only your reaction history using the local filter text.",
+  backfillHistoryParentsBtn: "Fetch gdata metadata for stored galleries matching the current filter and missing Parent links or alternate titles.",
   recalcShortRepeatsBtn: "Recompute the Short Repeats queue using the current strict title and artist matching rules.",
   loadMoreBtn: "Load the next page of local results for the current view.",
 };
@@ -493,7 +498,11 @@ function setActiveView(view) {
   const copy = viewCopy(view);
   viewTitleEl.textContent = copy.title;
   viewSubtitleEl.textContent = copy.subtitle;
+  const historyView = view === "history";
+  historySearchBtn.classList.toggle("hidden", !historyView);
+  backfillHistoryParentsBtn.classList.toggle("hidden", !historyView);
   recalcShortRepeatsBtn.classList.toggle("hidden", view !== "short-repeats");
+  localFilterEl.placeholder = historyView ? "Search voted history by title, alt title, tag, category, uploader" : defaultLocalFilterPlaceholder;
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
@@ -535,6 +544,35 @@ async function recalculateShortRepeats() {
   });
   applyGalleryPage(payload);
   setStatus(`Recalculated ${payload.total} short repeat galleries`);
+}
+
+async function searchReactionHistory() {
+  if (currentView !== "history") {
+    setActiveView("history");
+  }
+  await loadReactionHistory();
+  const query = localFilterEl.value.trim();
+  setStatus(query ? `History search loaded for "${query}"` : "Reaction history loaded");
+}
+
+async function backfillHistoryParents() {
+  setStatus("Updating parent metadata for stored galleries");
+  const payload = await api("/api/reactions/backfill-parents", {
+    method: "POST",
+    body: JSON.stringify({
+      scope: "all",
+      limit: 100,
+      filter_text: localFilterEl.value.trim(),
+    }),
+  });
+  applyGalleryPage(payload);
+  if (payload.errors.length) {
+    setStatus(`Updated ${payload.updated} metadata rows; errors: ${payload.errors.join(" | ")}`, true);
+  } else {
+    setStatus(
+      `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)`
+    );
+  }
 }
 
 async function loadMarkedGalleries(kind, offset = 0, append = false) {
@@ -936,7 +974,10 @@ function renderGalleryCards(items, append = false) {
     }
   }
   if (!append && !items.length) {
-    recommendationsEl.innerHTML = `<div class="hint">${escapeHtml(viewCopy(mode).empty)}</div>`;
+    const emptyText = mode === "history" && localFilterEl.value.trim()
+      ? "No matching reaction history found."
+      : viewCopy(mode).empty;
+    recommendationsEl.innerHTML = `<div class="hint">${escapeHtml(emptyText)}</div>`;
     return;
   }
   if (!append) {
@@ -1279,6 +1320,8 @@ document.querySelector("#downloadDinov2Btn").addEventListener("click", () => dow
 document.querySelector("#checkBtn").addEventListener("click", () => checkLogin().catch((error) => setStatus(error.message, true)));
 document.querySelector("#clearCookieBtn").addEventListener("click", () => clearCookie().catch((error) => setStatus(error.message, true)));
 document.querySelector("#searchFetchBtn").addEventListener("click", () => fetchNew(queryEl.value).catch((error) => setStatus(error.message, true)));
+historySearchBtn.addEventListener("click", () => searchReactionHistory().catch((error) => setStatus(error.message, true)));
+backfillHistoryParentsBtn.addEventListener("click", () => backfillHistoryParents().catch((error) => setStatus(error.message, true)));
 recalcShortRepeatsBtn.addEventListener("click", () => recalculateShortRepeats().catch((error) => setStatus(error.message, true)));
 queryEl.addEventListener("change", () => previewPlan().catch((error) => setStatus(error.message, true)));
 document.querySelector("#modelBtn").addEventListener("click", () => showModel().catch((error) => setStatus(error.message, true)));
@@ -1295,6 +1338,11 @@ importFileEl.addEventListener("change", () => {
   importFileEl.value = "";
 });
 localFilterEl.addEventListener("change", () => loadCurrentPage().catch((error) => setStatus(error.message, true)));
+localFilterEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  loadCurrentPage().catch((error) => setStatus(error.message, true));
+});
 for (const tab of viewTabs) {
   tab.addEventListener("click", () => {
     setActiveView(tab.dataset.view);
