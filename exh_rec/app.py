@@ -93,11 +93,13 @@ PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
+PARENT_UPDATE_STATE: dict[str, Any] = {"running": False, "logs": []}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
+PARENT_UPDATE_LOG_LIMIT = 120
 
 
 class ApiError(Exception):
@@ -535,6 +537,7 @@ def get_status() -> dict:
         visual_encoder = configured_visual_encoder(conn)
         return {
             "fetch": dict(FETCH_STATE),
+            "parent_update": parent_update_status(),
             "last_fetch": last_fetch_run(conn),
             "fetch_history": fetch_runs(conn, limit=5),
             "plan": plan_fetch_from_conn(conn),
@@ -1061,6 +1064,58 @@ def format_log_value(value: Any) -> str:
     if isinstance(value, (list, tuple, dict)):
         return json.dumps(value, ensure_ascii=True)
     return str(value)
+
+
+def parent_update_status() -> dict:
+    state = dict(PARENT_UPDATE_STATE)
+    state["logs"] = list(PARENT_UPDATE_STATE.get("logs") or [])
+    return state
+
+
+def reset_parent_update_progress(scope: str, limit: int, filter_text: str | None) -> None:
+    PARENT_UPDATE_STATE.clear()
+    PARENT_UPDATE_STATE.update(
+        {
+            "running": True,
+            "stage": "starting",
+            "scope": scope,
+            "limit": limit,
+            "filter_text": filter_text or "",
+            "checked": 0,
+            "total": 0,
+            "detail_checked": 0,
+            "detail_total": 0,
+            "detail_done": 0,
+            "persisted": 0,
+            "updated": 0,
+            "parent_updated": 0,
+            "title_jpn_updated": 0,
+            "errors": [],
+            "logs": [],
+        }
+    )
+
+
+def update_parent_progress(message: str, **fields: Any) -> None:
+    timestamp = current_timestamp()
+    fields["message"] = message
+    fields["updated_at"] = timestamp
+    PARENT_UPDATE_STATE.update(fields)
+    log_fields = dict(fields)
+    log_fields.pop("message", None)
+    parent_update_log(message, **log_fields)
+    entry_fields = {key: value for key, value in log_fields.items() if key not in {"updated_at"}}
+    logs = list(PARENT_UPDATE_STATE.get("logs") or [])
+    logs.append({"at": timestamp, "message": message, "fields": entry_fields})
+    PARENT_UPDATE_STATE["logs"] = logs[-PARENT_UPDATE_LOG_LIMIT:]
+
+
+def parent_update_log(message: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={format_log_value(value)}" for key, value in fields.items())
+    line = f"[parent-update] {message}"
+    if details:
+        line = f"{line} {details}"
+    print(line, flush=True)
 
 
 def display_query(query: str | None) -> str:
@@ -1621,19 +1676,54 @@ def backfill_parent_metadata(
     limit: int = 100,
     filter_text: str | None = None,
 ) -> dict:
+    scope = str(scope or "history").strip().lower()
+    if scope not in {"history", "all"}:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "scope must be history or all")
+    limit = bounded_int(limit, default=100, lower=1, upper=PARENT_METADATA_BACKFILL_MAX)
+    filter_text = (filter_text or "").strip()
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
     errors: list[str] = []
     try:
+        reset_parent_update_progress(scope, limit, filter_text)
+        update_parent_progress("parent update started", stage="starting", running=True)
         with db.connect() as conn:
             cookie = db.get_setting(conn, "cookie_header", "")
             proxy_url = network_proxy(conn)
+            update_parent_progress("candidate scan started", stage="selecting")
             galleries = history_parent_metadata_candidates(conn, scope=scope, limit=limit, filter_text=filter_text)
+        update_parent_progress(
+            "candidate scan finished",
+            stage="selected",
+            checked=len(galleries),
+            total=len(galleries),
+        )
         if not cookie:
+            update_parent_progress(
+                "parent update failed",
+                stage="failed",
+                running=False,
+                error="Save your ExHentai cookie first",
+                errors=["Save your ExHentai cookie first"],
+            )
             raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
         if not galleries:
             with db.connect() as conn:
                 page = reaction_history_payload(conn, limit=40, filter_text=filter_text)
+            update_parent_progress(
+                "no parent metadata candidates",
+                stage="finished",
+                running=False,
+                checked=0,
+                total=0,
+                detail_checked=0,
+                detail_total=0,
+                detail_done=0,
+                updated=0,
+                parent_updated=0,
+                title_jpn_updated=0,
+                errors=[],
+            )
             return {
                 "ok": True,
                 "checked": 0,
@@ -1646,35 +1736,119 @@ def backfill_parent_metadata(
             }
 
         try:
+            pairs = [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token]
+            update_parent_progress("gdata metadata fetch started", stage="gdata", gdata_total=len(pairs))
             metadata = fetch_gallery_metadata(
                 cookie,
-                [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token],
+                pairs,
                 proxy_url=proxy_url,
             )
             apply_gallery_metadata(galleries, metadata)
+            update_parent_progress(
+                "gdata metadata applied",
+                stage="gdata",
+                metadata_count=len(metadata),
+                gdata_parent_count=sum(1 for meta in metadata.values() if meta.get("parent_url")),
+                detail_total=sum(1 for gallery in galleries if not str(gallery.parent_url or "").strip()),
+            )
         except Exception as exc:
             errors.append(f"gdata API: {exc}")
+            update_parent_progress(
+                "gdata metadata failed",
+                stage="gdata",
+                error=str(exc),
+                errors=list(errors),
+            )
 
         detail_checked = 0
-        for index, gallery in enumerate(galleries):
-            if str(gallery.parent_url or "").strip():
-                continue
+        detail_candidates = [
+            (index, gallery) for index, gallery in enumerate(galleries) if not str(gallery.parent_url or "").strip()
+        ]
+        update_parent_progress(
+            "detail fallback selected",
+            stage="details",
+            detail_total=len(detail_candidates),
+            detail_done=0,
+            detail_checked=0,
+        )
+        for detail_index, (index, gallery) in enumerate(detail_candidates, start=1):
+            update_parent_progress(
+                "detail fetch started",
+                stage="details",
+                detail_index=detail_index,
+                detail_total=len(detail_candidates),
+                detail_done=detail_index - 1,
+                current_gallery_url=gallery.url,
+                current_gallery_title=gallery.title,
+            )
             try:
-                galleries[index] = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+                detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+                galleries[index] = detailed
                 detail_checked += 1
+                update_parent_progress(
+                    "detail fetch finished",
+                    stage="details",
+                    detail_index=detail_index,
+                    detail_total=len(detail_candidates),
+                    detail_done=detail_index,
+                    detail_checked=detail_checked,
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=detailed.title,
+                    current_parent_url=detailed.parent_url or "",
+                    detail_parent_found=bool(detailed.parent_url),
+                )
             except Exception as exc:
                 errors.append(f"{gallery.url}: {exc}")
+                update_parent_progress(
+                    "detail fetch failed",
+                    stage="details",
+                    detail_index=detail_index,
+                    detail_total=len(detail_candidates),
+                    detail_done=detail_index,
+                    detail_checked=detail_checked,
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=gallery.title,
+                    error=str(exc),
+                    errors=list(errors),
+                )
 
         updated = 0
         parent_updated = 0
         title_jpn_updated = 0
+        update_parent_progress("database update started", stage="persisting", persisted=0)
         with db.connect() as conn:
-            for gallery in galleries:
+            for persisted, gallery in enumerate(galleries, start=1):
                 stats = persist_gallery_metadata(conn, gallery)
                 updated += stats["updated"]
                 parent_updated += stats["parent_updated"]
                 title_jpn_updated += stats["title_jpn_updated"]
+                update_parent_progress(
+                    "database row checked",
+                    stage="persisting",
+                    persisted=persisted,
+                    total=len(galleries),
+                    updated=updated,
+                    parent_updated=parent_updated,
+                    title_jpn_updated=title_jpn_updated,
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=gallery.title,
+                )
             page = reaction_history_payload(conn, limit=40, filter_text=filter_text)
+        update_parent_progress(
+            "parent update finished" if not errors else "parent update finished with errors",
+            stage="finished",
+            running=False,
+            checked=len(galleries),
+            total=len(galleries),
+            detail_checked=detail_checked,
+            detail_total=len(detail_candidates),
+            detail_done=len(detail_candidates),
+            persisted=len(galleries),
+            updated=updated,
+            parent_updated=parent_updated,
+            title_jpn_updated=title_jpn_updated,
+            errors=list(errors),
+        )
         return {
             "ok": not errors,
             "checked": len(galleries),
@@ -1685,6 +1859,17 @@ def backfill_parent_metadata(
             "errors": errors,
             **page,
         }
+    except Exception as exc:
+        if PARENT_UPDATE_STATE.get("running"):
+            logged_errors = list(errors) or [str(exc)]
+            update_parent_progress(
+                "parent update failed",
+                stage="failed",
+                running=False,
+                error=str(exc),
+                errors=logged_errors,
+            )
+        raise
     finally:
         FETCH_LOCK.release()
 

@@ -183,6 +183,17 @@
           <button id="backfillHistoryParentsBtn" class="hidden" type="button">Update Parents</button>
           <button id="recalcShortRepeatsBtn" class="hidden" type="button">Recalculate Repeats</button>
         </div>
+        <section id="parentProgress" class="parent-progress hidden" aria-live="polite">
+          <div class="parent-progress-head">
+            <div>
+              <strong id="parentProgressTitle">Parent Update</strong>
+              <span id="parentProgressSummary">Idle</span>
+            </div>
+            <span id="parentProgressCounts"></span>
+          </div>
+          <progress id="parentProgressBar" max="100" value="0"></progress>
+          <div id="parentProgressLog" class="parent-progress-log"></div>
+        </section>
         <div id="recommendations" class="grid"></div>
         <div class="loadbar">
           <button id="loadMoreBtn" type="button">Load More</button>

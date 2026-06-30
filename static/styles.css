@@ -252,6 +252,70 @@ button.danger:hover {
   max-width: 360px;
 }
 
+.parent-progress {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.parent-progress.hidden {
+  display: none;
+}
+
+.parent-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.parent-progress-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.parent-progress-head strong {
+  font-size: 13px;
+}
+
+#parentProgressSummary,
+#parentProgressCounts {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+#parentProgressCounts {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.parent-progress progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent);
+}
+
+.parent-progress-log {
+  display: grid;
+  gap: 5px;
+  max-height: 170px;
+  overflow-y: auto;
+  padding-right: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.parent-progress-log div {
+  overflow-wrap: anywhere;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));

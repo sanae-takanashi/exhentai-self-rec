@@ -13,6 +13,7 @@ from exh_rec.app import (
     ApiError,
     FETCH_LOCK,
     FETCH_STATE,
+    PARENT_UPDATE_STATE,
     REFRESH_STATE,
     REFRESH_WAKE,
     Handler,
@@ -965,6 +966,7 @@ class AppTest(unittest.TestCase):
                 with (
                     patch("exh_rec.app.fetch_gallery_metadata", return_value={review_url: {"title_jpn": ""}}),
                     patch("exh_rec.app.fetch_gallery_detail", return_value=detail) as fetch_detail,
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 ):
                     result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
 
@@ -979,6 +981,15 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(result["detail_checked"], 1)
                 self.assertEqual(result["parent_updated"], 1)
                 self.assertEqual(result["title_jpn_updated"], 1)
+                self.assertFalse(PARENT_UPDATE_STATE["running"])
+                self.assertEqual(PARENT_UPDATE_STATE["stage"], "finished")
+                self.assertEqual(PARENT_UPDATE_STATE["detail_done"], 1)
+                self.assertEqual(PARENT_UPDATE_STATE["persisted"], 1)
+                self.assertTrue(any(entry["message"] == "detail fetch finished" for entry in PARENT_UPDATE_STATE["logs"]))
+                lines = stdout.getvalue().splitlines()
+                self.assertTrue(any(line.startswith("[parent-update] parent update started") for line in lines))
+                self.assertTrue(any(line.startswith("[parent-update] detail fetch finished") for line in lines))
+                self.assertTrue(any(line.startswith("[parent-update] parent update finished") for line in lines))
                 fetch_detail.assert_called_once()
                 args, kwargs = fetch_detail.call_args
                 self.assertEqual(args[0], "ipb_member_id=123; ipb_pass_hash=abc")

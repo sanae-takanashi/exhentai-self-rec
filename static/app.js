@@ -28,6 +28,12 @@ const backfillReviewParentsBtn = document.querySelector("#backfillReviewParentsB
 const historySearchBtn = document.querySelector("#historySearchBtn");
 const backfillHistoryParentsBtn = document.querySelector("#backfillHistoryParentsBtn");
 const recalcShortRepeatsBtn = document.querySelector("#recalcShortRepeatsBtn");
+const parentProgressEl = document.querySelector("#parentProgress");
+const parentProgressTitleEl = document.querySelector("#parentProgressTitle");
+const parentProgressSummaryEl = document.querySelector("#parentProgressSummary");
+const parentProgressCountsEl = document.querySelector("#parentProgressCounts");
+const parentProgressBarEl = document.querySelector("#parentProgressBar");
+const parentProgressLogEl = document.querySelector("#parentProgressLog");
 const importFileEl = document.querySelector("#importFile");
 const replaceImportEl = document.querySelector("#replaceImport");
 const loadMoreBtn = document.querySelector("#loadMoreBtn");
@@ -46,6 +52,8 @@ let reviewExploreSeed = "";
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
 let renderedGalleryUrls = [];
+let parentProgressVisible = false;
+let parentProgressPollTimer = null;
 let visualDefaultEncoder = "simple";
 let visualEmbeddingVersion = "canvas-rgb-8x8-v1";
 let visualFallbackEncoder = "simple";
@@ -382,6 +390,7 @@ async function loadStatus() {
   const payload = await api("/api/status");
   applyVisualSettings(payload.visual);
   renderStatus(payload);
+  renderParentUpdateProgress(payload.parent_update || {});
   await reloadRecommendationsAfterFetch(payload);
   return payload;
 }
@@ -560,26 +569,38 @@ async function searchReactionHistory() {
 }
 
 async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}) {
-  const payload = await api("/api/reactions/backfill-parents", {
-    method: "POST",
-    body: JSON.stringify({
-      scope: "all",
-      limit: 100,
-      filter_text: localFilterEl.value.trim(),
-    }),
+  parentProgressVisible = true;
+  renderParentUpdateProgress({
+    running: true,
+    stage: "starting",
+    message: "Starting parent update",
+    logs: [],
   });
-  if (reloadView === "history") {
-    applyGalleryPage(payload);
-  } else {
-    await loadCurrentPage();
-  }
-  const detailText = payload.detail_checked ? `; checked ${payload.detail_checked} source pages` : "";
-  if (payload.errors.length) {
-    setStatus(`Updated ${payload.updated} metadata rows${detailText}; errors: ${payload.errors.join(" | ")}`, true);
-  } else {
-    setStatus(
-      `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)${detailText}`
-    );
+  startParentProgressPolling();
+  try {
+    const payload = await api("/api/reactions/backfill-parents", {
+      method: "POST",
+      body: JSON.stringify({
+        scope: "all",
+        limit: 100,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    if (reloadView === "history") {
+      applyGalleryPage(payload);
+    } else {
+      await loadCurrentPage();
+    }
+    const detailText = payload.detail_checked ? `; checked ${payload.detail_checked} source pages` : "";
+    if (payload.errors.length) {
+      setStatus(`Updated ${payload.updated} metadata rows${detailText}; errors: ${payload.errors.join(" | ")}`, true);
+    } else {
+      setStatus(
+        `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)${detailText}`
+      );
+    }
+  } finally {
+    await loadStatus().catch(() => {});
   }
 }
 
@@ -1219,12 +1240,156 @@ function updateLoadMore(total = null) {
       : "Load More";
 }
 
+function startParentProgressPolling() {
+  if (parentProgressPollTimer) {
+    return;
+  }
+  parentProgressPollTimer = setInterval(() => {
+    loadStatus().catch(() => {});
+  }, 1000);
+}
+
+function stopParentProgressPolling() {
+  if (!parentProgressPollTimer) {
+    return;
+  }
+  clearInterval(parentProgressPollTimer);
+  parentProgressPollTimer = null;
+}
+
+function renderParentUpdateProgress(state) {
+  const hasLogs = Boolean(state.logs && state.logs.length);
+  const shouldShow = parentProgressVisible || state.running || hasLogs;
+  parentProgressEl.classList.toggle("hidden", !shouldShow);
+  backfillReviewParentsBtn.disabled = Boolean(state.running);
+  backfillHistoryParentsBtn.disabled = Boolean(state.running);
+  if (!shouldShow) {
+    return;
+  }
+  parentProgressVisible = true;
+  if (state.running) {
+    startParentProgressPolling();
+  } else {
+    stopParentProgressPolling();
+  }
+  parentProgressTitleEl.textContent = state.running ? "Parent Update Running" : "Parent Update";
+  parentProgressSummaryEl.textContent = parentProgressSummary(state);
+  parentProgressCountsEl.textContent = parentProgressCounts(state);
+  parentProgressBarEl.value = Math.round(parentProgressPercent(state));
+  parentProgressLogEl.innerHTML = (state.logs || [])
+    .slice(-30)
+    .map((entry) => `<div>${escapeHtml(parentProgressLogLine(entry))}</div>`)
+    .join("");
+  parentProgressLogEl.scrollTop = parentProgressLogEl.scrollHeight;
+}
+
+function parentProgressSummary(state) {
+  const stage = state.stage || "idle";
+  const message = state.message || (state.running ? "Running" : "Idle");
+  if (stage === "failed") {
+    return `Failed: ${state.error || message}`;
+  }
+  if (state.updated_at) {
+    return `${message} (${state.updated_at})`;
+  }
+  return message;
+}
+
+function parentProgressCounts(state) {
+  const parts = [];
+  if (Number.isFinite(state.checked) || Number.isFinite(state.total)) {
+    parts.push(`${state.checked || 0}/${state.total || 0} candidates`);
+  }
+  if (Number.isFinite(state.detail_total) && state.detail_total > 0) {
+    parts.push(`${state.detail_done || 0}/${state.detail_total} details`);
+  }
+  if (Number.isFinite(state.persisted) && Number.isFinite(state.total) && state.total > 0) {
+    parts.push(`${state.persisted || 0}/${state.total} saved`);
+  }
+  if (Number.isFinite(state.updated)) {
+    parts.push(`${state.updated || 0} rows`);
+  }
+  if (Number.isFinite(state.parent_updated)) {
+    parts.push(`${state.parent_updated || 0} parents`);
+  }
+  return parts.join(" | ");
+}
+
+function parentProgressPercent(state) {
+  if (state.stage === "finished") {
+    return 100;
+  }
+  if (state.stage === "failed") {
+    return Math.max(5, parentProgressPercentFromCounts(state));
+  }
+  if (state.stage === "persisting" && Number.isFinite(state.total) && state.total > 0) {
+    return 75 + (Math.min(state.persisted || 0, state.total) / state.total) * 25;
+  }
+  if (state.stage === "details" && Number.isFinite(state.detail_total)) {
+    if (state.detail_total <= 0) {
+      return 70;
+    }
+    return 35 + (Math.min(state.detail_done || 0, state.detail_total) / state.detail_total) * 40;
+  }
+  if (state.stage === "gdata") {
+    return 25;
+  }
+  if (state.stage === "selected") {
+    return 15;
+  }
+  if (state.stage === "selecting") {
+    return 8;
+  }
+  return state.running ? 4 : parentProgressPercentFromCounts(state);
+}
+
+function parentProgressPercentFromCounts(state) {
+  if (Number.isFinite(state.total) && state.total > 0 && Number.isFinite(state.persisted)) {
+    return Math.min(100, (state.persisted / state.total) * 100);
+  }
+  return 0;
+}
+
+function parentProgressLogLine(entry) {
+  const fields = entry.fields || {};
+  const details = [];
+  if (fields.current_gallery_title) {
+    details.push(fields.current_gallery_title);
+  } else if (fields.current_gallery_url) {
+    details.push(fields.current_gallery_url);
+  }
+  if (fields.current_parent_url) {
+    details.push(`parent ${fields.current_parent_url}`);
+  }
+  if (fields.error) {
+    details.push(`error ${fields.error}`);
+  }
+  const suffix = details.length ? ` - ${details.join(" | ")}` : "";
+  return `${entry.at || ""} ${entry.message || ""}${suffix}`.trim();
+}
+
 function renderStatus(payload) {
   const fetchState = payload.fetch || {};
+  const parentUpdate = payload.parent_update || {};
   const last = payload.last_fetch;
   const rows = [
     ["State", fetchState.running ? fetchState.message || fetchState.stage || "Running" : "Idle"],
   ];
+  if (parentUpdate.running || parentUpdate.updated_at) {
+    rows.push(["Parents", parentUpdate.running ? parentUpdate.message || "Running" : parentUpdate.message || "Idle"]);
+    if (parentUpdate.total || parentUpdate.checked) {
+      rows.push(["Parent Candidates", `${parentUpdate.checked || 0}/${parentUpdate.total || 0}`]);
+    }
+    if (Number.isFinite(parentUpdate.detail_total)) {
+      rows.push(["Parent Details", `${parentUpdate.detail_done || 0}/${parentUpdate.detail_total}`]);
+    }
+    if (Number.isFinite(parentUpdate.updated)) {
+      rows.push(["Parent Updates", `${parentUpdate.updated || 0} rows, ${parentUpdate.parent_updated || 0} parents`]);
+    }
+    if (parentUpdate.errors && parentUpdate.errors.length) {
+      rows.push(["Parent Errors", parentUpdate.errors.join(" | ")]);
+    }
+  }
   if (fetchState.running) {
     rows.push(["Counts", `${fetchState.fetched || 0} fetched, ${fetchState.stored || 0} stored, ${fetchState.enriched || 0} enriched`]);
     if (fetchState.run_id) {
