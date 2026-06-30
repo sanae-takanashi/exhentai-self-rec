@@ -1758,6 +1758,8 @@ def gallery_from_item(item: dict) -> Gallery:
         gid=item.get("gid"),
         token=item.get("token"),
         title=item.get("title") or "Gallery",
+        title_jpn=item.get("title_jpn"),
+        parent_url=item.get("parent_url"),
         category=item.get("category"),
         uploader=item.get("uploader"),
         posted_at=item.get("posted_at"),

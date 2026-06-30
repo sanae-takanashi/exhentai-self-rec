@@ -363,6 +363,32 @@ class RecommenderTest(unittest.TestCase):
         self.assertIsNotNone(row["detail_fetched_at"])
         self.assertEqual(row["last_seen_at"], "2026-06-01 12:00:00")
 
+    def test_store_galleries_persists_parent_and_alternate_title(self):
+        gallery_url = "https://exhentai.org/g/4015079/def456/"
+        parent_url = "https://exhentai.org/g/3974133/abc123/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=gallery_url,
+                    gid="4015079",
+                    token="def456",
+                    title="Hie Himiko Comics & Extras",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    parent_url=parent_url,
+                )
+            ],
+        )
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras")],
+        )
+
+        row = self.conn.execute("SELECT title_jpn, parent_url FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+
+        self.assertEqual(row["title_jpn"], "[日枝御子] コミックスとエクストラ")
+        self.assertEqual(row["parent_url"], parent_url)
+
     def test_store_galleries_list_fetch_does_not_overwrite_detail_thumbnail(self):
         gallery_url = "https://exhentai.org/g/4b/d/"
         store_galleries(
@@ -1144,6 +1170,111 @@ class RecommenderTest(unittest.TestCase):
         self.assertNotIn(different_url, repeat_urls)
         self.assertNotIn(short_url, review_urls)
         self.assertIn(different_url, review_urls)
+
+    def test_short_repeat_page_uses_direct_parent_gallery(self):
+        parent_url = "https://exhentai.org/g/3974133/abc123/"
+        child_url = "https://exhentai.org/g/4015079/def456/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=parent_url,
+                    gid="3974133",
+                    token="abc123",
+                    title="Hie Himiko Comics & Extras",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                ),
+                Gallery(
+                    url=child_url,
+                    gid="4015079",
+                    token="def456",
+                    title="Hie Himiko Comics & Extras",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    parent_url=parent_url,
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, parent_url, 80, [])
+        store_gallery_samples(self.conn, child_url, 80, [])
+        record_feedback(self.conn, parent_url, vote=1)
+
+        repeat_page = short_repeat_page(self.conn, limit=10)
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertEqual([item["url"] for item in repeat_page["items"]], [child_url])
+        self.assertEqual(repeat_page["items"][0]["related_feedback"][0]["url"], parent_url)
+        self.assertTrue(repeat_page["items"][0]["related_feedback"][0]["matched_key"].startswith("parent-url:"))
+        self.assertNotIn(child_url, review_urls)
+
+    def test_short_repeat_page_follows_parent_chain_to_voted_ancestor(self):
+        ancestor_url = "https://exhentai.org/g/3974133/abc123/"
+        intermediate_url = "https://exhentai.org/g/3999999/bcd234/"
+        child_url = "https://exhentai.org/g/4015079/def456/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=ancestor_url, gid="3974133", token="abc123", title="Hie Himiko Comics & Extras"),
+                Gallery(
+                    url=intermediate_url,
+                    gid="3999999",
+                    token="bcd234",
+                    title="Hie Himiko Comics & Extras",
+                    parent_url=ancestor_url,
+                ),
+                Gallery(
+                    url=child_url,
+                    gid="4015079",
+                    token="def456",
+                    title="Hie Himiko Comics & Extras",
+                    parent_url=intermediate_url,
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, ancestor_url, 80, [])
+        store_gallery_samples(self.conn, intermediate_url, 80, [])
+        store_gallery_samples(self.conn, child_url, 80, [])
+        record_feedback(self.conn, ancestor_url, score=5)
+
+        repeat_page = short_repeat_page(self.conn, limit=10)
+        child_item = next(item for item in repeat_page["items"] if item["url"] == child_url)
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertEqual(child_item["related_feedback"][0]["url"], ancestor_url)
+        self.assertNotIn(child_url, review_urls)
+
+    def test_short_repeat_page_matches_alternate_title_with_artist_tag(self):
+        old_url = "https://exhentai.org/g/7alttitleold/a/"
+        short_url = "https://exhentai.org/g/7alttitleshort/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=old_url,
+                    gid="7alttitleold",
+                    token="a",
+                    title="Hie Himiko Comics & Extras",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    tags=["artist:hie himiko"],
+                ),
+                Gallery(
+                    url=short_url,
+                    gid="7alttitleshort",
+                    token="a",
+                    title="Renamed Update",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    tags=["artist:hie himiko"],
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 80, [])
+        store_gallery_samples(self.conn, short_url, 6, [])
+        record_feedback(self.conn, old_url, vote=1)
+
+        repeat_urls = [item["url"] for item in short_repeat_page(self.conn, limit=10)["items"]]
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertIn(short_url, repeat_urls)
+        self.assertNotIn(short_url, review_urls)
 
     def test_recommend_filters_explicit_language_tags(self):
         japanese_url = "https://exhentai.org/g/8j/b/"

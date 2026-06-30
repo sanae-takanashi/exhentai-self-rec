@@ -72,6 +72,7 @@ SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist"}
 SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]\)】」』]\s*)+)")
 SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
 TITLE_ARTIST_ID_RE = re.compile(r"^\s*(?P<name>.+?)\s*[\(（](?P<artist_id>\d{4,})[\)）]\s*$")
+PARENT_GALLERY_RE = re.compile(r"(?:https?:)?(?://(?:exhentai|e-hentai)\.org)?/g/(\d+)/([0-9a-fA-F]+)/?")
 
 
 def parse_bootstrap_tags(raw: str) -> list[tuple[str, float]]:
@@ -157,12 +158,13 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
         conn.execute(
             """
             INSERT INTO galleries(
-                url, gid, token, title, category, uploader, posted_at, thumb_url,
-                rating, tags_json, tag_weights_json, source_query, detail_fetched_at, last_seen_at
+                url, gid, token, title, title_jpn, category, uploader, posted_at, thumb_url,
+                rating, tags_json, tag_weights_json, source_query, parent_url, detail_fetched_at, last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
+                title_jpn = COALESCE(excluded.title_jpn, galleries.title_jpn),
                 category = COALESCE(excluded.category, galleries.category),
                 uploader = COALESCE(excluded.uploader, galleries.uploader),
                 posted_at = COALESCE(excluded.posted_at, galleries.posted_at),
@@ -180,6 +182,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                     ELSE galleries.tag_weights_json
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
+                parent_url = COALESCE(excluded.parent_url, galleries.parent_url),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
                 last_seen_at = CASE
                     WHEN ? THEN galleries.last_seen_at
@@ -191,6 +194,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 gallery.gid,
                 gallery.token,
                 gallery.title,
+                gallery.title_jpn,
                 gallery.category,
                 gallery.uploader,
                 gallery.posted_at,
@@ -199,6 +203,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 json.dumps(gallery.tags, ensure_ascii=True),
                 tag_weights_json,
                 gallery.source_query,
+                gallery.parent_url,
                 None,
                 1 if detail_fetched else 0,
             ),
@@ -334,10 +339,11 @@ def gallery_feature_values(gallery: dict, tag_strengths: dict[str, float] | None
         if strength is None:
             strength = tag_strengths.get(norm, 1.0)
         add_feature(f"tag:{norm}", strength)
-    for token in TOKEN_RE.findall(gallery.get("title") or ""):
-        token = token.lower().strip("_:+.-")
-        if len(token) >= 3 and not token.isdigit():
-            add_feature(f"title:{token}")
+    for title_value in gallery_title_values(gallery):
+        for token in TOKEN_RE.findall(title_value):
+            token = token.lower().strip("_:+.-")
+            if len(token) >= 3 and not token.isdigit():
+                add_feature(f"title:{token}")
     return sorted(features.items())
 
 
@@ -503,8 +509,8 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
             dict(row)
             for row in conn.execute(
                 f"""
-                SELECT url, gid, token, title, category, uploader, posted_at, thumb_url,
-                       rating, tags_json, tag_weights_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
+                SELECT url, gid, token, title, title_jpn, category, uploader, posted_at, thumb_url,
+                       rating, tags_json, tag_weights_json, source_query, parent_url, detail_fetched_at, first_seen_at, last_seen_at
                 FROM galleries
                 WHERE url IN ({placeholders})
                 ORDER BY url
@@ -539,12 +545,13 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         conn.execute(
             """
             INSERT INTO galleries(
-                url, gid, token, title, category, uploader, posted_at, thumb_url,
-                rating, tags_json, tag_weights_json, source_query, detail_fetched_at, first_seen_at, last_seen_at
+                url, gid, token, title, title_jpn, category, uploader, posted_at, thumb_url,
+                rating, tags_json, tag_weights_json, source_query, parent_url, detail_fetched_at, first_seen_at, last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
+                title_jpn = COALESCE(excluded.title_jpn, galleries.title_jpn),
                 category = COALESCE(excluded.category, galleries.category),
                 uploader = COALESCE(excluded.uploader, galleries.uploader),
                 posted_at = COALESCE(excluded.posted_at, galleries.posted_at),
@@ -559,6 +566,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                     ELSE galleries.tag_weights_json
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
+                parent_url = COALESCE(excluded.parent_url, galleries.parent_url),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
                 last_seen_at = COALESCE(excluded.last_seen_at, galleries.last_seen_at)
             """,
@@ -567,6 +575,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 gallery.get("gid"),
                 gallery.get("token"),
                 gallery.get("title") or "Imported gallery",
+                gallery.get("title_jpn"),
                 gallery.get("category"),
                 gallery.get("uploader"),
                 gallery.get("posted_at"),
@@ -575,6 +584,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 import_tags_json(gallery.get("tags_json")),
                 import_tag_weights_json(gallery.get("tag_weights_json")),
                 gallery.get("source_query"),
+                gallery.get("parent_url"),
                 gallery.get("detail_fetched_at"),
                 gallery.get("first_seen_at"),
                 gallery.get("last_seen_at"),
@@ -1327,8 +1337,38 @@ def apply_feedback_state(gallery: dict) -> dict:
     return gallery
 
 
+def gallery_title_values(gallery: dict) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for field in ("title", "title_jpn"):
+        value = str(gallery.get(field) or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
 def normalize_repeat_text(value: object) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", str(value or "").lower()).split())
+
+
+def normalize_gallery_url(value: object) -> str:
+    match = PARENT_GALLERY_RE.search(str(value or ""))
+    if not match:
+        return ""
+    return f"https://exhentai.org/g/{match.group(1)}/{match.group(2).lower()}/"
+
+
+def parent_repeat_key(gallery_url: str) -> str:
+    return f"parent-url:{gallery_url}"
+
+
+def short_repeat_parent_keys(gallery: dict) -> list[str]:
+    parent_url = normalize_gallery_url(gallery.get("parent_url"))
+    gallery_url = normalize_gallery_url(gallery.get("url"))
+    if not parent_url or parent_url == gallery_url:
+        return []
+    return [parent_repeat_key(parent_url)]
 
 
 def repeat_title_key_usable(value: str) -> bool:
@@ -1379,12 +1419,12 @@ def short_repeat_title_identity_values(title: object) -> list[str]:
 
 
 def short_repeat_keys(gallery: dict) -> list[str]:
-    title = str(gallery.get("title") or "")
+    titles = gallery_title_values(gallery)
     keys: list[str] = []
     seen: set[str] = set()
     identities = short_repeat_identity_values(gallery)
     if not identities:
-        identities = short_repeat_title_identity_values(title)
+        identities = sorted({identity for title in titles for identity in short_repeat_title_identity_values(title)})
     if not identities:
         return []
 
@@ -1393,21 +1433,22 @@ def short_repeat_keys(gallery: dict) -> list[str]:
             seen.add(key)
             keys.append(key)
 
-    normalized = normalize_repeat_text(title)
-    if repeat_title_key_usable(normalized):
-        for identity in identities:
-            add(f"title-identity:{normalized}|{identity}")
-
-    prefix = SOURCE_PREFIX_RE.match(title)
-    if not prefix:
-        return keys
-
-    labels = title_source_labels(title)
-    stripped = normalize_repeat_text(title[prefix.end() :])
-    if stripped != normalized and repeat_title_key_usable(stripped):
-        for label in labels:
+    for title in titles:
+        normalized = normalize_repeat_text(title)
+        if repeat_title_key_usable(normalized):
             for identity in identities:
-                add(f"source-title-identity:{label}|{stripped}|{identity}")
+                add(f"title-identity:{normalized}|{identity}")
+
+        prefix = SOURCE_PREFIX_RE.match(title)
+        if not prefix:
+            continue
+
+        labels = title_source_labels(title)
+        stripped = normalize_repeat_text(title[prefix.end() :])
+        if stripped != normalized and repeat_title_key_usable(stripped):
+            for label in labels:
+                for identity in identities:
+                    add(f"source-title-identity:{label}|{stripped}|{identity}")
     return keys
 
 
@@ -1428,6 +1469,8 @@ def related_feedback_payload(gallery: dict) -> dict:
     return {
         "url": gallery.get("url"),
         "title": gallery.get("title"),
+        "title_jpn": gallery.get("title_jpn"),
+        "parent_url": gallery.get("parent_url"),
         "category": gallery.get("category"),
         "uploader": gallery.get("uploader"),
         "page_count": gallery.get("page_count"),
@@ -1463,12 +1506,35 @@ def related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list
         LIMIT 10000
         """
     ).fetchall()
+    children_by_parent: dict[str, list[str]] = {}
+    for row in conn.execute("SELECT url, parent_url FROM galleries WHERE parent_url IS NOT NULL AND parent_url != ''"):
+        url = normalize_gallery_url(row["url"])
+        parent_url = normalize_gallery_url(row["parent_url"])
+        if url and parent_url and url != parent_url:
+            children_by_parent.setdefault(parent_url, []).append(url)
+
     index: dict[str, list[dict]] = {}
+    rated_payloads: list[tuple[str, dict]] = []
     for row in rows:
         gallery = apply_feedback_state(gallery_item_from_row(row))
         payload = related_feedback_payload(gallery)
+        gallery_url = normalize_gallery_url(gallery.get("url"))
+        if gallery_url:
+            rated_payloads.append((gallery_url, payload))
+            index.setdefault(parent_repeat_key(gallery_url), []).append(payload)
         for key in short_repeat_keys(gallery):
             index.setdefault(key, []).append(payload)
+
+    for gallery_url, payload in rated_payloads:
+        seen = {gallery_url}
+        stack = list(children_by_parent.get(gallery_url, []))
+        while stack:
+            child_url = stack.pop()
+            if child_url in seen:
+                continue
+            seen.add(child_url)
+            index.setdefault(parent_repeat_key(child_url), []).append(payload)
+            stack.extend(children_by_parent.get(child_url, []))
     return index
 
 
@@ -1478,10 +1544,21 @@ def short_repeat_related_references(
     limit: int = RELATED_FEEDBACK_REFERENCE_LIMIT,
     page_limit: int = SHORT_REPEAT_PAGE_LIMIT,
 ) -> list[dict]:
-    if not is_short_repeat_candidate(gallery, page_limit=page_limit):
-        return []
     references: list[dict] = []
     seen_urls = {gallery.get("url")}
+    for key in short_repeat_parent_keys(gallery):
+        for reference in reference_index.get(key, []):
+            url = reference.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            item = dict(reference)
+            item["matched_key"] = key
+            references.append(item)
+            if len(references) >= limit:
+                return references
+    if not is_short_repeat_candidate(gallery, page_limit=page_limit):
+        return references
     for key in short_repeat_keys(gallery):
         for reference in reference_index.get(key, []):
             url = reference.get("url")
@@ -1546,7 +1623,8 @@ def short_repeat_page(
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
-        WHERE f.feedback_id IS NULL AND m.kind IS NULL AND g.page_count IS NOT NULL AND g.page_count <= ?
+        WHERE f.feedback_id IS NULL AND m.kind IS NULL
+          AND (g.parent_url IS NOT NULL OR (g.page_count IS NOT NULL AND g.page_count <= ?))
         ORDER BY g.last_seen_at DESC
         LIMIT ?
         """,
@@ -1791,7 +1869,7 @@ def diversity_keys(gallery: dict) -> list[str]:
 def gallery_matches_filter(gallery: dict, filter_text: str) -> bool:
     haystack = " ".join(
         [
-            str(gallery.get("title") or ""),
+            *gallery_title_values(gallery),
             str(gallery.get("category") or ""),
             str(gallery.get("uploader") or ""),
             " ".join(str(tag) for tag in gallery.get("tags") or []),
@@ -1903,7 +1981,7 @@ def bootstrap_exact_values(gallery: dict) -> set[str]:
 
 
 def bootstrap_search_text(gallery: dict) -> str:
-    values = [str(gallery.get("title") or "")]
+    values = gallery_title_values(gallery)
     category = str(gallery.get("category") or "").strip()
     if category:
         values.extend([category, f"category:{category}"])

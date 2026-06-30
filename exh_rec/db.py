@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS galleries (
     gid TEXT,
     token TEXT,
     title TEXT NOT NULL,
+    title_jpn TEXT,
     category TEXT,
     uploader TEXT,
     posted_at TEXT,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS galleries (
     tags_json TEXT NOT NULL DEFAULT '[]',
     tag_weights_json TEXT NOT NULL DEFAULT '{}',
     source_query TEXT,
+    parent_url TEXT,
     detail_fetched_at TEXT,
     page_count INTEGER,
     samples_json TEXT NOT NULL DEFAULT '[]',
@@ -113,6 +115,8 @@ def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         ensure_column(conn, "feedback", "score", "INTEGER")
+        ensure_column(conn, "galleries", "title_jpn", "TEXT")
+        ensure_column(conn, "galleries", "parent_url", "TEXT")
         ensure_column(conn, "galleries", "detail_fetched_at", "TEXT")
         ensure_column(conn, "galleries", "tag_weights_json", "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(conn, "galleries", "page_count", "INTEGER")

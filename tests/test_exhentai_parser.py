@@ -140,9 +140,13 @@ class ParserTest(unittest.TestCase):
         html = """
         <html>
           <h1 id="gn">Detailed Gallery Title</h1>
+          <h1 id="gj">[日枝御子] コミックスとエクストラ</h1>
           <div id="gdc"><div class="cn">Doujinshi</div></div>
           <div id="gdn"><a>UploaderName</a></div>
-          <table><tr><td>Posted:</td><td>2026-06-01 12:34</td></tr></table>
+          <table>
+            <tr><td>Posted:</td><td>2026-06-01 12:34</td></tr>
+            <tr><td>Parent:</td><td><a href="https://exhentai.org/g/3974133/abcdef1234/">parent</a></td></tr>
+          </table>
           <div id="gd1"><img src="https://t.example/detail.jpg"></div>
           <a href="https://exhentai.org/tag/artist:detail_artist">tag</a>
           <a href="https://exhentai.org/tag/female:tag_one">tag</a>
@@ -151,6 +155,8 @@ class ParserTest(unittest.TestCase):
         """
         gallery = parse_gallery_detail(html, "https://exhentai.org/g/67890/fedcba9876/")
         self.assertEqual(gallery.title, "Detailed Gallery Title")
+        self.assertEqual(gallery.title_jpn, "[日枝御子] コミックスとエクストラ")
+        self.assertEqual(gallery.parent_url, "https://exhentai.org/g/3974133/abcdef1234/")
         self.assertEqual(gallery.category, "Doujinshi")
         self.assertEqual(gallery.uploader, "UploaderName")
         self.assertEqual(gallery.posted_at, "2026-06-01 12:34")
@@ -425,9 +431,12 @@ class GdataTest(unittest.TestCase):
                     "gid": gid,
                     "token": token,
                     "title": title,
+                    "title_jpn": f"Japanese {title}",
                     "category": "Manga",
                     "thumb": f"https://ehgt.org/aa/bb/{gid}.jpg",
                     "uploader": "someone",
+                    "parent_gid": "3974133",
+                    "parent_key": "abcdef1234",
                     "posted": "1700000000",
                     "filecount": "42",
                     "rating": "4.35",
@@ -446,6 +455,8 @@ class GdataTest(unittest.TestCase):
         meta = metadata[url]
         self.assertEqual(meta["thumb"], "https://ehgt.org/aa/bb/123.jpg")
         self.assertEqual(meta["category"], "Manga")
+        self.assertEqual(meta["title_jpn"], "Japanese Title")
+        self.assertEqual(meta["parent_url"], "https://exhentai.org/g/3974133/abcdef1234/")
         self.assertEqual(meta["page_count"], 42)
         self.assertAlmostEqual(meta["rating"], 4.35)
         self.assertEqual(meta["tags"], ["artist:foo bar", "language:english"])
@@ -496,6 +507,8 @@ class GdataTest(unittest.TestCase):
             "https://exhentai.org/g/123/abc/": {
                 "thumb": "https://ehgt.org/aa/bb/123.jpg",
                 "title": "Real Title",
+                "title_jpn": "[日枝御子] コミックスとエクストラ",
+                "parent_url": "https://exhentai.org/g/3974133/abcdef1234/",
                 "category": "Doujinshi",
                 "uploader": "person",
                 "rating": 4.0,
@@ -510,6 +523,8 @@ class GdataTest(unittest.TestCase):
         self.assertEqual(changed, 1)
         self.assertEqual(gallery.thumb_url, "https://ehgt.org/aa/bb/123.jpg")
         self.assertEqual(gallery.title, "Real Title")
+        self.assertEqual(gallery.title_jpn, "[日枝御子] コミックスとエクストラ")
+        self.assertEqual(gallery.parent_url, "https://exhentai.org/g/3974133/abcdef1234/")
         self.assertEqual(gallery.category, "Doujinshi")
         self.assertEqual(gallery.page_count, 12)
         self.assertIn("parody:x", gallery.tags)

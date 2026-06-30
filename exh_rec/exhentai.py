@@ -38,9 +38,11 @@ CAT_RE = re.compile(r"class=[\"'][^\"']*\bcn\b[^\"']*[\"'][^>]*>(.*?)</", re.I |
 UPLOADER_RE = re.compile(r"class=[\"'][^\"']*\bglhide\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
 RATING_RE = re.compile(r"Rating:\s*([0-9.]+)", re.I)
 DETAIL_TITLE_RE = re.compile(r"id=[\"']gn[\"'][^>]*>(.*?)</", re.I | re.S)
+DETAIL_TITLE_JPN_RE = re.compile(r"id=[\"']gj[\"'][^>]*>(.*?)</", re.I | re.S)
 DETAIL_CATEGORY_RE = re.compile(r"id=[\"']gdc[\"'][^>]*>.*?class=[\"'][^\"']*\bcn\b[^\"']*[\"'][^>]*>(.*?)</", re.I | re.S)
 DETAIL_UPLOADER_RE = re.compile(r"id=[\"']gdn[\"'][^>]*>(.*?)</", re.I | re.S)
 DETAIL_POSTED_RE = re.compile(r"<td[^>]*>\s*Posted:\s*</td>\s*<td[^>]*>(.*?)</td>", re.I | re.S)
+DETAIL_PARENT_RE = re.compile(r"<td[^>]*>\s*Parent:\s*</td>\s*<td[^>]*>(.*?)</td>", re.I | re.S)
 DETAIL_AVERAGE_RE = re.compile(r"Average:\s*([0-9.]+)", re.I)
 DETAIL_LENGTH_RE = re.compile(r"Length:\s*</td>\s*<td[^>]*>\s*([\d,]+)", re.I)
 DETAIL_LENGTH_FALLBACK_RE = re.compile(r"([\d,]+)\s*pages", re.I)
@@ -85,6 +87,8 @@ class Gallery:
     # Each entry is either a plain URL string (individual/"Large" previews) or a
     # ``{"url", "x", "y", "w", "h"}`` sprite-frame dict ("Normal" mode).
     sample_thumbs: list = field(default_factory=list)
+    title_jpn: str | None = None
+    parent_url: str | None = None
 
 
 class LinkTitleParser(HTMLParser):
@@ -384,6 +388,7 @@ def parse_gdata_entry(entry: dict) -> dict:
         "thumb": str(entry.get("thumb") or "") or None,
         "title": html.unescape(str(entry.get("title") or "")) or None,
         "title_jpn": html.unescape(str(entry.get("title_jpn") or "")) or None,
+        "parent_url": gdata_parent_url(entry),
         "category": str(entry.get("category") or "") or None,
         "uploader": html.unescape(str(entry.get("uploader") or "")) or None,
         "posted": str(entry.get("posted") or "") or None,
@@ -391,6 +396,14 @@ def parse_gdata_entry(entry: dict) -> dict:
         "rating": coerce_float(entry.get("rating")),
         "tags": tags,
     }
+
+
+def gdata_parent_url(entry: dict) -> str | None:
+    gid = str(entry.get("parent_gid") or "").strip()
+    token = str(entry.get("parent_key") or entry.get("parent_token") or "").strip()
+    if not gid or gid == "0" or not token:
+        return None
+    return canonical_gallery_url(gid, token)
 
 
 def coerce_int(value: object) -> int | None:
@@ -426,6 +439,8 @@ def apply_gallery_metadata(galleries: list[Gallery], metadata: dict[str, dict]) 
         title = meta.get("title")
         if title and (not gallery.title or gallery.title.startswith("Gallery ")):
             gallery.title = title
+        gallery.title_jpn = gallery.title_jpn or meta.get("title_jpn")
+        gallery.parent_url = gallery.parent_url or meta.get("parent_url")
         gallery.category = gallery.category or meta.get("category")
         gallery.uploader = gallery.uploader or meta.get("uploader")
         if gallery.rating is None and meta.get("rating") is not None:
@@ -690,6 +705,7 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
     gid = match.group(1) if match else None
     token = match.group(2) if match else None
     title = strip_html_match(DETAIL_TITLE_RE.search(page_html))
+    title_jpn = strip_html_match(DETAIL_TITLE_JPN_RE.search(page_html))
     rating_match = DETAIL_AVERAGE_RE.search(html.unescape(page_html)) or RATING_RE.search(html.unescape(page_html))
     rating = float(rating_match.group(1)) if rating_match else None
     page_count, rich_entries = parse_gallery_pages_rich(page_html)
@@ -715,6 +731,8 @@ def parse_gallery_detail(page_html: str, gallery_url: str) -> Gallery:
         tag_weights=tag_weights,
         page_count=page_count,
         sample_thumbs=sample_thumbs,
+        title_jpn=title_jpn,
+        parent_url=extract_parent_url(page_html),
     )
 
 
@@ -740,11 +758,23 @@ def merge_gallery(base: Gallery, detail: Gallery) -> Gallery:
         source_query=base.source_query,
         page_count=detail.page_count if detail.page_count is not None else base.page_count,
         sample_thumbs=detail.sample_thumbs or base.sample_thumbs,
+        title_jpn=detail.title_jpn or base.title_jpn,
+        parent_url=detail.parent_url or base.parent_url,
     )
 
 
 def canonical_gallery_url(gid: str, token: str) -> str:
     return f"https://exhentai.org/g/{gid}/{token}/"
+
+
+def extract_parent_url(page_html: str) -> str | None:
+    parent = DETAIL_PARENT_RE.search(page_html)
+    if not parent:
+        return None
+    match = GALLERY_RE.search(parent.group(1))
+    if not match:
+        return None
+    return canonical_gallery_url(match.group(1), match.group(2))
 
 
 def nearby_gallery_block(page_html: str, start: int, end: int) -> str:
