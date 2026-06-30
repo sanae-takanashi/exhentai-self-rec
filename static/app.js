@@ -24,6 +24,7 @@ const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const localFilterEl = document.querySelector("#localFilter");
 const defaultLocalFilterPlaceholder = localFilterEl.placeholder;
+const backfillReviewParentsBtn = document.querySelector("#backfillReviewParentsBtn");
 const historySearchBtn = document.querySelector("#historySearchBtn");
 const backfillHistoryParentsBtn = document.querySelector("#backfillHistoryParentsBtn");
 const recalcShortRepeatsBtn = document.querySelector("#recalcShortRepeatsBtn");
@@ -100,6 +101,7 @@ const staticTooltips = {
   query: "Optional one-off ExHentai search query. It is used alone when you click Fetch Query.",
   searchFetchBtn: "Fetch galleries for only the one-off query in the search box.",
   localFilter: "Filter already stored local galleries by title, tag, category, or uploader.",
+  backfillReviewParentsBtn: "Fetch gdata metadata for stored Review galleries matching the current filter and missing Parent links or alternate titles.",
   historySearchBtn: "Search only your reaction history using the local filter text.",
   backfillHistoryParentsBtn: "Fetch gdata metadata for stored galleries matching the current filter and missing Parent links or alternate titles.",
   recalcShortRepeatsBtn: "Recompute the Short Repeats queue using the current strict title and artist matching rules.",
@@ -499,6 +501,8 @@ function setActiveView(view) {
   viewTitleEl.textContent = copy.title;
   viewSubtitleEl.textContent = copy.subtitle;
   const historyView = view === "history";
+  const reviewView = view === "review";
+  backfillReviewParentsBtn.classList.toggle("hidden", !reviewView);
   historySearchBtn.classList.toggle("hidden", !historyView);
   backfillHistoryParentsBtn.classList.toggle("hidden", !historyView);
   recalcShortRepeatsBtn.classList.toggle("hidden", view !== "short-repeats");
@@ -555,8 +559,7 @@ async function searchReactionHistory() {
   setStatus(query ? `History search loaded for "${query}"` : "Reaction history loaded");
 }
 
-async function backfillHistoryParents() {
-  setStatus("Updating parent metadata for stored galleries");
+async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}) {
   const payload = await api("/api/reactions/backfill-parents", {
     method: "POST",
     body: JSON.stringify({
@@ -565,7 +568,11 @@ async function backfillHistoryParents() {
       filter_text: localFilterEl.value.trim(),
     }),
   });
-  applyGalleryPage(payload);
+  if (reloadView === "history") {
+    applyGalleryPage(payload);
+  } else {
+    await loadCurrentPage();
+  }
   if (payload.errors.length) {
     setStatus(`Updated ${payload.updated} metadata rows; errors: ${payload.errors.join(" | ")}`, true);
   } else {
@@ -573,6 +580,16 @@ async function backfillHistoryParents() {
       `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)`
     );
   }
+}
+
+async function backfillReviewParents() {
+  setStatus("Updating parent metadata for Review galleries");
+  await backfillParentsForCurrentFilter({ reloadView: "review" });
+}
+
+async function backfillHistoryParents() {
+  setStatus("Updating parent metadata for stored galleries");
+  await backfillParentsForCurrentFilter({ reloadView: "history" });
 }
 
 async function loadMarkedGalleries(kind, offset = 0, append = false) {
@@ -1339,6 +1356,7 @@ document.querySelector("#downloadDinov2Btn").addEventListener("click", () => dow
 document.querySelector("#checkBtn").addEventListener("click", () => checkLogin().catch((error) => setStatus(error.message, true)));
 document.querySelector("#clearCookieBtn").addEventListener("click", () => clearCookie().catch((error) => setStatus(error.message, true)));
 document.querySelector("#searchFetchBtn").addEventListener("click", () => fetchNew(queryEl.value).catch((error) => setStatus(error.message, true)));
+backfillReviewParentsBtn.addEventListener("click", () => backfillReviewParents().catch((error) => setStatus(error.message, true)));
 historySearchBtn.addEventListener("click", () => searchReactionHistory().catch((error) => setStatus(error.message, true)));
 backfillHistoryParentsBtn.addEventListener("click", () => backfillHistoryParents().catch((error) => setStatus(error.message, true)));
 recalcShortRepeatsBtn.addEventListener("click", () => recalculateShortRepeats().catch((error) => setStatus(error.message, true)));
