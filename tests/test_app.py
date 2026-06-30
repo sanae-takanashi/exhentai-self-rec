@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 import sqlite3
 import threading
@@ -62,6 +63,7 @@ from exh_rec.app import (
     reaction_history_payload,
     recommend_candidate_limit,
     recommendation_payload,
+    refresh_gallery_metadata_payload,
     refresh_summary,
     refresh_thumbnails,
     reset_library_payload,
@@ -904,14 +906,24 @@ class AppTest(unittest.TestCase):
         sent = []
         handler = Handler.__new__(Handler)
         handler.path = "/api/reactions/backfill-parents"
-        handler.read_json = lambda: {"scope": "history", "limit": 25, "filter_text": "Hie"}
+        handler.read_json = lambda: {
+            "scope": "history",
+            "limit": 25,
+            "filter_text": "Hie",
+            "gallery_urls": ["https://exhentai.org/g/4015079/def456/"],
+        }
         handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
         handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
 
         with patch("exh_rec.app.backfill_parent_metadata", return_value={"ok": True, "items": []}) as backfill:
             handler.do_POST()
 
-        backfill.assert_called_once_with(scope="history", limit=25, filter_text="Hie")
+        backfill.assert_called_once_with(
+            scope="history",
+            limit=25,
+            filter_text="Hie",
+            gallery_urls=["https://exhentai.org/g/4015079/def456/"],
+        )
         self.assertEqual(sent, [({"ok": True, "items": []}, HTTPStatus.OK)])
 
     def test_backfill_parent_metadata_all_scope_updates_unrated_rows(self):
@@ -941,6 +953,53 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(result["detail_checked"], 0)
                 fetch_detail.assert_not_called()
                 self.assertEqual(row["parent_url"], parent_url)
+
+    def test_backfill_parent_metadata_uses_visible_gallery_urls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                visible_url = "https://exhentai.org/g/4016817/b4ac479818/"
+                other_url = "https://exhentai.org/g/4016818/b4ac479819/"
+                parent_url = "https://exhentai.org/g/4010452/e75ad2f893/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(
+                        conn,
+                        [
+                            Gallery(url=visible_url, gid="4016817", token="b4ac479818", title="Visible Review"),
+                            Gallery(url=other_url, gid="4016818", token="b4ac479819", title="Other Review"),
+                        ],
+                    )
+
+                metadata = {
+                    visible_url: {"parent_url": parent_url},
+                    other_url: {"parent_url": parent_url},
+                }
+                with (
+                    patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata,
+                    patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                ):
+                    result = backfill_parent_metadata(
+                        scope="all",
+                        limit=100,
+                        gallery_urls=[visible_url],
+                    )
+
+                with db.connect() as conn:
+                    visible = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (visible_url,)).fetchone()
+                    other = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (other_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["checked"], 1)
+                fetch_metadata.assert_called_once_with(
+                    "ipb_member_id=123; ipb_pass_hash=abc",
+                    [("4016817", "b4ac479818")],
+                    proxy_url="",
+                )
+                fetch_detail.assert_not_called()
+                self.assertEqual(visible["parent_url"], parent_url)
+                self.assertIsNone(other["parent_url"])
 
     def test_backfill_parent_metadata_falls_back_to_detail_parent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1036,6 +1095,54 @@ class AppTest(unittest.TestCase):
                 lines = stdout.getvalue().splitlines()
                 self.assertTrue(any(line.startswith("[parent-update] detail fetch retry") for line in lines))
                 self.assertTrue(any(line.startswith("[parent-update] detail fetch finished") for line in lines))
+
+    def test_refresh_gallery_metadata_payload_updates_parent_thumbnail_and_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/4016817/b4ac479818/"
+                parent_url = "https://exhentai.org/g/4010452/e75ad2f893/"
+                samples = [f"https://s.exhentai.org/t/sample-{index}.jpg" for index in range(5)]
+                detail = Gallery(
+                    url=gallery_url,
+                    gid="4016817",
+                    token="b4ac479818",
+                    title="Visible Review",
+                    thumb_url="https://ehgt.org/aa/bb/4016817.jpg",
+                    parent_url=parent_url,
+                    page_count=40,
+                    sample_thumbs=samples,
+                    tags=["artist:example"],
+                )
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=gallery_url, gid="4016817", token="b4ac479818", title="Visible Review")])
+
+                with (
+                    patch("exh_rec.app.fetch_gallery_detail", return_value=detail) as fetch_detail,
+                    patch("exh_rec.app.cache_sample_thumbnails", return_value=len(samples)) as cache_samples,
+                ):
+                    payload = refresh_gallery_metadata_payload({"gallery_url": gallery_url})
+
+                with db.connect() as conn:
+                    row = conn.execute(
+                        "SELECT parent_url, thumb_url, page_count, samples_json, detail_fetched_at, tags_json FROM galleries WHERE url = ?",
+                        (gallery_url,),
+                    ).fetchone()
+
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["parent_url"], parent_url)
+                self.assertEqual(payload["sample_count"], 5)
+                self.assertEqual(payload["cached_samples"], 5)
+                fetch_detail.assert_called_once()
+                cache_samples.assert_called_once_with(gallery_url, samples)
+                self.assertEqual(row["parent_url"], parent_url)
+                self.assertEqual(row["thumb_url"], "https://ehgt.org/aa/bb/4016817.jpg")
+                self.assertEqual(row["page_count"], 40)
+                self.assertIsNotNone(row["detail_fetched_at"])
+                self.assertEqual(json.loads(row["samples_json"]), samples)
+                self.assertIn("artist:example", row["tags_json"])
 
     def test_short_repeat_payload_returns_related_old_feedback(self):
         conn = sqlite3.connect(":memory:")

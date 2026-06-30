@@ -54,6 +54,7 @@ const pendingFeedbackUrls = new Set();
 let renderedGalleryUrls = [];
 let parentProgressVisible = false;
 let parentProgressPollTimer = null;
+const pendingGalleryRefreshUrls = new Set();
 let visualDefaultEncoder = "simple";
 let visualEmbeddingVersion = "canvas-rgb-8x8-v1";
 let visualFallbackEncoder = "simple";
@@ -584,6 +585,7 @@ async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}
         scope: "all",
         limit: 100,
         filter_text: localFilterEl.value.trim(),
+        gallery_urls: [...renderedGalleryUrls],
       }),
     });
     if (reloadView === "history") {
@@ -704,6 +706,29 @@ async function refreshThumbnails() {
     setStatus(`Refreshed ${payload.updated} thumbnails; errors: ${payload.errors.join(" | ")}`, true);
   } else {
     setStatus(`Refreshed ${payload.updated} thumbnails`);
+  }
+}
+
+async function refreshGalleryMetadata(galleryUrl) {
+  if (pendingGalleryRefreshUrls.has(galleryUrl)) {
+    return;
+  }
+  pendingGalleryRefreshUrls.add(galleryUrl);
+  setGalleryFeedbackButtonsDisabled(galleryUrl, true);
+  setStatus("Refreshing gallery metadata");
+  try {
+    const payload = await api("/api/gallery/refresh", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+      }),
+    });
+    await loadCurrentPage();
+    const parentText = payload.parent_url ? "parent found" : "no parent found";
+    setStatus(`Refreshed gallery metadata (${parentText}, ${payload.sample_count || 0} samples)`);
+  } finally {
+    pendingGalleryRefreshUrls.delete(galleryUrl);
+    setGalleryFeedbackButtonsDisabled(galleryUrl, false);
   }
 }
 
@@ -1077,6 +1102,7 @@ function renderGalleryCards(items, append = false) {
     const historyButton = hasFeedback && mode !== "preview"
       ? `<button class="clear" type="button" data-history="1" data-url="${escapeAttr(item.url)}" title="Show your feedback history for this gallery.">History</button>`
       : "";
+    const refreshMetadataButton = `<button class="clear" type="button" data-refresh-gallery="1" data-url="${escapeAttr(item.url)}" title="Fetch this gallery detail page and refresh thumbnail, samples, and parent chain.">Refresh metadata</button>`;
     const feedbackActions = historyButton || clearButton ? `<div class="card-actions">${historyButton}${clearButton}</div>` : "";
     const favoriteButton = item.user_mark_kind === "favorite"
       ? ""
@@ -1103,6 +1129,7 @@ function renderGalleryCards(items, append = false) {
             .join("")}
         </div>
         ${markActions}
+        <div class="card-actions">${refreshMetadataButton}</div>
         ${feedbackActions}`;
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
     card.innerHTML = `
@@ -1203,7 +1230,15 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
     if (button.dataset.url !== galleryUrl) {
       continue;
     }
-    if (button.dataset.vote || button.dataset.score || button.dataset.skip || button.dataset.clear || button.dataset.mark || button.dataset.clearMark) {
+    if (
+      button.dataset.vote ||
+      button.dataset.score ||
+      button.dataset.skip ||
+      button.dataset.clear ||
+      button.dataset.mark ||
+      button.dataset.clearMark ||
+      button.dataset.refreshGallery
+    ) {
       button.disabled = disabled;
     }
   }
@@ -1586,6 +1621,11 @@ recommendationsEl.addEventListener("click", (event) => {
   const historyButton = event.target.closest("button[data-history]");
   if (historyButton) {
     showFeedbackHistory(historyButton.dataset.url).catch((error) => setStatus(error.message, true));
+    return;
+  }
+  const refreshGalleryButton = event.target.closest("button[data-refresh-gallery]");
+  if (refreshGalleryButton) {
+    refreshGalleryMetadata(refreshGalleryButton.dataset.url).catch((error) => setStatus(error.message, true));
     return;
   }
 });

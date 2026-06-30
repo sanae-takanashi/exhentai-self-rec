@@ -257,6 +257,10 @@ class Handler(BaseHTTPRequestHandler):
                     filter_text=payload.get("filter_text"),
                 )
                 self.send_json(result)
+            elif path == "/api/gallery/refresh":
+                payload = self.read_json()
+                result = refresh_gallery_metadata_payload(payload)
+                self.send_json(result)
             elif path == "/api/feedback":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -393,6 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                     scope=payload.get("scope") or "history",
                     limit=payload.get("limit") or 100,
                     filter_text=payload.get("filter_text"),
+                    gallery_urls=payload.get("gallery_urls"),
                 )
                 self.send_json(result)
             elif path == "/api/retrain":
@@ -1592,12 +1597,40 @@ def history_parent_metadata_candidates(
     scope: str = "history",
     limit: int = 100,
     filter_text: str | None = None,
+    gallery_urls: Any = None,
 ) -> list[Gallery]:
     limit = bounded_int(limit, default=100, lower=1, upper=PARENT_METADATA_BACKFILL_MAX)
     scope = str(scope or "history").strip().lower()
     if scope not in {"history", "all"}:
         raise ApiError(HTTPStatus.BAD_REQUEST, "scope must be history or all")
     filter_text = (filter_text or "").strip().lower()
+    exact_urls = ordered_gallery_urls(gallery_urls)
+    if exact_urls:
+        placeholders = ", ".join("?" for _ in exact_urls)
+        rows = conn.execute(
+            f"""
+            SELECT g.*
+            FROM galleries g
+            WHERE g.url IN ({placeholders})
+              AND g.gid IS NOT NULL AND g.gid != ''
+              AND g.token IS NOT NULL AND g.token != ''
+              AND (g.parent_url IS NULL OR g.parent_url = '' OR g.title_jpn IS NULL OR g.title_jpn = '')
+            """,
+            exact_urls,
+        ).fetchall()
+        rows_by_url = {row["url"]: row for row in rows}
+        candidates: list[Gallery] = []
+        for url in exact_urls:
+            row = rows_by_url.get(url)
+            if not row:
+                continue
+            item = db.row_to_dict(row)
+            if filter_text and not gallery_matches_filter(item, filter_text):
+                continue
+            candidates.append(gallery_from_item(item))
+            if len(candidates) >= limit:
+                break
+        return candidates
     fetch_limit = 10000 if filter_text else limit
     history_filter = "AND (f.feedback_id IS NOT NULL OR m.kind IS NOT NULL)" if scope == "history" else ""
     rows = conn.execute(
@@ -1632,6 +1665,22 @@ def history_parent_metadata_candidates(
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def ordered_gallery_urls(raw_urls: Any) -> list[str]:
+    if not isinstance(raw_urls, list):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_urls:
+        url = normalize_gallery_url(str(raw or ""))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= PARENT_METADATA_BACKFILL_MAX:
+            break
+    return urls
 
 
 def persist_gallery_metadata(conn, gallery: Gallery) -> dict[str, int]:
@@ -1697,23 +1746,36 @@ def backfill_parent_metadata(
     scope: str = "history",
     limit: int = 100,
     filter_text: str | None = None,
+    gallery_urls: Any = None,
 ) -> dict:
     scope = str(scope or "history").strip().lower()
     if scope not in {"history", "all"}:
         raise ApiError(HTTPStatus.BAD_REQUEST, "scope must be history or all")
     limit = bounded_int(limit, default=100, lower=1, upper=PARENT_METADATA_BACKFILL_MAX)
     filter_text = (filter_text or "").strip()
+    exact_urls = ordered_gallery_urls(gallery_urls)
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
     errors: list[str] = []
     try:
         reset_parent_update_progress(scope, limit, filter_text)
-        update_parent_progress("parent update started", stage="starting", running=True)
+        update_parent_progress(
+            "parent update started",
+            stage="starting",
+            running=True,
+            exact_url_count=len(exact_urls),
+        )
         with db.connect() as conn:
             cookie = db.get_setting(conn, "cookie_header", "")
             proxy_url = network_proxy(conn)
             update_parent_progress("candidate scan started", stage="selecting")
-            galleries = history_parent_metadata_candidates(conn, scope=scope, limit=limit, filter_text=filter_text)
+            galleries = history_parent_metadata_candidates(
+                conn,
+                scope=scope,
+                limit=limit,
+                filter_text=filter_text,
+                gallery_urls=exact_urls,
+            )
         update_parent_progress(
             "candidate scan finished",
             stage="selected",
@@ -2709,7 +2771,20 @@ def crop_sprite_bytes(data: bytes, x: int, y: int, w: int, h: int) -> tuple[byte
     return buffer.getvalue(), "image/png"
 
 
-def refresh_gallery_sample_metadata(gallery_url: str) -> None:
+def refresh_gallery_metadata_payload(payload: dict[str, Any]) -> dict:
+    gallery_url = normalize_gallery_url(str(payload.get("gallery_url") or ""))
+    if not gallery_url:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+    if not FETCH_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
+    try:
+        result = refresh_gallery_metadata(gallery_url)
+        return {"ok": True, **result}
+    finally:
+        FETCH_LOCK.release()
+
+
+def refresh_gallery_metadata(gallery_url: str) -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         extra_pages = sample_extra_pages(conn)
@@ -2721,17 +2796,64 @@ def refresh_gallery_sample_metadata(gallery_url: str) -> None:
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
     try:
         gallery = gallery_from_item(db.row_to_dict(row))
-        detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+        detailed = gallery_refresh_fetch_with_retries(
+            "detail fetch",
+            gallery.url,
+            lambda: fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url),
+        )
         ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
         samples = collect_gallery_samples(cookie, detailed, extra_pages, delay=0, proxy_url=proxy_url)
-        cache_sample_thumbnails(detailed.url, samples)
+        cached = cache_sample_thumbnails(detailed.url, samples)
     except ApiError:
         raise
     except Exception as exc:
-        raise ApiError(HTTPStatus.BAD_GATEWAY, f"Sample refresh failed: {exc}") from exc
+        raise ApiError(HTTPStatus.BAD_GATEWAY, f"Gallery refresh failed: {exc}") from exc
     with db.connect() as conn:
         store_galleries(conn, [detailed], detail_fetched=True)
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
+        row = conn.execute("SELECT * FROM galleries WHERE url = ?", (detailed.url,)).fetchone()
+        item = gallery_item_payload(conn, db.row_to_dict(row)) if row else None
+    return {
+        "gallery_url": detailed.url,
+        "parent_url": detailed.parent_url,
+        "thumb_url": detailed.thumb_url,
+        "page_count": detailed.page_count,
+        "sample_count": len(samples),
+        "cached_samples": cached,
+        "item": item,
+    }
+
+
+def gallery_refresh_fetch_with_retries(action: str, gallery_url: str, fetcher) -> Any:
+    attempts = PARENT_UPDATE_FETCH_RETRIES + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetcher()
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            gallery_refresh_log(
+                f"{action} retry",
+                gallery_url=gallery_url,
+                retry_attempt=attempt,
+                retry_remaining=attempts - attempt,
+                retry_limit=PARENT_UPDATE_FETCH_RETRIES,
+                error=str(exc),
+            )
+            time.sleep(PARENT_UPDATE_RETRY_BACKOFF_SECONDS * attempt)
+    raise RuntimeError(f"{action} exhausted retries")
+
+
+def gallery_refresh_log(message: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={format_log_value(value)}" for key, value in fields.items())
+    line = f"[gallery-refresh] {message}"
+    if details:
+        line = f"{line} {details}"
+    print(line, flush=True)
+
+
+def refresh_gallery_sample_metadata(gallery_url: str) -> None:
+    refresh_gallery_metadata(gallery_url)
 
 
 def cache_sample_thumbnails(gallery_url: str, samples: list) -> int:
