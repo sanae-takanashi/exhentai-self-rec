@@ -100,6 +100,8 @@ COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
 PARENT_UPDATE_LOG_LIMIT = 120
+PARENT_UPDATE_FETCH_RETRIES = 2
+PARENT_UPDATE_RETRY_BACKOFF_SECONDS = 1.0
 
 
 class ApiError(Exception):
@@ -1118,6 +1120,26 @@ def parent_update_log(message: str, **fields: Any) -> None:
     print(line, flush=True)
 
 
+def parent_update_fetch_with_retries(action: str, fetcher, **progress_fields: Any) -> Any:
+    attempts = PARENT_UPDATE_FETCH_RETRIES + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetcher()
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            update_parent_progress(
+                f"{action} retry",
+                retry_attempt=attempt,
+                retry_remaining=attempts - attempt,
+                retry_limit=PARENT_UPDATE_FETCH_RETRIES,
+                error=str(exc),
+                **progress_fields,
+            )
+            time.sleep(PARENT_UPDATE_RETRY_BACKOFF_SECONDS * attempt)
+    raise RuntimeError(f"{action} exhausted retries")
+
+
 def display_query(query: str | None) -> str:
     return query or "recent"
 
@@ -1738,10 +1760,15 @@ def backfill_parent_metadata(
         try:
             pairs = [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token]
             update_parent_progress("gdata metadata fetch started", stage="gdata", gdata_total=len(pairs))
-            metadata = fetch_gallery_metadata(
-                cookie,
-                pairs,
-                proxy_url=proxy_url,
+            metadata = parent_update_fetch_with_retries(
+                "gdata metadata fetch",
+                lambda: fetch_gallery_metadata(
+                    cookie,
+                    pairs,
+                    proxy_url=proxy_url,
+                ),
+                stage="gdata",
+                gdata_total=len(pairs),
             )
             apply_gallery_metadata(galleries, metadata)
             update_parent_progress(
@@ -1782,7 +1809,16 @@ def backfill_parent_metadata(
                 current_gallery_title=gallery.title,
             )
             try:
-                detailed = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+                detailed = parent_update_fetch_with_retries(
+                    "detail fetch",
+                    lambda: fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url),
+                    stage="details",
+                    detail_index=detail_index,
+                    detail_total=len(detail_candidates),
+                    detail_done=detail_index - 1,
+                    current_gallery_url=gallery.url,
+                    current_gallery_title=gallery.title,
+                )
                 galleries[index] = detailed
                 detail_checked += 1
                 update_parent_progress(

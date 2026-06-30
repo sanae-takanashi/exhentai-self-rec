@@ -1000,6 +1000,43 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(row["page_count"], 99)
                 self.assertIn("artist:hie himiko", row["tags_json"])
 
+    def test_backfill_parent_metadata_retries_detail_parent_fetch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                review_url = "https://exhentai.org/g/4015079/def456/"
+                parent_url = "https://exhentai.org/g/3974133/abc123/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=review_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras")])
+
+                detail = Gallery(url=review_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras", parent_url=parent_url)
+                with (
+                    patch("exh_rec.app.fetch_gallery_metadata", return_value={}),
+                    patch(
+                        "exh_rec.app.fetch_gallery_detail",
+                        side_effect=[RuntimeError("temporary detail failure"), RuntimeError("second detail failure"), detail],
+                    ) as fetch_detail,
+                    patch("exh_rec.app.time.sleep") as sleep,
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                ):
+                    result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
+
+                with db.connect() as conn:
+                    row = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (review_url,)).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["detail_checked"], 1)
+                self.assertEqual(fetch_detail.call_count, 3)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+                self.assertEqual(row["parent_url"], parent_url)
+                retry_logs = [entry for entry in PARENT_UPDATE_STATE["logs"] if entry["message"] == "detail fetch retry"]
+                self.assertEqual([entry["fields"]["retry_attempt"] for entry in retry_logs], [1, 2])
+                lines = stdout.getvalue().splitlines()
+                self.assertTrue(any(line.startswith("[parent-update] detail fetch retry") for line in lines))
+                self.assertTrue(any(line.startswith("[parent-update] detail fetch finished") for line in lines))
+
     def test_short_repeat_payload_returns_related_old_feedback(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
