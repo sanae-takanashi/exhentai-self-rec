@@ -1637,6 +1637,7 @@ def backfill_parent_metadata(
             return {
                 "ok": True,
                 "checked": 0,
+                "detail_checked": 0,
                 "updated": 0,
                 "parent_updated": 0,
                 "title_jpn_updated": 0,
@@ -1654,6 +1655,16 @@ def backfill_parent_metadata(
         except Exception as exc:
             errors.append(f"gdata API: {exc}")
 
+        detail_checked = 0
+        for index, gallery in enumerate(galleries):
+            if str(gallery.parent_url or "").strip():
+                continue
+            try:
+                galleries[index] = fetch_gallery_detail(cookie, gallery, delay=0, proxy_url=proxy_url)
+                detail_checked += 1
+            except Exception as exc:
+                errors.append(f"{gallery.url}: {exc}")
+
         updated = 0
         parent_updated = 0
         title_jpn_updated = 0
@@ -1667,6 +1678,7 @@ def backfill_parent_metadata(
         return {
             "ok": not errors,
             "checked": len(galleries),
+            "detail_checked": detail_checked,
             "updated": updated,
             "parent_updated": parent_updated,
             "title_jpn_updated": title_jpn_updated,

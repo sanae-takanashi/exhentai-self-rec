@@ -869,7 +869,10 @@ class AppTest(unittest.TestCase):
                     },
                     unrated_url: {"parent_url": parent_url},
                 }
-                with patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata:
+                with (
+                    patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata,
+                    patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                ):
                     result = backfill_parent_metadata(scope="history", limit=10, filter_text="Hie")
 
                 with db.connect() as conn:
@@ -889,6 +892,7 @@ class AppTest(unittest.TestCase):
                     [("4015079", "def456")],
                     proxy_url="",
                 )
+                fetch_detail.assert_not_called()
                 self.assertEqual(history["title_jpn"], "[日枝御子] コミックスとエクストラ")
                 self.assertEqual(history["parent_url"], parent_url)
                 self.assertEqual(history["thumb_url"], "https://ehgt.org/aa/bb/4015079.jpg")
@@ -921,7 +925,10 @@ class AppTest(unittest.TestCase):
                     store_galleries(conn, [Gallery(url=review_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras")])
 
                 metadata = {review_url: {"parent_url": parent_url}}
-                with patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata):
+                with (
+                    patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata),
+                    patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                ):
                     result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
 
                 with db.connect() as conn:
@@ -930,7 +937,57 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["checked"], 1)
                 self.assertEqual(result["parent_updated"], 1)
+                self.assertEqual(result["detail_checked"], 0)
+                fetch_detail.assert_not_called()
                 self.assertEqual(row["parent_url"], parent_url)
+
+    def test_backfill_parent_metadata_falls_back_to_detail_parent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                review_url = "https://exhentai.org/g/4015079/def456/"
+                parent_url = "https://exhentai.org/g/3974133/abc123/"
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    store_galleries(conn, [Gallery(url=review_url, gid="4015079", token="def456", title="Hie Himiko Comics & Extras")])
+
+                detail = Gallery(
+                    url=review_url,
+                    gid="4015079",
+                    token="def456",
+                    title="Hie Himiko Comics & Extras",
+                    title_jpn="[日枝御子] コミックスとエクストラ",
+                    parent_url=parent_url,
+                    tags=["artist:hie himiko"],
+                    page_count=99,
+                )
+                with (
+                    patch("exh_rec.app.fetch_gallery_metadata", return_value={review_url: {"title_jpn": ""}}),
+                    patch("exh_rec.app.fetch_gallery_detail", return_value=detail) as fetch_detail,
+                ):
+                    result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
+
+                with db.connect() as conn:
+                    row = conn.execute(
+                        "SELECT title_jpn, parent_url, page_count, tags_json FROM galleries WHERE url = ?",
+                        (review_url,),
+                    ).fetchone()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["checked"], 1)
+                self.assertEqual(result["detail_checked"], 1)
+                self.assertEqual(result["parent_updated"], 1)
+                self.assertEqual(result["title_jpn_updated"], 1)
+                fetch_detail.assert_called_once()
+                args, kwargs = fetch_detail.call_args
+                self.assertEqual(args[0], "ipb_member_id=123; ipb_pass_hash=abc")
+                self.assertEqual(args[1].url, review_url)
+                self.assertEqual(kwargs, {"delay": 0, "proxy_url": ""})
+                self.assertEqual(row["parent_url"], parent_url)
+                self.assertEqual(row["title_jpn"], "[日枝御子] コミックスとエクストラ")
+                self.assertEqual(row["page_count"], 99)
+                self.assertIn("artist:hie himiko", row["tags_json"])
 
     def test_short_repeat_payload_returns_related_old_feedback(self):
         conn = sqlite3.connect(":memory:")

@@ -573,11 +573,12 @@ async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}
   } else {
     await loadCurrentPage();
   }
+  const detailText = payload.detail_checked ? `; checked ${payload.detail_checked} source pages` : "";
   if (payload.errors.length) {
-    setStatus(`Updated ${payload.updated} metadata rows; errors: ${payload.errors.join(" | ")}`, true);
+    setStatus(`Updated ${payload.updated} metadata rows${detailText}; errors: ${payload.errors.join(" | ")}`, true);
   } else {
     setStatus(
-      `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)`
+      `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)${detailText}`
     );
   }
 }
