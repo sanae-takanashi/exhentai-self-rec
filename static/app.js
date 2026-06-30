@@ -963,6 +963,23 @@ function renderRelatedFeedback(item) {
   </div>`;
 }
 
+function renderParentChain(item) {
+  const entries = item.parent_chain || [];
+  if (!entries.length) {
+    return "";
+  }
+  const links = entries
+    .map((entry) => {
+      const title = entry.title || entry.url || "Parent gallery";
+      const label = entry.known ? title : `Unknown parent ${entry.url}`;
+      return entry.url
+        ? `<a href="${escapeAttr(entry.url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
+        : `<span>${escapeHtml(label)}</span>`;
+    })
+    .join('<span class="chain-separator">&rarr;</span>');
+  return `<div class="parent-chain"><span>Parent chain</span>${links}</div>`;
+}
+
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
   if (!append) {
@@ -998,6 +1015,7 @@ function renderGalleryCards(items, append = false) {
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
     const relatedFeedback = renderRelatedFeedback(item);
+    const parentChain = renderParentChain(item);
     const hasFeedback = Boolean(item.feedback_id);
     const userFeedback = hasFeedback
       ? item.user_score
@@ -1062,6 +1080,7 @@ function renderGalleryCards(items, append = false) {
         ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
         ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
+        ${parentChain}
         <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
         ${relatedFeedback}

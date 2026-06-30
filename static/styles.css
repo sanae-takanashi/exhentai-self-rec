@@ -61,9 +61,26 @@ h2 {
 #status,
 .hint,
 .meta,
+.parent-chain,
 .reason {
   color: var(--muted);
   font-size: 13px;
+}
+
+.parent-chain {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.parent-chain > span:first-child {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.chain-separator {
+  color: var(--muted);
 }
 
 .actions,

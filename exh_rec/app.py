@@ -52,6 +52,7 @@ from .recommender import (
     learned_query_tags,
     marked_gallery_page,
     model_snapshot,
+    normalize_gallery_url,
     normalize_language_filter,
     normalize_model_mode,
     normalize_posted_after,
@@ -2194,7 +2195,7 @@ def recommendation_payload(
         require_bootstrap_match=require_bootstrap_match,
         posted_after=posted_after,
     )
-    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
@@ -2205,7 +2206,7 @@ def reaction_history_payload(
     filter_text: str | None = None,
 ) -> dict:
     page = reaction_history_page(conn, limit=limit, offset=offset, filter_text=filter_text)
-    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
@@ -2217,7 +2218,7 @@ def marked_gallery_payload(
     filter_text: str | None = None,
 ) -> dict:
     page = marked_gallery_page(conn, kind=kind, limit=limit, offset=offset, filter_text=filter_text)
-    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
@@ -2234,7 +2235,7 @@ def short_repeat_payload(
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
     )
-    page["items"] = [recommendation_item_with_image_fallback(item) for item in page["items"]]
+    page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
@@ -2258,6 +2259,56 @@ def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match
         filter_text=payload.get("filter_text"),
         require_bootstrap_match=require_bootstrap_match,
     )
+
+
+def gallery_item_payloads(conn, items: list[dict]) -> list[dict]:
+    return [gallery_item_payload(conn, item) for item in items]
+
+
+def gallery_item_payload(conn, item: dict) -> dict:
+    updated = recommendation_item_with_image_fallback(item)
+    parent_chain = gallery_parent_chain(conn, updated)
+    if parent_chain:
+        updated = dict(updated)
+        updated["parent_chain"] = parent_chain
+    return updated
+
+
+def gallery_parent_chain(conn, item: dict, limit: int = 12) -> list[dict]:
+    parent_url = normalize_gallery_url(item.get("parent_url"))
+    gallery_url = normalize_gallery_url(item.get("url"))
+    if not parent_url or parent_url == gallery_url:
+        return []
+
+    chain: list[dict] = []
+    seen = {gallery_url} if gallery_url else set()
+    current_url = parent_url
+    for _ in range(limit):
+        if not current_url or current_url in seen:
+            break
+        seen.add(current_url)
+        row = conn.execute(
+            """
+            SELECT url, title, title_jpn, parent_url, page_count
+            FROM galleries
+            WHERE url = ?
+            """,
+            (current_url,),
+        ).fetchone()
+        if not row:
+            chain.append({"url": current_url, "title": current_url, "known": False})
+            break
+        chain.append(
+            {
+                "url": row["url"],
+                "title": row["title"] or row["url"],
+                "title_jpn": row["title_jpn"],
+                "page_count": row["page_count"],
+                "known": True,
+            }
+        )
+        current_url = normalize_gallery_url(row["parent_url"])
+    return chain
 
 
 def recommendation_item_with_image_fallback(item: dict) -> dict:

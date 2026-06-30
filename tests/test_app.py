@@ -797,14 +797,18 @@ class AppTest(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(db.SCHEMA)
+        grandparent_url = "https://exhentai.org/g/1000/a/"
+        parent_url = "https://exhentai.org/g/1001/a/"
         old_url = "https://exhentai.org/g/10h/a/"
         new_url = "https://exhentai.org/g/10i/a/"
         sample_url = "https://s.exhentai.org/t/history.jpg"
         store_galleries(
             conn,
             [
+                Gallery(url=grandparent_url, gid="1000", token="a", title="Grandparent Gallery"),
+                Gallery(url=parent_url, gid="1001", token="a", title="Parent Gallery", parent_url=grandparent_url),
                 Gallery(url=old_url, gid="10h", token="a", title="Old Feedback"),
-                Gallery(url=new_url, gid="10i", token="a", title="New Feedback"),
+                Gallery(url=new_url, gid="10i", token="a", title="New Feedback", parent_url=parent_url),
             ],
         )
         store_gallery_samples(conn, new_url, 12, [sample_url])
@@ -817,7 +821,24 @@ class AppTest(unittest.TestCase):
         self.assertEqual([item["url"] for item in payload["items"]], [new_url, old_url])
         self.assertEqual(payload["items"][0]["thumb_url"], sample_url)
         self.assertEqual(payload["items"][0]["user_score"], 5)
+        self.assertEqual([entry["url"] for entry in payload["items"][0]["parent_chain"]], [parent_url, grandparent_url])
+        self.assertEqual(payload["items"][0]["parent_chain"][0]["title"], "Parent Gallery")
+        self.assertTrue(payload["items"][0]["parent_chain"][0]["known"])
         self.assertTrue(payload["items"][0]["rated"])
+        conn.close()
+
+    def test_reaction_history_payload_shows_unknown_parent_url(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery_url = "https://exhentai.org/g/10unknown/a/"
+        parent_url = "https://exhentai.org/g/2000/a/"
+        store_galleries(conn, [Gallery(url=gallery_url, gid="10unknown", token="a", title="Unknown Parent", parent_url=parent_url)])
+        record_feedback(conn, gallery_url, vote=1)
+
+        payload = reaction_history_payload(conn, limit=10)
+
+        self.assertEqual(payload["items"][0]["parent_chain"], [{"url": parent_url, "title": parent_url, "known": False}])
         conn.close()
 
     def test_backfill_parent_metadata_updates_reaction_history_rows(self):
