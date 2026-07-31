@@ -78,8 +78,8 @@ const staticTooltips = {
   checkBtn: "Test whether the stored cookie can access ExHentai gallery listings.",
   clearCookieBtn: "Remove the stored cookie and saved access-check result.",
   tags: "Seed tags for initial fetching and scoring. Use negative lines for dislikes and :weight for stronger signals.",
-  pages: "Number of result pages to fetch for each query, from 1 to 5.",
-  staleFetchExtraPages: "If the first max-page batch has no new galleries, fetch this many additional older pages.",
+  pages: "Result pages fetched when an automatic query first establishes its cursor, from 1 to 5.",
+  staleFetchExtraPages: "Additional pages allowed while an automatic query catches up to its previous cursor.",
   detailLimit: "Maximum galleries per fetch to enrich with full detail metadata and sample thumbnails.",
   learnedLimit: "Maximum learned positive tags to add as extra remote fetch queries.",
   candidateLimit: "Number of local candidate galleries considered when ranking recommendations.",
@@ -661,6 +661,11 @@ async function fetchNew(query = "") {
   }
   if (payload.errors.length) {
     setStatus(`Fetched ${payload.fetched}; errors: ${payload.errors.join(" | ")}`, true);
+  } else if (payload.cursor_incomplete_queries && payload.cursor_incomplete_queries.length) {
+    setStatus(
+      `Fetched ${payload.fetched}; stored ${payload.stored}; catch-up limit reached for ${payload.cursor_incomplete_queries.join(", ")}`,
+      true,
+    );
   } else {
     setStatus(`Fetched ${payload.fetched}; stored ${payload.stored}; enriched ${payload.enriched}`);
   }
@@ -1463,7 +1468,15 @@ function renderStatus(payload) {
     if (Number.isFinite(fetchState.page_start) || Number.isFinite(fetchState.next_page_start)) {
       const start = Number.isFinite(fetchState.page_start) ? fetchState.page_start : fetchState.next_page_start;
       const count = Number.isFinite(fetchState.page_count) ? fetchState.page_count : fetchState.next_page_count;
-      rows.push(["Pages", `start ${start || 0}, count ${count || 0}, +${fetchState.remaining_extra_pages || 0} fallback left`]);
+      rows.push(["Pages", `start ${start || 0}, count ${count || 0}, ${fetchState.remaining_extra_pages || 0} catch-up left`]);
+    }
+    if (fetchState.cursor_active) {
+      rows.push([
+        "Cursor",
+        fetchState.cursor_caught_up
+          ? "caught up"
+          : `${fetchState.cursor_matches || 0}/${fetchState.cursor_match_target || 0} anchors`,
+      ]);
     }
     if (Number.isFinite(fetchState.fetched_batch) || Number.isFinite(fetchState.stored_batch)) {
       rows.push(["Batch", `${fetchState.fetched_batch || 0} fetched, ${fetchState.stored_batch || 0} new`]);
@@ -1503,8 +1516,13 @@ function renderStatus(payload) {
   }
   const plan = payload.plan;
   if (plan && plan.entries) {
-    rows.push(["Plan", plan.entries.map((entry) => entry.query || "recent").join(", ")]);
-    rows.push(["Scope", `${plan.pages} page(s), +${plan.stale_fetch_extra_pages || 0} stale fallback, ${plan.detail_fetch_limit} details`]);
+    rows.push([
+      "Plan",
+      plan.entries
+        .map((entry) => `${entry.query || "recent"}${entry.cursor_caught_up === false ? " [catch-up pending]" : ""}`)
+        .join(", "),
+    ]);
+    rows.push(["Scope", `${plan.pages} initial page(s), +${plan.stale_fetch_extra_pages || 0} cursor catch-up, ${plan.detail_fetch_limit} details`]);
     rows.push(["Pool", `${plan.recommend_candidate_limit} local candidates`]);
   }
   if (payload.refresh) {
