@@ -455,7 +455,7 @@ def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     so both survive untouched.
     """
     removed: dict[str, int] = {}
-    for table in ("gallery_marks", "feedback", "feature_weights", "fetch_runs", "galleries"):
+    for table in ("gallery_marks", "feedback", "feature_weights", "fetch_runs", "fetch_query_state", "galleries"):
         cursor = conn.execute(f"DELETE FROM {table}")
         removed[table] = cursor.rowcount
     return removed

@@ -83,6 +83,17 @@ CREATE TABLE IF NOT EXISTS fetch_runs (
     finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS fetch_query_state (
+    query_key TEXT PRIMARY KEY,
+    query_text TEXT,
+    source TEXT NOT NULL,
+    anchor_urls_json TEXT NOT NULL DEFAULT '[]',
+    caught_up INTEGER NOT NULL DEFAULT 1,
+    last_page_count INTEGER NOT NULL DEFAULT 0,
+    last_success_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS feature_weights (
     feature TEXT PRIMARY KEY,
     weight REAL NOT NULL DEFAULT 0.0,
@@ -95,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_galleries_last_seen ON galleries(last_seen_at DES
 CREATE INDEX IF NOT EXISTS idx_feedback_gallery ON feedback(gallery_url, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gallery_marks_kind ON gallery_marks(kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fetch_runs_started ON fetch_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fetch_query_state_updated ON fetch_query_state(updated_at DESC);
 """
 
 

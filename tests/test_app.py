@@ -43,6 +43,7 @@ from exh_rec.app import (
     feedback_update_summary,
     finish_interrupted_fetch_runs,
     fetch_runs,
+    get_fetch_query_state,
     format_generated_query,
     get_access_check,
     get_settings,
@@ -70,6 +71,7 @@ from exh_rec.app import (
     sample_count_for,
     save_visual_embedding_payload,
     save_settings,
+    save_fetch_query_state,
     select_detail_candidates,
     select_recommendation_detail_candidates,
     server_display_url,
@@ -1688,6 +1690,13 @@ class AppTest(unittest.TestCase):
                     upsert_bootstrap_tags(conn, parse_bootstrap_tags("artist:keepme"))
                     store_galleries(conn, [Gallery(url=gallery_url, gid="50", token="a", title="Legacy")])
                     record_feedback(conn, gallery_url, vote=1)
+                    save_fetch_query_state(
+                        conn,
+                        {"query": None, "source": "recent"},
+                        [gallery_url],
+                        caught_up=True,
+                        page_count=1,
+                    )
 
                 payload = reset_library_payload()
 
@@ -1700,6 +1709,7 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM fetch_runs").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM fetch_query_state").fetchone()[0], 0)
                     self.assertEqual(db.get_setting(conn, "cookie_header", ""), "ipb_member_id=123; ipb_pass_hash=abc")
                     tags = {row["tag"] for row in conn.execute("SELECT tag FROM bootstrap_tags")}
                 self.assertIn("artist:keepme", tags)
@@ -1747,7 +1757,7 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["model_retrained"])
                 self.assertIn("artist:fetchdetail", learned)
 
-    def test_fetch_and_store_fetches_deeper_when_max_pages_are_stale(self):
+    def test_fetch_and_store_follows_query_cursor_until_old_anchor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
             with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
@@ -1760,21 +1770,145 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "stale_fetch_extra_pages", "5")
                     db.set_setting(conn, "detail_fetch_limit", "0")
                     store_galleries(conn, [old_gallery])
+                    save_fetch_query_state(
+                        conn,
+                        {"query": None, "source": "recent"},
+                        [old_gallery.url],
+                        caught_up=True,
+                        page_count=1,
+                    )
 
                 def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
                     if start_page == 0:
-                        return [old_gallery]
-                    if start_page == 5:
                         return [new_gallery]
+                    if start_page == 1:
+                        return [old_gallery]
                     return []
 
-                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch:
+                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch, patch(
+                    "exh_rec.app.enrich_covers_via_api", return_value=0
+                ):
                     result = fetch_and_store()
 
                 self.assertEqual(result["stored"], 1)
                 self.assertIn(new_gallery.url, [item["url"] for item in result["items"]])
                 starts = [call.kwargs.get("start_page", 0) for call in fetch.call_args_list]
-                self.assertEqual(starts[:2], [0, 5])
+                self.assertEqual(starts[:2], [0, 1])
+                with db.connect() as conn:
+                    state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
+                self.assertEqual(state["anchors"], [new_gallery.url])
+                self.assertTrue(state["caught_up"])
+                self.assertEqual(state["last_page_count"], 2)
+
+    def test_fetch_and_store_stops_on_first_page_when_cursor_is_current(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                anchors = [
+                    Gallery(url=f"https://exhentai.org/g/90{idx}/a/", gid=f"90{idx}", token="a", title=f"Anchor {idx}")
+                    for idx in range(3)
+                ]
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "fetch_pages", "5")
+                    db.set_setting(conn, "stale_fetch_extra_pages", "20")
+                    db.set_setting(conn, "detail_fetch_limit", "0")
+                    store_galleries(conn, anchors)
+                    save_fetch_query_state(
+                        conn,
+                        {"query": None, "source": "recent"},
+                        [gallery.url for gallery in anchors],
+                        caught_up=True,
+                        page_count=5,
+                    )
+
+                with patch("exh_rec.app.fetch_galleries", return_value=anchors) as fetch, patch(
+                    "exh_rec.app.enrich_covers_via_api", return_value=0
+                ):
+                    result = fetch_and_store()
+
+                self.assertEqual(fetch.call_count, 1)
+                self.assertEqual(result["stored"], 0)
+                with db.connect() as conn:
+                    state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
+                self.assertTrue(state["caught_up"])
+                self.assertEqual(state["last_page_count"], 1)
+
+    def test_fetch_and_store_keeps_independent_recent_and_bootstrap_cursors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                recent = Gallery(url="https://exhentai.org/g/950/a/", gid="950", token="a", title="Recent")
+                seeded = Gallery(url="https://exhentai.org/g/951/a/", gid="951", token="a", title="Seeded")
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "fetch_pages", "1")
+                    db.set_setting(conn, "stale_fetch_extra_pages", "20")
+                    db.set_setting(conn, "detail_fetch_limit", "0")
+                    upsert_bootstrap_tags(conn, [("artist:seed", 1.0)])
+
+                def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
+                    self.assertEqual(start_page, 0)
+                    return [recent] if query is None else [seeded]
+
+                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch), patch(
+                    "exh_rec.app.enrich_covers_via_api", return_value=0
+                ):
+                    first = fetch_and_store()
+
+                self.assertEqual(first["stored"], 2)
+                with db.connect() as conn:
+                    recent_state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
+                    seed_state = get_fetch_query_state(conn, {"query": "artist:seed", "source": "bootstrap"})
+                    db.set_setting(conn, "fetch_pages", "5")
+                self.assertEqual(recent_state["anchors"], [recent.url])
+                self.assertEqual(seed_state["anchors"], [seeded.url])
+
+                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch, patch(
+                    "exh_rec.app.enrich_covers_via_api", return_value=0
+                ):
+                    second = fetch_and_store()
+
+                self.assertEqual(fetch.call_count, 2)
+                self.assertEqual(second["stored"], 0)
+
+    def test_fetch_and_store_preserves_cursor_when_catch_up_limit_is_reached(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                old_gallery = Gallery(url="https://exhentai.org/g/100/a/", gid="100", token="a", title="Old Anchor")
+                with db.connect() as conn:
+                    db.set_setting(conn, "cookie_header", "ipb_member_id=123; ipb_pass_hash=abc")
+                    db.set_setting(conn, "fetch_pages", "1")
+                    db.set_setting(conn, "stale_fetch_extra_pages", "2")
+                    db.set_setting(conn, "detail_fetch_limit", "0")
+                    save_fetch_query_state(
+                        conn,
+                        {"query": None, "source": "recent"},
+                        [old_gallery.url],
+                        caught_up=True,
+                        page_count=1,
+                    )
+
+                def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
+                    gid = 200 + start_page
+                    return [Gallery(url=f"https://exhentai.org/g/{gid}/a/", gid=str(gid), token="a", title=f"New {gid}")]
+
+                with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch, patch(
+                    "exh_rec.app.enrich_covers_via_api", return_value=0
+                ):
+                    result = fetch_and_store()
+
+                self.assertEqual(fetch.call_count, 3)
+                self.assertEqual(result["stored"], 3)
+                with db.connect() as conn:
+                    state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
+                self.assertEqual(state["anchors"], [old_gallery.url])
+                self.assertFalse(state["caught_up"])
+                self.assertEqual(state["last_page_count"], 3)
 
     def test_fetch_and_store_logs_detailed_progress(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1795,7 +1929,7 @@ class AppTest(unittest.TestCase):
                 lines = [call.args[0] for call in printed.call_args_list]
                 self.assertTrue(any(line.startswith("[fetch] fetch started") for line in lines))
                 self.assertTrue(any(line.startswith("[fetch] query started") for line in lines))
-                self.assertTrue(any(line.startswith("[fetch] page batch fetched") for line in lines))
+                self.assertTrue(any(line.startswith("[fetch] query page fetched") for line in lines))
                 self.assertTrue(any(line.startswith("[fetch] fetch finished") for line in lines))
                 self.assertEqual(result["status"], "success")
                 self.assertFalse(FETCH_STATE["running"])

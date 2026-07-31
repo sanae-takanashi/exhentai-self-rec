@@ -102,6 +102,9 @@ THUMB_MAX_BYTES = 5 * 1024 * 1024
 PARENT_UPDATE_LOG_LIMIT = 120
 PARENT_UPDATE_FETCH_RETRIES = 2
 PARENT_UPDATE_RETRY_BACKOFF_SECONDS = 1.0
+FETCH_CURSOR_SOURCES = frozenset({"recent", "bootstrap", "learned"})
+FETCH_CURSOR_ANCHOR_LIMIT = 10
+FETCH_CURSOR_MATCH_COUNT = 3
 
 
 class ApiError(Exception):
@@ -1014,6 +1017,10 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
     tags = get_bootstrap_tags(conn)
     learned_tags = learned_query_tags(conn, learned_limit)
     entries = build_query_plan(tags, learned_tags, force_query=force_query)
+    for entry in entries:
+        state = get_fetch_query_state(conn, entry)
+        entry["cursor_initialized"] = bool(state and state["anchors"])
+        entry["cursor_caught_up"] = None if state is None else state["caught_up"]
     return {
         "queries": [entry["query"] for entry in entries],
         "entries": entries,
@@ -1149,6 +1156,94 @@ def display_query(query: str | None) -> str:
     return query or "recent"
 
 
+def fetch_query_key(query: str | None) -> str:
+    return "recent" if query is None else f"search:{query}"
+
+
+def cursor_enabled_for(entry: dict) -> bool:
+    return entry.get("source") in FETCH_CURSOR_SOURCES
+
+
+def decode_cursor_anchors(raw: object) -> list[str]:
+    try:
+        values = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return normalize_cursor_anchors(values)
+
+
+def normalize_cursor_anchors(values: list[object]) -> list[str]:
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        url = str(value or "").strip()
+        if not url or url in seen:
+            continue
+        anchors.append(url)
+        seen.add(url)
+        if len(anchors) >= FETCH_CURSOR_ANCHOR_LIMIT:
+            break
+    return anchors
+
+
+def get_fetch_query_state(conn, entry: dict) -> dict | None:
+    if not cursor_enabled_for(entry):
+        return None
+    row = conn.execute(
+        """
+        SELECT query_key, query_text, source, anchor_urls_json, caught_up,
+               last_page_count, last_success_at, updated_at
+        FROM fetch_query_state
+        WHERE query_key = ?
+        """,
+        (fetch_query_key(entry.get("query")),),
+    ).fetchone()
+    if row is None:
+        return None
+    state = dict(row)
+    state["anchors"] = decode_cursor_anchors(state.pop("anchor_urls_json", "[]"))
+    state["caught_up"] = bool(state["caught_up"])
+    return state
+
+
+def save_fetch_query_state(
+    conn,
+    entry: dict,
+    anchors: list[str],
+    caught_up: bool,
+    page_count: int,
+) -> None:
+    if not cursor_enabled_for(entry):
+        return
+    conn.execute(
+        """
+        INSERT INTO fetch_query_state(
+            query_key, query_text, source, anchor_urls_json, caught_up,
+            last_page_count, last_success_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(query_key) DO UPDATE SET
+            query_text = excluded.query_text,
+            source = excluded.source,
+            anchor_urls_json = excluded.anchor_urls_json,
+            caught_up = excluded.caught_up,
+            last_page_count = excluded.last_page_count,
+            last_success_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            fetch_query_key(entry.get("query")),
+            entry.get("query"),
+            entry.get("source") or "unknown",
+            json.dumps(normalize_cursor_anchors(anchors), ensure_ascii=True),
+            1 if caught_up else 0,
+            max(0, int(page_count)),
+        ),
+    )
+
+
 def get_access_check(conn) -> dict | None:
     raw = db.get_setting(conn, "last_access_check", "")
     if not raw:
@@ -1181,7 +1276,8 @@ def fetch_and_store(
         FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
-    queries = build_queries(tags, learned_tags, force_query)
+    query_plan = build_query_plan(tags, learned_tags, force_query=force_query)
+    queries = [entry["query"] for entry in query_plan]
     run_id: int | None = None
     fetched = 0
     stored = 0
@@ -1190,6 +1286,7 @@ def fetch_and_store(
     selected_for_detail = []
     selected_urls: set[str] = set()
     errors: list[str] = []
+    cursor_incomplete_queries: list[str] = []
     update_fetch_progress(
         "fetch started",
         running=True,
@@ -1216,93 +1313,137 @@ def fetch_and_store(
             run_id = int(cursor.lastrowid)
         update_fetch_progress("fetch run recorded", stage="running", run_id=run_id)
 
-        for query_index, query in enumerate(queries, start=1):
+        for query_index, entry in enumerate(query_plan, start=1):
+            query = entry["query"]
             try:
-                start_page = 0
-                batch_pages = pages
-                remaining_extra_pages = stale_extra_pages if pages >= 5 else 0
+                with db.connect() as conn:
+                    cursor_state = get_fetch_query_state(conn, entry)
+                old_anchor_list = cursor_state["anchors"] if cursor_state else []
+                old_anchors = set(old_anchor_list)
+                cursor_active = cursor_enabled_for(entry) and bool(old_anchors)
+                page_limit = pages + stale_extra_pages if cursor_active else pages
+                page_limit = max(1, page_limit)
+                matched_anchors: set[str] = set()
+                query_galleries: list[Gallery] = []
+                query_seen: set[str] = set()
+                head_anchors: list[str] = []
+                pages_fetched = 0
+                cursor_caught_up = not cursor_active
+                anchor_match_target = min(FETCH_CURSOR_MATCH_COUNT, len(old_anchors))
                 update_fetch_progress(
                     "query started",
                     stage="fetching_pages",
                     current_query=display_query(query),
                     query_index=query_index,
                     query_total=len(queries),
-                    page_start=start_page,
-                    page_count=batch_pages,
-                    remaining_extra_pages=remaining_extra_pages,
+                    query_source=entry.get("source"),
+                    cursor_active=cursor_active,
+                    cursor_caught_up=cursor_caught_up,
+                    page_start=0,
+                    page_count=page_limit,
+                    remaining_extra_pages=max(0, page_limit - pages),
                 )
-                while True:
+                for page_number in range(page_limit):
                     update_fetch_progress(
-                        "fetching page batch",
+                        "fetching query page",
                         stage="fetching_pages",
                         current_query=display_query(query),
                         query_index=query_index,
                         query_total=len(queries),
-                        page_start=start_page,
-                        page_count=batch_pages,
-                        remaining_extra_pages=remaining_extra_pages,
+                        page_start=page_number,
+                        page_count=1,
+                        cursor_active=cursor_active,
+                        cursor_matches=len(matched_anchors),
+                        cursor_match_target=anchor_match_target,
+                        remaining_extra_pages=max(0, page_limit - page_number - 1),
                     )
-                    galleries = fetch_galleries(
+                    page_galleries = fetch_galleries(
                         cookie,
                         query=query,
-                        pages=batch_pages,
-                        start_page=start_page,
+                        pages=1,
+                        start_page=page_number,
                         proxy_url=proxy_url,
                     )
-                    fetched += len(galleries)
+                    pages_fetched += 1
+                    fetched += len(page_galleries)
+                    if page_number == 0:
+                        head_anchors = [gallery.url for gallery in page_galleries[:FETCH_CURSOR_ANCHOR_LIMIT]]
+                    for gallery in page_galleries:
+                        if gallery.url not in query_seen:
+                            query_galleries.append(gallery)
+                            query_seen.add(gallery.url)
+                        if gallery.url in old_anchors:
+                            matched_anchors.add(gallery.url)
                     update_fetch_progress(
-                        "page batch fetched",
+                        "query page fetched",
                         stage="fetching_pages",
                         current_query=display_query(query),
-                        fetched_batch=len(galleries),
+                        fetched_batch=len(page_galleries),
                         fetched=fetched,
+                        cursor_matches=len(matched_anchors),
+                        cursor_match_target=anchor_match_target,
                     )
-                    try:
-                        cover_updated = enrich_covers_via_api(cookie, galleries, proxy_url=proxy_url)
-                        update_fetch_progress(
-                            "cover metadata checked",
-                            stage="cover_metadata",
-                            current_query=display_query(query),
-                            cover_updated=cover_updated,
-                        )
-                    except Exception as exc:
-                        errors.append(f"covers {query or 'recent'}: {exc}")
-                        update_fetch_progress(
-                            "cover metadata failed",
-                            stage="cover_metadata",
-                            current_query=display_query(query),
-                            error=str(exc),
-                            errors=list(errors),
-                        )
-                    with db.connect() as conn:
-                        batch_stored = store_galleries(conn, galleries)
-                        stored += batch_stored
-                        candidates = select_detail_candidates(conn, galleries, detail_limit - len(selected_for_detail))
-                    for gallery in candidates:
-                        if gallery.url not in selected_urls:
-                            selected_for_detail.append(gallery)
-                            selected_urls.add(gallery.url)
-                    update_fetch_progress(
-                        "page batch stored",
-                        stage="storing",
-                        current_query=display_query(query),
-                        fetched=fetched,
-                        stored=stored,
-                        stored_batch=batch_stored,
-                        detail_selected=len(selected_for_detail),
-                    )
-                    if batch_stored > 0 or not galleries or remaining_extra_pages <= 0:
+                    if not page_galleries:
+                        cursor_caught_up = True
                         break
+                    if cursor_active and len(matched_anchors) >= anchor_match_target:
+                        cursor_caught_up = True
+                        break
+
+                try:
+                    cover_updated = enrich_covers_via_api(cookie, query_galleries, proxy_url=proxy_url)
                     update_fetch_progress(
-                        "page batch stale; fetching deeper",
-                        stage="fetching_pages",
+                        "cover metadata checked",
+                        stage="cover_metadata",
                         current_query=display_query(query),
-                        next_page_start=start_page + batch_pages,
-                        next_page_count=min(5, remaining_extra_pages),
+                        cover_updated=cover_updated,
                     )
-                    start_page += batch_pages
-                    batch_pages = min(5, remaining_extra_pages)
-                    remaining_extra_pages -= batch_pages
+                except Exception as exc:
+                    errors.append(f"covers {query or 'recent'}: {exc}")
+                    update_fetch_progress(
+                        "cover metadata failed",
+                        stage="cover_metadata",
+                        current_query=display_query(query),
+                        error=str(exc),
+                        errors=list(errors),
+                    )
+                with db.connect() as conn:
+                    batch_stored = store_galleries(conn, query_galleries)
+                    stored += batch_stored
+                    candidates = select_detail_candidates(
+                        conn,
+                        query_galleries,
+                        detail_limit - len(selected_for_detail),
+                    )
+                    if cursor_enabled_for(entry) and (head_anchors or old_anchor_list):
+                        anchors_to_save = head_anchors if cursor_caught_up and head_anchors else old_anchor_list
+                        save_fetch_query_state(
+                            conn,
+                            entry,
+                            anchors_to_save,
+                            caught_up=cursor_caught_up,
+                            page_count=pages_fetched,
+                        )
+                for gallery in candidates:
+                    if gallery.url not in selected_urls:
+                        selected_for_detail.append(gallery)
+                        selected_urls.add(gallery.url)
+                update_fetch_progress(
+                    "query stored",
+                    stage="storing",
+                    current_query=display_query(query),
+                    fetched=fetched,
+                    stored=stored,
+                    stored_batch=batch_stored,
+                    detail_selected=len(selected_for_detail),
+                    cursor_active=cursor_active,
+                    cursor_caught_up=cursor_caught_up,
+                    cursor_matches=len(matched_anchors),
+                    cursor_match_target=anchor_match_target,
+                    pages_fetched=pages_fetched,
+                )
+                if cursor_active and not cursor_caught_up:
+                    cursor_incomplete_queries.append(display_query(query))
             except Exception as exc:
                 errors.append(str(exc))
                 update_fetch_progress(
@@ -1395,6 +1536,7 @@ def fetch_and_store(
             enriched=enriched,
             model_retrained=model_retrained,
             errors=list(errors),
+            cursor_incomplete_queries=list(cursor_incomplete_queries),
         )
         return {
             "ok": not errors,
@@ -1405,6 +1547,7 @@ def fetch_and_store(
             "enriched": enriched,
             "model_retrained": model_retrained,
             "errors": errors,
+            "cursor_incomplete_queries": cursor_incomplete_queries,
             "last_fetch": last_fetch,
             **page,
         }
