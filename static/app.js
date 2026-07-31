@@ -1079,9 +1079,12 @@ function renderGalleryCards(items, append = false) {
   for (const item of items) {
     const card = document.createElement("article");
     card.className = "card";
-    const thumb = item.thumb_url
+    const thumbContent = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
+    const thumb = item.thumb_url && mode === "review"
+      ? `<a class="thumb" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer" aria-label="Open ${escapeAttr(item.title)}">${thumbContent}</a>`
+      : `<div class="thumb">${thumbContent}</div>`;
     const samples = item.samples || [];
     const samplesPreview = samples.length
       ? `<div class="samples">${samples
@@ -1146,7 +1149,7 @@ function renderGalleryCards(items, append = false) {
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
     card.innerHTML = `
       <div class="media-preview">
-        <div class="thumb">${thumb}</div>
+        ${thumb}
         ${samplesPreview}
       </div>
       <div class="body">
