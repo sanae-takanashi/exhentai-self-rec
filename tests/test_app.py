@@ -62,6 +62,7 @@ from exh_rec.app import (
     parse_mark_kind,
     query_float,
     query_int,
+    queue_counts_payload,
     reaction_history_payload,
     recommend_candidate_limit,
     recommendation_payload,
@@ -1321,6 +1322,51 @@ class AppTest(unittest.TestCase):
         self.assertIn("recalculated_at", sent[0][0])
         self.assertEqual(sent[0][0]["total"], 1)
         self.assertEqual(sent[0][0]["items"][0]["url"], repeat_url)
+        conn.close()
+
+    def test_queue_counts_payload_returns_review_and_short_repeat_totals(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        old_url = "https://exhentai.org/g/8000/a/"
+        repeat_url = "https://exhentai.org/g/8001/b/"
+        review_url = "https://exhentai.org/g/8002/c/"
+        db.set_setting(conn, "review_require_bootstrap_match", "0")
+        db.set_setting(conn, "recommend_language_filter", "")
+        store_galleries(
+            conn,
+            [
+                Gallery(url=old_url, gid="8000", token="a", title="[Pixiv] Count Artist Pack", tags=["artist:count artist"]),
+                Gallery(url=repeat_url, gid="8001", token="b", title="[Pixiv] Count Artist Pack", tags=["artist:count artist"]),
+                Gallery(url=review_url, gid="8002", token="c", title="Review Candidate"),
+            ],
+        )
+        store_gallery_samples(conn, old_url, 80, [])
+        store_gallery_samples(conn, repeat_url, 5, [])
+        record_feedback(conn, old_url, vote=1)
+
+        counts = queue_counts_payload(conn)
+
+        self.assertEqual(counts, {"review": 1, "short_repeats": 1})
+        conn.close()
+
+    def test_queue_counts_endpoint_returns_payload(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        sent = []
+        handler = Handler.__new__(Handler)
+        handler.path = "/api/queue-counts"
+        handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+        handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        with patch("exh_rec.app.db.connect", return_value=conn), patch(
+            "exh_rec.app.queue_counts_payload",
+            return_value={"review": 7, "short_repeats": 3},
+        ):
+            handler.do_GET()
+
+        self.assertEqual(sent, [({"review": 7, "short_repeats": 3}, HTTPStatus.OK)])
         conn.close()
 
     def test_marked_gallery_payload_returns_bookmark_cards(self):

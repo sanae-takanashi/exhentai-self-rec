@@ -43,9 +43,13 @@ const modelBody = document.querySelector("#modelBody");
 const refreshStatusEl = document.querySelector("#refreshStatus");
 const viewTitleEl = document.querySelector("#viewTitle");
 const viewSubtitleEl = document.querySelector("#viewSubtitle");
+const reviewQueueCountEl = document.querySelector("#reviewQueueCount");
+const shortRepeatsQueueCountEl = document.querySelector("#shortRepeatsQueueCount");
 const viewTabs = [...document.querySelectorAll("[data-view]")];
 let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
+let queueCountsPromise = null;
+let queueCountsRefreshQueued = false;
 let lastRenderedFetchId = null;
 let currentView = "review";
 let reviewExploreSeed = "";
@@ -435,6 +439,7 @@ async function saveSettings() {
   cookieEl.value = "";
   cookiePreviewEl.textContent = cookiePreviewText(settings);
   await loadStatus();
+  refreshQueueCounts();
   setStatus("Settings saved");
 }
 
@@ -501,6 +506,59 @@ function viewCopy(view) {
   };
 }
 
+function renderQueueCount(element, value, label) {
+  if (!element || !Number.isFinite(Number(value))) {
+    return;
+  }
+  const count = Math.max(0, Number(value));
+  element.textContent = count.toLocaleString();
+  element.title = `${count.toLocaleString()} ${label} need review`;
+}
+
+function renderQueueCounts(payload) {
+  renderQueueCount(reviewQueueCountEl, payload.review, "galleries");
+  renderQueueCount(shortRepeatsQueueCountEl, payload.short_repeats, "short repeats");
+}
+
+function loadQueueCounts() {
+  if (queueCountsPromise) {
+    return queueCountsPromise;
+  }
+  queueCountsPromise = api("/api/queue-counts")
+    .then((payload) => {
+      renderQueueCounts(payload);
+      return payload;
+    })
+    .catch(() => null)
+    .finally(() => {
+      queueCountsPromise = null;
+      if (queueCountsRefreshQueued) {
+        queueCountsRefreshQueued = false;
+        loadQueueCounts();
+      }
+    });
+  return queueCountsPromise;
+}
+
+function refreshQueueCounts() {
+  if (queueCountsPromise) {
+    queueCountsRefreshQueued = true;
+    return queueCountsPromise;
+  }
+  return loadQueueCounts();
+}
+
+function updateCurrentQueueCount(payload) {
+  if (localFilterEl.value.trim() || !Number.isFinite(Number(payload.total))) {
+    return;
+  }
+  if (currentView === "review") {
+    renderQueueCount(reviewQueueCountEl, payload.total, "galleries");
+  } else if (currentView === "short-repeats") {
+    renderQueueCount(shortRepeatsQueueCountEl, payload.total, "short repeats");
+  }
+}
+
 function setActiveView(view) {
   currentView = view;
   for (const tab of viewTabs) {
@@ -558,6 +616,7 @@ async function recalculateShortRepeats() {
     body: JSON.stringify({ filter_text: localFilterEl.value.trim() }),
   });
   applyGalleryPage(payload);
+  refreshQueueCounts();
   setStatus(`Recalculated ${payload.total} short repeat galleries`);
 }
 
@@ -657,6 +716,7 @@ async function fetchNew(query = "") {
     }),
   });
   await loadCurrentPage();
+  refreshQueueCounts();
   if (payload.last_fetch) {
     renderStatus({ fetch: { running: false }, last_fetch: payload.last_fetch, settings: {} });
   }
@@ -905,6 +965,7 @@ async function applyFeedbackResult(payload) {
   } else {
     applyGalleryPage(payload);
   }
+  refreshQueueCounts();
 }
 
 async function showModel() {
@@ -928,6 +989,7 @@ async function retrain() {
     body: JSON.stringify({ include_rated: false, filter_text: localFilterEl.value.trim() }),
   });
   await loadCurrentPage();
+  refreshQueueCounts();
   modelBody.textContent = JSON.stringify(payload.model, null, 2);
   setStatus("Model retrained");
 }
@@ -946,7 +1008,9 @@ async function resetLibrary() {
     body: JSON.stringify({}),
   });
   applyGalleryPage(payload);
+  renderQueueCounts({ review: 0, short_repeats: 0 });
   await loadStatus();
+  refreshQueueCounts();
   const removed = payload.removed || {};
   setStatus(`Data reset; removed ${removed.galleries || 0} galleries and ${removed.feedback || 0} votes`);
 }
@@ -977,6 +1041,7 @@ async function importPreferences(file) {
   });
   await loadSettings();
   await loadCurrentPage();
+  refreshQueueCounts();
   modelBody.textContent = JSON.stringify(payload.model, null, 2);
   setStatus(
     `Imported ${payload.imported.feedback} feedback, ${payload.imported.bootstrap_tags} bootstrap tags`
@@ -1277,6 +1342,7 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
 
 function applyGalleryPage(payload, append = false) {
   renderGalleryCards(payload.items || [], append);
+  updateCurrentQueueCount(payload);
   nextRecommendationOffset = payload.next_offset || 0;
   hasMoreRecommendations = Boolean(payload.has_more);
   updateLoadMore(payload.total || 0);
@@ -1295,6 +1361,7 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
   if (currentView !== "history") {
     await loadCurrentPage();
   }
+  refreshQueueCounts();
 }
 
 function updateLoadMore(total = null) {
@@ -1684,9 +1751,11 @@ applyStaticTooltips();
 
 loadSettings()
   .then(loadStatus)
-  .then(() => {
+  .then(async () => {
     setActiveView(currentView);
-    return loadCurrentPage();
+    const counts = loadQueueCounts();
+    await loadCurrentPage();
+    await counts;
   })
   .catch((error) => setStatus(error.message, true));
 

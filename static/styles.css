@@ -229,11 +229,35 @@ button.danger:hover {
   margin-bottom: 14px;
 }
 
+.view-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.queue-count {
+  flex: 0 0 auto;
+  min-width: 24px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #30343a;
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+  text-align: center;
+}
+
 .view-tabs button.active {
   background: var(--accent);
   border-color: var(--accent);
   color: #06100d;
   font-weight: 650;
+}
+
+.view-tabs button.active .queue-count {
+  background: #163c32;
+  color: #d9fff2;
 }
 
 .view-heading {

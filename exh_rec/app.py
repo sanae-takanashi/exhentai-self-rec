@@ -150,6 +150,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_settings())
             elif path == "/api/status":
                 self.send_json(get_status())
+            elif path == "/api/queue-counts":
+                with db.connect() as conn:
+                    self.send_json(queue_counts_payload(conn))
             elif path == "/api/fetch-runs":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=10, lower=1, upper=100)
@@ -2796,6 +2799,24 @@ def short_repeat_payload(
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def queue_counts_payload(conn) -> dict[str, int]:
+    candidate_limit = recommend_candidate_limit(conn)
+    review = recommend_page(
+        conn,
+        limit=1,
+        include_rated=False,
+        candidate_limit=candidate_limit,
+        language_filter=configured_language_filter(conn),
+        model_mode=configured_model_mode(conn),
+        require_bootstrap_match=configured_review_require_bootstrap_match(conn),
+    )
+    short_repeats = short_repeat_page(conn, limit=1, candidate_limit=candidate_limit)
+    return {
+        "review": int(review["total"]),
+        "short_repeats": int(short_repeats["total"]),
+    }
 
 
 def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match: bool = False) -> dict:
