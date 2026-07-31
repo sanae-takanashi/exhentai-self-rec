@@ -595,11 +595,12 @@ async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}
       await loadCurrentPage();
     }
     const detailText = payload.detail_checked ? `; checked ${payload.detail_checked} source pages` : "";
-    if (payload.errors.length) {
-      setStatus(`Updated ${payload.updated} metadata rows${detailText}; errors: ${payload.errors.join(" | ")}`, true);
+    const errors = [...(payload.errors || []), ...(payload.parent_errors || [])];
+    if (errors.length) {
+      setStatus(`Updated ${payload.updated} metadata rows${detailText}; errors: ${errors.join(" | ")}`, true);
     } else {
       setStatus(
-        `Updated ${payload.updated} metadata rows (${payload.parent_updated} parents, ${payload.title_jpn_updated} alternate titles)${detailText}`
+        `Updated ${payload.updated} metadata rows (${payload.parent_updated} parent links, ${payload.parent_enriched || 0} ancestor records, ${payload.title_jpn_updated} alternate titles)${detailText}`
       );
     }
   } finally {
@@ -1374,6 +1375,9 @@ function parentProgressCounts(state) {
   if (Number.isFinite(state.parent_updated)) {
     parts.push(`${state.parent_updated || 0} parents`);
   }
+  if (Number.isFinite(state.parent_enriched)) {
+    parts.push(`${state.parent_enriched || 0} ancestors`);
+  }
   return parts.join(" | ");
 }
 
@@ -1385,7 +1389,10 @@ function parentProgressPercent(state) {
     return Math.max(5, parentProgressPercentFromCounts(state));
   }
   if (state.stage === "persisting" && Number.isFinite(state.total) && state.total > 0) {
-    return 75 + (Math.min(state.persisted || 0, state.total) / state.total) * 25;
+    return 75 + (Math.min(state.persisted || 0, state.total) / state.total) * 15;
+  }
+  if (state.stage === "parent_chain" && Number.isFinite(state.parent_chain_total) && state.parent_chain_total > 0) {
+    return 90 + (Math.min(state.parent_chain_done || 0, state.parent_chain_total) / state.parent_chain_total) * 10;
   }
   if (state.stage === "details" && Number.isFinite(state.detail_total)) {
     if (state.detail_total <= 0) {

@@ -38,6 +38,7 @@ from exh_rec.app import (
     render_sample_entry,
     SpriteCropUnavailable,
     fetch_and_store,
+    fetch_parent_chain_metadata,
     feedback_enrichment_plan,
     feedback_history_payload,
     feedback_update_summary,
@@ -844,6 +845,65 @@ class AppTest(unittest.TestCase):
         payload = reaction_history_payload(conn, limit=10)
 
         self.assertEqual(payload["items"][0]["parent_chain"], [{"url": parent_url, "title": parent_url, "known": False}])
+
+    def test_fetch_parent_chain_metadata_stores_complete_chain_outside_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                child_url = "https://exhentai.org/g/3002/c/"
+                parent_url = "https://exhentai.org/g/3001/b/"
+                grandparent_url = "https://exhentai.org/g/3000/a/"
+                child = Gallery(url=child_url, gid="3002", token="c", title="Child", parent_url=parent_url)
+                details = {
+                    parent_url: Gallery(
+                        url=parent_url,
+                        gid="3001",
+                        token="b",
+                        title="Parent",
+                        parent_url=grandparent_url,
+                        page_count=80,
+                        thumb_url="https://ehgt.org/aa/bb/3001.jpg",
+                    ),
+                    grandparent_url: Gallery(
+                        url=grandparent_url,
+                        gid="3000",
+                        token="a",
+                        title="Grandparent",
+                        page_count=40,
+                        thumb_url="https://ehgt.org/aa/bb/3000.jpg",
+                    ),
+                }
+                with db.connect() as conn:
+                    store_galleries(conn, [child])
+
+                def fetch_detail(_cookie, gallery, **_kwargs):
+                    return details[gallery.url]
+
+                with patch("exh_rec.app.fetch_gallery_detail", side_effect=fetch_detail) as fetch:
+                    fetched = fetch_parent_chain_metadata("cookie", child, proxy_url="http://proxy.test:8080")
+
+                self.assertEqual(fetched, 2)
+                self.assertEqual(fetch.call_count, 2)
+                with db.connect() as conn:
+                    rows = {
+                        row["url"]: row
+                        for row in conn.execute(
+                            "SELECT url, title, parent_url, page_count, review_excluded, detail_fetched_at FROM galleries"
+                        )
+                    }
+                    record_feedback(conn, child_url, vote=1)
+                    payload = reaction_history_payload(conn)
+
+                self.assertEqual(rows[child_url]["review_excluded"], 0)
+                self.assertEqual(rows[parent_url]["review_excluded"], 1)
+                self.assertEqual(rows[grandparent_url]["review_excluded"], 1)
+                self.assertEqual(rows[parent_url]["page_count"], 80)
+                self.assertIsNotNone(rows[parent_url]["detail_fetched_at"])
+                self.assertEqual(
+                    [entry["title"] for entry in payload["items"][0]["parent_chain"]],
+                    ["Parent", "Grandparent"],
+                )
         conn.close()
 
     def test_backfill_parent_metadata_updates_reaction_history_rows(self):
@@ -877,6 +937,10 @@ class AppTest(unittest.TestCase):
                 with (
                     patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata,
                     patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                    patch(
+                        "exh_rec.app.fetch_parent_chain_metadata",
+                        side_effect=RuntimeError("parent unavailable"),
+                    ) as fetch_parents,
                 ):
                     result = backfill_parent_metadata(scope="history", limit=10, filter_text="Hie")
 
@@ -888,6 +952,8 @@ class AppTest(unittest.TestCase):
                     unrated = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (unrated_url,)).fetchone()
 
                 self.assertTrue(result["ok"])
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["parent_errors"], [f"parent chain {parent_url}: parent unavailable"])
                 self.assertEqual(result["checked"], 1)
                 self.assertEqual(result["updated"], 1)
                 self.assertEqual(result["parent_updated"], 1)
@@ -898,6 +964,7 @@ class AppTest(unittest.TestCase):
                     proxy_url="",
                 )
                 fetch_detail.assert_not_called()
+                fetch_parents.assert_called_once()
                 self.assertEqual(history["title_jpn"], "[日枝御子] コミックスとエクストラ")
                 self.assertEqual(history["parent_url"], parent_url)
                 self.assertEqual(history["thumb_url"], "https://ehgt.org/aa/bb/4015079.jpg")
@@ -943,6 +1010,7 @@ class AppTest(unittest.TestCase):
                 with (
                     patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata),
                     patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                    patch("exh_rec.app.fetch_parent_chain_metadata", return_value=0) as fetch_parents,
                 ):
                     result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
 
@@ -954,6 +1022,7 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(result["parent_updated"], 1)
                 self.assertEqual(result["detail_checked"], 0)
                 fetch_detail.assert_not_called()
+                fetch_parents.assert_called_once()
                 self.assertEqual(row["parent_url"], parent_url)
 
     def test_backfill_parent_metadata_uses_visible_gallery_urls(self):
@@ -981,6 +1050,7 @@ class AppTest(unittest.TestCase):
                 with (
                     patch("exh_rec.app.fetch_gallery_metadata", return_value=metadata) as fetch_metadata,
                     patch("exh_rec.app.fetch_gallery_detail") as fetch_detail,
+                    patch("exh_rec.app.fetch_parent_chain_metadata", return_value=0) as fetch_parents,
                 ):
                     result = backfill_parent_metadata(
                         scope="all",
@@ -1000,6 +1070,7 @@ class AppTest(unittest.TestCase):
                     proxy_url="",
                 )
                 fetch_detail.assert_not_called()
+                fetch_parents.assert_called_once()
                 self.assertEqual(visible["parent_url"], parent_url)
                 self.assertIsNone(other["parent_url"])
 
@@ -1027,6 +1098,7 @@ class AppTest(unittest.TestCase):
                 with (
                     patch("exh_rec.app.fetch_gallery_metadata", return_value={review_url: {"title_jpn": ""}}),
                     patch("exh_rec.app.fetch_gallery_detail", return_value=detail) as fetch_detail,
+                    patch("exh_rec.app.fetch_parent_chain_metadata", return_value=0) as fetch_parents,
                     patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 ):
                     result = backfill_parent_metadata(scope="all", limit=10, filter_text="Hie")
@@ -1052,6 +1124,11 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(any(line.startswith("[parent-update] detail fetch finished") for line in lines))
                 self.assertTrue(any(line.startswith("[parent-update] parent update finished") for line in lines))
                 fetch_detail.assert_called_once()
+                fetch_parents.assert_called_once_with(
+                    "ipb_member_id=123; ipb_pass_hash=abc",
+                    detail,
+                    proxy_url="",
+                )
                 args, kwargs = fetch_detail.call_args
                 self.assertEqual(args[0], "ipb_member_id=123; ipb_pass_hash=abc")
                 self.assertEqual(args[1].url, review_url)
@@ -1079,6 +1156,7 @@ class AppTest(unittest.TestCase):
                         "exh_rec.app.fetch_gallery_detail",
                         side_effect=[RuntimeError("temporary detail failure"), RuntimeError("second detail failure"), detail],
                     ) as fetch_detail,
+                    patch("exh_rec.app.fetch_parent_chain_metadata", return_value=0) as fetch_parents,
                     patch("exh_rec.app.time.sleep") as sleep,
                     patch("sys.stdout", new_callable=io.StringIO) as stdout,
                 ):
@@ -1090,6 +1168,11 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["detail_checked"], 1)
                 self.assertEqual(fetch_detail.call_count, 3)
+                fetch_parents.assert_called_once_with(
+                    "ipb_member_id=123; ipb_pass_hash=abc",
+                    detail,
+                    proxy_url="",
+                )
                 self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
                 self.assertEqual(row["parent_url"], parent_url)
                 retry_logs = [entry for entry in PARENT_UPDATE_STATE["logs"] if entry["message"] == "detail fetch retry"]
@@ -1123,6 +1206,7 @@ class AppTest(unittest.TestCase):
 
                 with (
                     patch("exh_rec.app.fetch_gallery_detail", return_value=detail) as fetch_detail,
+                    patch("exh_rec.app.fetch_parent_chain_metadata", return_value=0) as fetch_parents,
                     patch("exh_rec.app.cache_sample_thumbnails", return_value=len(samples)) as cache_samples,
                 ):
                     payload = refresh_gallery_metadata_payload({"gallery_url": gallery_url})
@@ -1141,6 +1225,11 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(payload["item"]["tags"], ["artist:example"])
                 self.assertEqual(payload["item"]["samples"], samples)
                 fetch_detail.assert_called_once()
+                fetch_parents.assert_called_once_with(
+                    "ipb_member_id=123; ipb_pass_hash=abc",
+                    detail,
+                    proxy_url="",
+                )
                 cache_samples.assert_called_once_with(gallery_url, samples)
                 self.assertEqual(row["parent_url"], parent_url)
                 self.assertEqual(row["thumb_url"], "https://ehgt.org/aa/bb/4016817.jpg")

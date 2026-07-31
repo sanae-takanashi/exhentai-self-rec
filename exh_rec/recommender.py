@@ -150,7 +150,12 @@ def learned_query_tags(conn: sqlite3.Connection, limit: int = 6) -> list[str]:
     return [row["tag"] for row in rows if row["tag"]]
 
 
-def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_fetched: bool = False) -> int:
+def store_galleries(
+    conn: sqlite3.Connection,
+    galleries: list[Gallery],
+    detail_fetched: bool = False,
+    review_excluded: bool = False,
+) -> int:
     count = 0
     for gallery in galleries:
         tag_weights_json = json.dumps(normalize_tag_weights(gallery.tag_weights), ensure_ascii=True)
@@ -159,9 +164,10 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
             """
             INSERT INTO galleries(
                 url, gid, token, title, title_jpn, category, uploader, posted_at, thumb_url,
-                rating, tags_json, tag_weights_json, source_query, parent_url, detail_fetched_at, last_seen_at
+                rating, tags_json, tag_weights_json, source_query, parent_url, review_excluded,
+                detail_fetched_at, last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 title_jpn = COALESCE(excluded.title_jpn, galleries.title_jpn),
@@ -183,6 +189,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 END,
                 source_query = COALESCE(excluded.source_query, galleries.source_query),
                 parent_url = COALESCE(excluded.parent_url, galleries.parent_url),
+                review_excluded = MIN(galleries.review_excluded, excluded.review_excluded),
                 detail_fetched_at = COALESCE(excluded.detail_fetched_at, galleries.detail_fetched_at),
                 last_seen_at = CASE
                     WHEN ? THEN galleries.last_seen_at
@@ -204,6 +211,7 @@ def store_galleries(conn: sqlite3.Connection, galleries: list[Gallery], detail_f
                 tag_weights_json,
                 gallery.source_query,
                 gallery.parent_url,
+                1 if review_excluded else 0,
                 None,
                 1 if detail_fetched else 0,
             ),
@@ -1082,7 +1090,7 @@ def recommend_page(
     short_repeat_reference_index = (
         related_feedback_reference_index(conn) if exclude_short_repeats and not include_rated else {}
     )
-    unrated_where = "WHERE f.feedback_id IS NULL AND m.kind IS NULL" if not include_rated else ""
+    unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL" if not include_rated else ""
     rows = conn.execute(
         f"""
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
@@ -1098,6 +1106,7 @@ def recommend_page(
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        WHERE g.review_excluded = 0
         {unrated_where}
         ORDER BY g.last_seen_at DESC
         LIMIT ?
@@ -1623,7 +1632,8 @@ def short_repeat_page(
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
-        WHERE f.feedback_id IS NULL AND m.kind IS NULL
+        WHERE g.review_excluded = 0
+          AND f.feedback_id IS NULL AND m.kind IS NULL
           AND (g.parent_url IS NOT NULL OR (g.page_count IS NOT NULL AND g.page_count <= ?))
         ORDER BY g.last_seen_at DESC
         LIMIT ?

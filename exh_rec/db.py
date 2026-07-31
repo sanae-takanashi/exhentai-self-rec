@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS galleries (
     tag_weights_json TEXT NOT NULL DEFAULT '{}',
     source_query TEXT,
     parent_url TEXT,
+    review_excluded INTEGER NOT NULL DEFAULT 0,
     detail_fetched_at TEXT,
     page_count INTEGER,
     samples_json TEXT NOT NULL DEFAULT '[]',
@@ -129,6 +130,7 @@ def init_db() -> None:
         ensure_column(conn, "feedback", "score", "INTEGER")
         ensure_column(conn, "galleries", "title_jpn", "TEXT")
         ensure_column(conn, "galleries", "parent_url", "TEXT")
+        ensure_column(conn, "galleries", "review_excluded", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "galleries", "detail_fetched_at", "TEXT")
         ensure_column(conn, "galleries", "tag_weights_json", "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(conn, "galleries", "page_count", "INTEGER")

@@ -130,6 +130,8 @@ The refresh panel shows the current fetch plan. Typing an optional one-off searc
 
 Automatic query cursors are keyed by the normalized remote query, so stable bootstrap searches avoid repeatedly scanning a fixed five-page window while still following new results back to the previous scan. A cursor advances only after its old anchors are reached or the search reaches the end. If the catch-up limit is reached first, the old cursor is preserved and the plan reports `catch-up pending`; increasing `Catch-up` allows a later refresh to continue safely without treating the partial scan as complete.
 
+Detail enrichment and parent metadata updates also follow missing parent links and store ancestor metadata locally, up to 12 levels. Ancestors fetched only for this purpose are excluded from Review and short-repeat candidates; if a later normal query discovers one, it becomes reviewable like any other fetched gallery.
+
 Blank or whitespace-only one-off search input uses the normal recent/bootstrap/learned fetch plan.
 
 Generated bootstrap and learned tag queries quote multi-word tag values for ExHentai search reliability, while keeping the plain tag label visible in the plan.
