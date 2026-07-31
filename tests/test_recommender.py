@@ -340,6 +340,27 @@ class RecommenderTest(unittest.TestCase):
         row = self.conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         self.assertIsNotNone(row["detail_fetched_at"])
 
+    def test_metadata_only_parent_stays_out_of_review_until_normally_fetched(self):
+        child_url = "https://exhentai.org/g/4100/a/"
+        parent_url = "https://exhentai.org/g/4099/b/"
+        store_galleries(self.conn, [Gallery(url=child_url, gid="4100", token="a", title="Child")])
+        store_galleries(
+            self.conn,
+            [Gallery(url=parent_url, gid="4099", token="b", title="Parent metadata")],
+            detail_fetched=True,
+            review_excluded=True,
+        )
+
+        page = recommend_page(self.conn, include_rated=True, exclude_short_repeats=False)
+        self.assertEqual([item["url"] for item in page["items"]], [child_url])
+
+        store_galleries(self.conn, [Gallery(url=parent_url, gid="4099", token="b", title="Parent discovered")])
+
+        row = self.conn.execute("SELECT review_excluded FROM galleries WHERE url = ?", (parent_url,)).fetchone()
+        page = recommend_page(self.conn, include_rated=True, exclude_short_repeats=False)
+        self.assertEqual(row["review_excluded"], 0)
+        self.assertEqual({item["url"] for item in page["items"]}, {child_url, parent_url})
+
     def test_store_galleries_detail_fetch_preserves_existing_last_seen(self):
         gallery_url = "https://exhentai.org/g/4a/d/"
         store_galleries(

@@ -105,6 +105,7 @@ PARENT_UPDATE_RETRY_BACKOFF_SECONDS = 1.0
 FETCH_CURSOR_SOURCES = frozenset({"recent", "bootstrap", "learned"})
 FETCH_CURSOR_ANCHOR_LIMIT = 10
 FETCH_CURSOR_MATCH_COUNT = 3
+PARENT_CHAIN_FETCH_LIMIT = 12
 
 
 class ApiError(Exception):
@@ -1103,8 +1104,10 @@ def reset_parent_update_progress(scope: str, limit: int, filter_text: str | None
             "persisted": 0,
             "updated": 0,
             "parent_updated": 0,
+            "parent_enriched": 0,
             "title_jpn_updated": 0,
             "errors": [],
+            "parent_errors": [],
             "logs": [],
         }
     )
@@ -1282,10 +1285,12 @@ def fetch_and_store(
     fetched = 0
     stored = 0
     enriched = 0
+    parent_enriched = 0
     model_retrained = False
     selected_for_detail = []
     selected_urls: set[str] = set()
     errors: list[str] = []
+    parent_errors: list[str] = []
     cursor_incomplete_queries: list[str] = []
     update_fetch_progress(
         "fetch started",
@@ -1478,6 +1483,18 @@ def fetch_and_store(
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
+                try:
+                    parent_enriched += fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
+                except Exception as exc:
+                    parent_errors.append(f"parent chain {detailed.parent_url or detailed.url}: {exc}")
+                    update_fetch_progress(
+                        "parent chain fetch failed",
+                        stage="enriching_details",
+                        current_gallery_url=gallery.url,
+                        current_parent_url=detailed.parent_url or "",
+                        error=str(exc),
+                        parent_errors=list(parent_errors),
+                    )
                 update_fetch_progress(
                     "detail fetch finished",
                     stage="enriching_details",
@@ -1486,6 +1503,7 @@ def fetch_and_store(
                     detail_done=detail_index,
                     current_gallery_url=gallery.url,
                     enriched=enriched,
+                    parent_enriched=parent_enriched,
                     sample_count=len(samples),
                 )
             except Exception as exc:
@@ -1534,8 +1552,10 @@ def fetch_and_store(
             fetched=fetched,
             stored=stored,
             enriched=enriched,
+            parent_enriched=parent_enriched,
             model_retrained=model_retrained,
             errors=list(errors),
+            parent_errors=list(parent_errors),
             cursor_incomplete_queries=list(cursor_incomplete_queries),
         )
         return {
@@ -1545,8 +1565,10 @@ def fetch_and_store(
             "fetched": fetched,
             "stored": stored,
             "enriched": enriched,
+            "parent_enriched": parent_enriched,
             "model_retrained": model_retrained,
             "errors": errors,
+            "parent_errors": parent_errors,
             "cursor_incomplete_queries": cursor_incomplete_queries,
             "last_fetch": last_fetch,
             **page,
@@ -1583,8 +1605,10 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
     requested_limit = detail_limit if limit is None else bounded_int(limit, default=detail_limit, lower=0, upper=50)
     run_id: int | None = None
     enriched = 0
+    parent_enriched = 0
     model_retrained = False
     errors: list[str] = []
+    parent_errors: list[str] = []
     update_fetch_progress(
         "enrichment started",
         running=True,
@@ -1639,6 +1663,18 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
+                try:
+                    parent_enriched += fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
+                except Exception as exc:
+                    parent_errors.append(f"parent chain {detailed.parent_url or detailed.url}: {exc}")
+                    update_fetch_progress(
+                        "parent chain fetch failed",
+                        stage="enriching_details",
+                        current_gallery_url=gallery.url,
+                        current_parent_url=detailed.parent_url or "",
+                        error=str(exc),
+                        parent_errors=list(parent_errors),
+                    )
                 update_fetch_progress(
                     "detail fetch finished",
                     stage="enriching_details",
@@ -1647,6 +1683,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                     detail_done=detail_index,
                     current_gallery_url=gallery.url,
                     enriched=enriched,
+                    parent_enriched=parent_enriched,
                     sample_count=len(samples),
                 )
             except Exception as exc:
@@ -1689,15 +1726,19 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             stage="finished",
             status=status,
             enriched=enriched,
+            parent_enriched=parent_enriched,
             model_retrained=model_retrained,
             errors=list(errors),
+            parent_errors=list(parent_errors),
         )
         return {
             "ok": not errors,
             "status": status,
             "enriched": enriched,
+            "parent_enriched": parent_enriched,
             "model_retrained": model_retrained,
             "errors": errors,
+            "parent_errors": parent_errors,
             "last_fetch": last_fetch,
             **page,
         }
@@ -1900,6 +1941,7 @@ def backfill_parent_metadata(
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
     errors: list[str] = []
+    parent_errors: list[str] = []
     try:
         reset_parent_update_progress(scope, limit, filter_text)
         update_parent_progress(
@@ -2056,6 +2098,7 @@ def backfill_parent_metadata(
         updated = 0
         parent_updated = 0
         title_jpn_updated = 0
+        parent_enriched = 0
         update_parent_progress("database update started", stage="persisting", persisted=0)
         with db.connect() as conn:
             for persisted, gallery in enumerate(galleries, start=1):
@@ -2074,6 +2117,28 @@ def backfill_parent_metadata(
                     current_gallery_url=gallery.url,
                     current_gallery_title=gallery.title,
                 )
+        update_parent_progress(
+            "parent chain fetch started",
+            stage="parent_chain",
+            parent_chain_total=len(galleries),
+            parent_chain_done=0,
+        )
+        for parent_index, gallery in enumerate(galleries, start=1):
+            try:
+                parent_enriched += fetch_parent_chain_metadata(cookie, gallery, proxy_url=proxy_url)
+            except Exception as exc:
+                parent_errors.append(f"parent chain {gallery.parent_url or gallery.url}: {exc}")
+            update_parent_progress(
+                "parent chain checked",
+                stage="parent_chain",
+                parent_chain_total=len(galleries),
+                parent_chain_done=parent_index,
+                parent_enriched=parent_enriched,
+                current_gallery_url=gallery.url,
+                current_parent_url=gallery.parent_url or "",
+                parent_errors=list(parent_errors),
+            )
+        with db.connect() as conn:
             page = reaction_history_payload(conn, limit=40, filter_text=filter_text)
         update_parent_progress(
             "parent update finished" if not errors else "parent update finished with errors",
@@ -2087,8 +2152,10 @@ def backfill_parent_metadata(
             persisted=len(galleries),
             updated=updated,
             parent_updated=parent_updated,
+            parent_enriched=parent_enriched,
             title_jpn_updated=title_jpn_updated,
             errors=list(errors),
+            parent_errors=list(parent_errors),
         )
         return {
             "ok": not errors,
@@ -2096,8 +2163,10 @@ def backfill_parent_metadata(
             "detail_checked": detail_checked,
             "updated": updated,
             "parent_updated": parent_updated,
+            "parent_enriched": parent_enriched,
             "title_jpn_updated": title_jpn_updated,
             "errors": errors,
+            "parent_errors": parent_errors,
             **page,
         }
     except Exception as exc:
@@ -2131,6 +2200,47 @@ def ensure_api_cover(cookie: str, base: Gallery, detailed: Gallery, proxy_url: s
         enrich_covers_via_api(cookie, [detailed], proxy_url=proxy_url)
     except Exception:
         pass
+
+
+def fetch_parent_chain_metadata(
+    cookie: str,
+    gallery: Gallery,
+    proxy_url: str = "",
+    limit: int = PARENT_CHAIN_FETCH_LIMIT,
+) -> int:
+    """Fetch missing ancestors as metadata-only rows excluded from Review."""
+    current_url = normalize_gallery_url(gallery.parent_url)
+    gallery_url = normalize_gallery_url(gallery.url)
+    seen = {gallery_url} if gallery_url else set()
+    fetched = 0
+
+    for _ in range(max(0, min(PARENT_CHAIN_FETCH_LIMIT, int(limit)))):
+        if not current_url or current_url in seen:
+            break
+        seen.add(current_url)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM galleries WHERE url = ?", (current_url,)).fetchone()
+
+        if row and row["detail_fetched_at"]:
+            current_url = normalize_gallery_url(row["parent_url"])
+            continue
+
+        base = gallery_from_item(db.row_to_dict(row)) if row else Gallery(url=current_url, title="Parent gallery")
+        detailed = gallery_refresh_fetch_with_retries(
+            "parent detail fetch",
+            current_url,
+            lambda base=base: fetch_gallery_detail(cookie, base, delay=0, proxy_url=proxy_url),
+        )
+        if normalize_gallery_url(detailed.url) != current_url:
+            raise RuntimeError(f"Parent detail fetch returned an unexpected gallery: {detailed.url}")
+        ensure_api_cover(cookie, base, detailed, proxy_url=proxy_url)
+        with db.connect() as conn:
+            store_galleries(conn, [detailed], detail_fetched=True, review_excluded=True)
+            persist_gallery_metadata(conn, detailed)
+        fetched += 1
+        current_url = normalize_gallery_url(detailed.parent_url)
+
+    return fetched
 
 
 def refresh_thumbnails(
@@ -2281,7 +2391,18 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         store_galleries(conn, [detailed], detail_fetched=True)
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
         retrain_model(conn)
-    return {"status": "success", "gallery_url": gallery_url}
+    parent_error = None
+    try:
+        parent_enriched = fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
+    except Exception as exc:
+        parent_enriched = 0
+        parent_error = str(exc)
+    return {
+        "status": "success",
+        "gallery_url": gallery_url,
+        "parent_enriched": parent_enriched,
+        "parent_error": parent_error,
+    }
 
 
 def feedback_enrichment_plan(signal: float, payload: dict[str, Any]) -> dict:
@@ -2970,6 +3091,19 @@ def refresh_gallery_metadata(gallery_url: str) -> dict:
     with db.connect() as conn:
         store_galleries(conn, [detailed], detail_fetched=True)
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
+    parent_errors: list[str] = []
+    try:
+        parent_enriched = fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
+    except Exception as exc:
+        parent_enriched = 0
+        parent_errors.append(f"{detailed.parent_url or detailed.url}: {exc}")
+        gallery_refresh_log(
+            "parent chain fetch failed",
+            gallery_url=detailed.url,
+            parent_url=detailed.parent_url or "",
+            error=str(exc),
+        )
+    with db.connect() as conn:
         row = conn.execute("SELECT * FROM galleries WHERE url = ?", (detailed.url,)).fetchone()
         item = gallery_db_row_payload(conn, row) if row else None
     return {
@@ -2979,6 +3113,8 @@ def refresh_gallery_metadata(gallery_url: str) -> dict:
         "page_count": detailed.page_count,
         "sample_count": len(samples),
         "cached_samples": cached,
+        "parent_enriched": parent_enriched,
+        "parent_errors": parent_errors,
         "item": item,
     }
 
