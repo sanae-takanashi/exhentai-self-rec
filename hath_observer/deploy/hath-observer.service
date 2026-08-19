@@ -1,0 +1,22 @@
+[Unit]
+Description=H@H observer for exhentai-self-rec
+Wants=network-online.target
+After=network-online.target hath.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/hath-observer
+EnvironmentFile=/etc/hath-observer.env
+ExecStart=/usr/bin/python3 -m hath_observer
+Restart=always
+RestartSec=5
+StateDirectory=hath-observer
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/hath /srv/hath-observer
+ReadWritePaths=/var/lib/hath-observer
+
+[Install]
+WantedBy=multi-user.target

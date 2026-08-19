@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -11,6 +12,17 @@ from dataclasses import asdict
 
 from .exhentai import Gallery
 from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
+from .personalized import (
+    hath_download_signal_weight,
+    model_public_status,
+    load_personalized_model,
+    normalize_reason_code,
+    normalize_surface,
+    positive_query_tags,
+    score_personalized_galleries,
+    train_personalized_model,
+)
+from .classification import continuing_classifier_decisions, public_classifier_status, train_continuing_classifier
 
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
@@ -65,10 +77,25 @@ BOOTSTRAP_NAMESPACES = {
 }
 MODEL_MODE_HYBRID = "hybrid"
 MODEL_MODE_VISUAL = "visual"
-MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL}
+MODEL_MODE_LEGACY = "legacy"
+MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL, MODEL_MODE_LEGACY}
 SHORT_REPEAT_PAGE_LIMIT = 10
 RELATED_FEEDBACK_REFERENCE_LIMIT = 5
 SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist"}
+CONTINUING_SOURCE_RE = re.compile(
+    r"(?:^|[\[\(【「『\s])(?:pixiv|fanbox|patreon|fantia|twitter|x\.com)(?:[\]\)】」』\s]|$)",
+    re.I,
+)
+CONTINUING_EXPLICIT_RE = re.compile(
+    r"\b(?:archive|collection|imageset|image\s*set|ongoing|monthly\s+(?:pack|set|archive|collection))\b",
+    re.I,
+)
+CONTINUING_STANDALONE_RE = re.compile(r"\bongoing\b", re.I)
+CONTINUING_DATE_RANGE_RE = re.compile(
+    r"(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?\s*(?:~|～|—|-|to)\s*(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?",
+    re.I,
+)
+CONTINUING_TRAILING_DATE_RE = re.compile(r"\s+(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?\s*$")
 SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]\)】」』]\s*)+)")
 SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
 TITLE_ARTIST_ID_RE = re.compile(r"^\s*(?P<name>.+?)\s*[\(（](?P<artist_id>\d{4,})[\)）]\s*$")
@@ -137,6 +164,13 @@ def get_bootstrap_tags(conn: sqlite3.Connection) -> list[dict]:
 def learned_query_tags(conn: sqlite3.Connection, limit: int = 6) -> list[str]:
     if limit <= 0:
         return []
+    personalized = load_personalized_model(conn)
+    model_tags = positive_query_tags(personalized, limit=limit)
+    if model_tags:
+        negative_bootstrap = {
+            row["tag"] for row in conn.execute("SELECT tag FROM bootstrap_tags WHERE weight < 0")
+        }
+        return [tag for tag in model_tags if tag not in negative_bootstrap][:limit]
     rows = conn.execute(
         """
         SELECT SUBSTR(feature, 5) AS tag
@@ -292,6 +326,45 @@ def store_visual_embedding(
     )
 
 
+def store_visual_image_embeddings(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    images: list[dict],
+    version: str = VISUAL_EMBEDDING_VERSION,
+) -> int:
+    exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+    if not exists:
+        raise ValueError("Gallery not found")
+    normalized_images = []
+    for index, image in enumerate(images[:12]):
+        if not isinstance(image, dict):
+            continue
+        image_url = str(image.get("image_url") or "").strip() or None
+        image_key = str(image.get("image_key") or "").strip()
+        if not image_key:
+            identity = image_url or f"image:{index}"
+            image_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        normalized_images.append((image_key[:120], image_url, normalize_visual_embedding(image.get("embedding"))))
+    if not normalized_images:
+        return 0
+    conn.execute(
+        "DELETE FROM gallery_visual_images WHERE gallery_url = ? AND embedding_version = ?",
+        (gallery_url, version),
+    )
+    conn.executemany(
+        """
+        INSERT INTO gallery_visual_images(
+            gallery_url, image_key, image_url, embedding_json, embedding_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        [
+            (gallery_url, image_key, image_url, json.dumps(embedding, ensure_ascii=True), version)
+            for image_key, image_url, embedding in normalized_images
+        ],
+    )
+    return len(normalized_images)
+
+
 def normalize_visual_embedding(embedding: list[object]) -> list[float]:
     if not isinstance(embedding, list):
         raise ValueError("embedding must be a list")
@@ -383,6 +456,8 @@ def record_feedback(
     vote: float | None = None,
     note: str | None = None,
     score: int | None = None,
+    reason_code: str | None = None,
+    surface: str | None = None,
 ) -> None:
     previous = conn.execute(
         """
@@ -397,8 +472,8 @@ def record_feedback(
     previous_signal = float(previous["vote"] or 0) if previous else 0.0
     signal = feedback_signal(vote=vote, score=score)
     conn.execute(
-        "INSERT INTO feedback(gallery_url, vote, score, note) VALUES (?, ?, ?, ?)",
-        (gallery_url, signal, score, note),
+        "INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface) VALUES (?, ?, ?, ?, ?, ?)",
+        (gallery_url, signal, score, note, normalize_reason_code(reason_code), normalize_surface(surface)),
     )
     if signal != 0 or previous_signal != 0:
         retrain_model(conn)
@@ -463,10 +538,46 @@ def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     so both survive untouched.
     """
     removed: dict[str, int] = {}
-    for table in ("gallery_marks", "feedback", "feature_weights", "fetch_runs", "fetch_query_state", "galleries"):
+    for table in (
+        "hath_events", "hath_downloads", "hath_clients",
+        "gallery_visual_images", "recommendation_impressions", "model_training_runs", "gallery_classification_overrides",
+        "gallery_marks", "feedback", "feature_weights", "fetch_runs", "fetch_query_state", "galleries",
+    ):
         cursor = conn.execute(f"DELETE FROM {table}")
         removed[table] = cursor.rowcount
     return removed
+
+
+def set_classification_override(conn: sqlite3.Connection, gallery_url: str, classification: str) -> str:
+    gallery_url = normalize_gallery_url(gallery_url)
+    if not gallery_url:
+        raise ValueError("valid gallery_url is required")
+    classification = str(classification or "").strip().lower()
+    if classification == "auto":
+        conn.execute("DELETE FROM gallery_classification_overrides WHERE gallery_url = ?", (gallery_url,))
+        train_continuing_classifier(conn)
+        return "auto"
+    if classification not in {"review", "updates"}:
+        raise ValueError("classification must be review, updates, or auto")
+    conn.execute(
+        """
+        INSERT INTO gallery_classification_overrides(gallery_url, classification, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(gallery_url) DO UPDATE SET
+            classification = excluded.classification,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (gallery_url, classification),
+    )
+    train_continuing_classifier(conn)
+    return classification
+
+
+def classification_overrides(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        normalize_gallery_url(row["gallery_url"]): str(row["classification"])
+        for row in conn.execute("SELECT gallery_url, classification FROM gallery_classification_overrides")
+    }
 
 
 def feedback_history(conn: sqlite3.Connection, gallery_url: str, limit: int = 25) -> list[dict]:
@@ -475,7 +586,7 @@ def feedback_history(conn: sqlite3.Connection, gallery_url: str, limit: int = 25
         dict(row)
         for row in conn.execute(
             """
-            SELECT id, gallery_url, vote, score, note, created_at
+            SELECT id, gallery_url, vote, score, note, reason_code, surface, created_at
             FROM feedback
             WHERE gallery_url = ?
             ORDER BY id DESC
@@ -491,7 +602,7 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
         dict(row)
         for row in conn.execute(
             """
-            SELECT gallery_url, vote, score, note, created_at
+            SELECT gallery_url, vote, score, note, reason_code, surface, created_at
             FROM feedback
             ORDER BY id
             """
@@ -507,9 +618,20 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
             """
         )
     ]
+    classification_rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT gallery_url, classification, updated_at
+            FROM gallery_classification_overrides
+            ORDER BY updated_at, gallery_url
+            """
+        )
+    ]
     feedback_urls = [row["gallery_url"] for row in feedback_rows]
     marked_urls = [row["gallery_url"] for row in mark_rows]
-    gallery_urls = sorted(set([*feedback_urls, *marked_urls]))
+    classified_urls = [row["gallery_url"] for row in classification_rows]
+    gallery_urls = sorted(set([*feedback_urls, *marked_urls, *classified_urls]))
     galleries = []
     if gallery_urls:
         placeholders = ",".join("?" for _ in gallery_urls)
@@ -527,22 +649,24 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
             )
         ]
     return {
-        "schema": "exh-rec-preferences-v1",
+        "schema": "exh-rec-preferences-v2",
         "exported_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "bootstrap_tags": get_bootstrap_tags(conn),
         "galleries": galleries,
         "feedback": feedback_rows,
         "gallery_marks": mark_rows,
+        "classification_overrides": classification_rows,
     }
 
 
 def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = False) -> dict:
-    if payload.get("schema") != "exh-rec-preferences-v1":
+    if payload.get("schema") not in {"exh-rec-preferences-v1", "exh-rec-preferences-v2"}:
         raise ValueError("Unsupported preference export schema")
     if replace:
         conn.execute("DELETE FROM feedback")
         conn.execute("DELETE FROM gallery_marks")
         conn.execute("DELETE FROM bootstrap_tags")
+        conn.execute("DELETE FROM gallery_classification_overrides")
 
     galleries = import_rows(payload, "galleries")
     imported_galleries = 0
@@ -637,14 +761,16 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             continue
         conn.execute(
             """
-            INSERT INTO feedback(gallery_url, vote, score, note, created_at)
-            VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
             """,
             (
                 gallery_url,
                 vote,
                 score,
                 item.get("note"),
+                normalize_reason_code(item.get("reason_code")),
+                normalize_surface(item.get("surface")),
                 item.get("created_at"),
             ),
         )
@@ -681,12 +807,37 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         )
         imported_marks += 1
 
+    imported_classifications = 0
+    for item in import_rows(payload, "classification_overrides"):
+        gallery_url = str(item.get("gallery_url") or "").strip()
+        if not gallery_url:
+            continue
+        exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        if not exists:
+            continue
+        classification = str(item.get("classification") or "").strip().lower()
+        if classification not in {"review", "updates"}:
+            continue
+        conn.execute(
+            """
+            INSERT INTO gallery_classification_overrides(gallery_url, classification, updated_at)
+            VALUES (?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            ON CONFLICT(gallery_url) DO UPDATE SET
+                classification = excluded.classification,
+                updated_at = excluded.updated_at
+            """,
+            (gallery_url, classification, item.get("updated_at")),
+        )
+        imported_classifications += 1
+
     retrain_model(conn)
+    train_continuing_classifier(conn)
     return {
         "bootstrap_tags": imported_tags,
         "galleries": imported_galleries,
         "feedback": imported_feedback,
         "gallery_marks": imported_marks,
+        "classification_overrides": imported_classifications,
     }
 
 
@@ -793,6 +944,25 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
         apply_feedback_features(conn, gallery, signal, score=5 if signal > 0 else 1, tag_strengths=tag_strengths)
+    download_signal = hath_download_signal_weight(conn)
+    if download_signal > 0:
+        download_rows = conn.execute(
+            """
+            SELECT g.*
+            FROM hath_downloads d
+            JOIN galleries g ON g.url = d.gallery_url
+            WHERE d.status = 'completed'
+              AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.gallery_url = d.gallery_url)
+              AND NOT EXISTS (SELECT 1 FROM gallery_marks m WHERE m.gallery_url = d.gallery_url)
+            GROUP BY d.gallery_url
+            """
+        ).fetchall()
+        for row in download_rows:
+            gallery = dict(row)
+            gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+            gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
+            apply_feedback_features(conn, gallery, download_signal, tag_strengths=tag_strengths)
+    train_personalized_model(conn)
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
@@ -841,6 +1011,29 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
                 "signal": gallery_mark_signal(str(row["mark_kind"] or "")),
             }
         )
+    download_signal = hath_download_signal_weight(conn)
+    if download_signal > 0:
+        download_rows = conn.execute(
+            """
+            SELECT g.url, g.visual_embedding_json, g.visual_embedding_version
+            FROM hath_downloads d
+            JOIN galleries g ON g.url = d.gallery_url
+            WHERE d.status = 'completed'
+              AND g.visual_embedding_json IS NOT NULL AND g.visual_embedding_json != ''
+              AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.gallery_url = d.gallery_url)
+              AND NOT EXISTS (SELECT 1 FROM gallery_marks m WHERE m.gallery_url = d.gallery_url)
+            GROUP BY d.gallery_url
+            """
+        ).fetchall()
+        for row in download_rows:
+            rows.append(
+                {
+                    "url": row["url"],
+                    "visual_embedding_json": row["visual_embedding_json"],
+                    "visual_embedding_version": row["visual_embedding_version"],
+                    "signal": download_signal,
+                }
+            )
     version = active_visual_version(rows)
     if not version:
         return None
@@ -1069,6 +1262,7 @@ def recommend_page(
     require_bootstrap_match: bool = False,
     posted_after: str | None = None,
     exclude_short_repeats: bool = True,
+    continuing_updates: dict[str, dict] | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -1090,11 +1284,15 @@ def recommend_page(
     short_repeat_reference_index = (
         related_feedback_reference_index(conn) if exclude_short_repeats and not include_rated else {}
     )
-    unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL" if not include_rated else ""
+    if continuing_updates is None:
+        continuing_updates = continuing_update_series_index(conn) if exclude_short_repeats and not include_rated else {}
+    overrides = classification_overrides(conn) if exclude_short_repeats and not include_rated else {}
+    unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL AND hd.gallery_url IS NULL" if not include_rated else ""
     rows = conn.execute(
         f"""
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
-               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at,
+               hd.gallery_url AS downloaded_gallery_url
         FROM galleries g
         LEFT JOIN (
             SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote, feedback.score AS user_score
@@ -1106,6 +1304,12 @@ def recommend_page(
             ) latest ON latest.gallery_url = feedback.gallery_url AND latest.latest_id = feedback.id
         ) f ON f.gallery_url = g.url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        LEFT JOIN (
+            SELECT gallery_url
+            FROM hath_downloads
+            WHERE status = 'completed' AND gallery_url IS NOT NULL
+            GROUP BY gallery_url
+        ) hd ON hd.gallery_url = g.url
         WHERE g.review_excluded = 0
         {unrated_where}
         ORDER BY g.last_seen_at DESC
@@ -1115,6 +1319,9 @@ def recommend_page(
     ).fetchall()
 
     scored = []
+    personalized_inputs: list[dict] = []
+    classifier_inputs = [gallery_item_from_row(row) for row in rows]
+    classifier_decisions, classifier_status = continuing_classifier_decisions(conn, classifier_inputs)
     for idx, row in enumerate(rows):
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
@@ -1129,12 +1336,28 @@ def recommend_page(
                 continue
         else:
             score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
+        personalized_gallery = dict(gallery) if model_mode == MODEL_MODE_HYBRID else None
         gallery.pop("visual_embedding", None)
         gallery["user_vote"] = round(float(gallery.get("user_vote", 0) or 0), 3)
         gallery["user_mark_kind"] = gallery.get("user_mark_kind")
         gallery["marked"] = gallery["user_mark_kind"] in MARK_KINDS
         gallery["rated"] = gallery.get("feedback_id") is not None or gallery["marked"]
-        if exclude_short_repeats and not include_rated and is_short_repeat_gallery(gallery, short_repeat_reference_index):
+        continuing = continuing_updates.get(gallery.get("url"))
+        manual_classification = overrides.get(normalize_gallery_url(gallery.get("url")))
+        gallery["classification_override"] = manual_classification
+        learned_classification = classifier_decisions.get(gallery.get("url")) if not manual_classification else None
+        gallery["classification_prediction"] = learned_classification
+        if manual_classification == "updates" or (
+            learned_classification and learned_classification.get("classification") == "updates"
+        ):
+            continue
+        if exclude_short_repeats and not include_rated and continuing and manual_classification != "review":
+            if continuing["reviewed"] or gallery.get("url") != continuing["latest_url"]:
+                continue
+        if (
+            exclude_short_repeats and not include_rated and manual_classification != "review"
+            and is_short_repeat_gallery(gallery, short_repeat_reference_index)
+        ):
             continue
         if gallery["rated"] and not include_rated:
             continue
@@ -1170,9 +1393,32 @@ def recommend_page(
                     reasons.append(freshness_reason)
         gallery["score"] = round(score, 3)
         gallery["reasons"] = reasons[:5]
+        if personalized_gallery is not None:
+            personalized_inputs.append(personalized_gallery)
         scored.append(gallery)
 
-    scored.sort(key=lambda item: item["score"], reverse=True)
+    personalized_status: dict = {"ready": False, "status": "not-requested"}
+    if model_mode == MODEL_MODE_HYBRID and personalized_inputs:
+        predictions, artifact = score_personalized_galleries(conn, personalized_inputs)
+        personalized_status = model_public_status(artifact)
+        if artifact.get("ready") and artifact.get("accepted") and len(predictions) == len(scored):
+            for gallery, prediction in zip(scored, predictions):
+                probability = apply_bootstrap_probability_prior(
+                    float(prediction["like_probability"]), gallery, bootstrap
+                )
+                prediction["like_probability"] = round(probability, 6)
+                prediction["rank_score"] = round(probability, 6)
+                gallery.update(prediction)
+                gallery["score"] = gallery["rank_score"]
+                gallery["reasons"] = personalized_reasons(gallery, prediction, bootstrap)
+        else:
+            for gallery in scored:
+                gallery.update(legacy_prediction_fields(gallery, personalized_status))
+    elif model_mode != MODEL_MODE_VISUAL:
+        for gallery in scored:
+            gallery.update(legacy_prediction_fields(gallery, personalized_status))
+
+    scored.sort(key=lambda item: item.get("rank_score", item["score"]), reverse=True)
     scored = diversify_ranked_galleries(scored)
     if bootstrap_explore_count and not include_rated and scored:
         scored = mix_bootstrap_exploration(
@@ -1196,9 +1442,180 @@ def recommend_page(
         "require_bootstrap_match": bool(require_bootstrap_match),
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
+        "personalized_model": personalized_status,
+        "continuing_classifier": classifier_status,
         "exclude_short_repeats": bool(exclude_short_repeats),
         "short_repeat_page_limit": SHORT_REPEAT_PAGE_LIMIT,
     }
+
+
+def apply_bootstrap_probability_prior(probability: float, gallery: dict, bootstrap: dict[str, float]) -> float:
+    probability = min(1.0 - 1e-6, max(1e-6, probability))
+    searchable = bootstrap_search_text(gallery)
+    exact_values = bootstrap_exact_values(gallery)
+    matched = [weight for tag, weight in bootstrap.items() if bootstrap_matches(tag, searchable, exact_values)]
+    prior = max(-0.45, min(0.45, sum(matched) * 0.08))
+    logit = math.log(probability / (1.0 - probability)) + prior
+    return 1.0 / (1.0 + math.exp(-logit))
+
+
+def legacy_prediction_fields(gallery: dict, model_status: dict | None = None) -> dict:
+    raw_score = float(gallery.get("score") or 0.0)
+    probability = 1.0 / (1.0 + math.exp(-max(-12.0, min(12.0, raw_score))))
+    return {
+        "like_probability": round(probability, 6),
+        "uncertainty": None,
+        "confidence": None,
+        "rank_score": round(raw_score, 6),
+        "model_version": "legacy-linear-v1",
+        "reason_details": {"positive": [], "negative": []},
+        "model_fallback": (model_status or {}).get("status"),
+        "text_visual_disagreement": 0.0,
+    }
+
+
+def discovery_page(
+    conn: sqlite3.Connection,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+    candidate_limit: int = 2000,
+    language_filter: list[str] | str | None = None,
+    seed: str | None = None,
+) -> dict:
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    pool_limit = min(10000, max(candidate_limit, limit + offset, 100))
+    page = recommend_page(
+        conn,
+        limit=pool_limit,
+        offset=0,
+        include_rated=False,
+        filter_text=filter_text,
+        candidate_limit=pool_limit,
+        freshness_weight=0.0,
+        language_filter=language_filter,
+        model_mode=MODEL_MODE_HYBRID,
+        require_bootstrap_match=False,
+    )
+    candidates = page["items"]
+    if not (
+        (page.get("personalized_model") or {}).get("ready")
+        and (page.get("personalized_model") or {}).get("accepted")
+    ):
+        items = candidates[offset : offset + limit]
+        for item in items:
+            item["discovery_reason"] = "legacy fallback"
+        return {**page, "items": items, "offset": offset, "next_offset": offset + len(items)}
+
+    daily_seed = seed or time.strftime("%Y-%m-%d", time.gmtime())
+    rng = random.Random(f"discovery:{daily_seed}")
+    tie_break = {item["url"]: rng.random() for item in candidates}
+    boundary = sorted(
+        candidates,
+        key=lambda item: (
+            -float(item.get("uncertainty") or 0.0),
+            abs(float(item.get("like_probability") or 0.5) - 0.5),
+            tie_break[item["url"]],
+        ),
+    )
+    disagreement = sorted(
+        candidates,
+        key=lambda item: (-float(item.get("text_visual_disagreement") or 0.0), tie_break[item["url"]]),
+    )
+    coverage = sorted(
+        candidates,
+        key=lambda item: (
+            min((seen_interest_count(item, other) for other in candidates if other is not item), default=0),
+            tie_break[item["url"]],
+        ),
+    )
+    total_needed = min(len(candidates), offset + limit)
+    quotas = [math.ceil(total_needed * 0.4), math.ceil(total_needed * 0.3), total_needed]
+    selected: list[dict] = []
+    selected_urls: set[str] = set()
+    for source, target, reason in (
+        (boundary, quotas[0], "uncertain boundary"),
+        (disagreement, quotas[1], "text visual disagreement"),
+        (coverage, quotas[2], "new interest coverage"),
+    ):
+        added = 0
+        for item in source:
+            if item["url"] in selected_urls:
+                continue
+            copy = dict(item)
+            copy["discovery_reason"] = reason
+            copy["reasons"] = [reason, *copy.get("reasons", [])][:5]
+            selected.append(copy)
+            selected_urls.add(item["url"])
+            added += 1
+            if added >= target or len(selected) >= total_needed:
+                break
+    items = selected[offset : offset + limit]
+    next_offset = offset + len(items)
+    return {
+        **page,
+        "items": items,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(candidates),
+        "has_more": next_offset < len(candidates),
+        "surface": "discovery",
+        "seed": daily_seed,
+    }
+
+
+def seen_interest_count(left: dict, right: dict) -> int:
+    return len(set(diversity_keys(left)) & set(diversity_keys(right)))
+
+
+def record_impressions(conn: sqlite3.Connection, request_id: str, surface: str, items: list[dict]) -> int:
+    request_id = str(request_id or "").strip()[:120]
+    if not request_id:
+        raise ValueError("request_id is required")
+    surface = normalize_surface(surface)
+    inserted = 0
+    for item in items[:100]:
+        gallery_url = str(item.get("gallery_url") or item.get("url") or "").strip()
+        position = item.get("position")
+        if not gallery_url or not isinstance(position, int) or position < 0:
+            continue
+        exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
+        if not exists:
+            continue
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO recommendation_impressions(
+                request_id, gallery_url, surface, position, model_version, like_probability
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                gallery_url,
+                surface,
+                position,
+                str(item.get("model_version") or "")[:120] or None,
+                optional_float(item.get("like_probability")),
+            ),
+        )
+        inserted += max(0, cursor.rowcount)
+    return inserted
+
+
+def personalized_reasons(gallery: dict, prediction: dict, bootstrap: dict[str, float]) -> list[str]:
+    probability = float(prediction.get("like_probability") or 0.0)
+    reasons = [f"match {probability * 100:.0f}%"]
+    details = prediction.get("reason_details") or {}
+    for item in (details.get("positive") or [])[:2]:
+        reasons.append(f"for {item.get('feature')} {float(item.get('contribution') or 0):+.2f}")
+    for item in (details.get("negative") or [])[:1]:
+        reasons.append(f"against {item.get('feature')} {float(item.get('contribution') or 0):+.2f}")
+    if any(
+        bootstrap_matches(tag, bootstrap_search_text(gallery), bootstrap_exact_values(gallery))
+        for tag in bootstrap
+    ):
+        reasons.append("bootstrap prior")
+    return reasons[:5]
 
 
 def normalize_posted_after(value: str | None) -> str:
@@ -1359,6 +1776,170 @@ def gallery_title_values(gallery: dict) -> list[str]:
 
 def normalize_repeat_text(value: object) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", str(value or "").lower()).split())
+
+
+def continuing_title_signal(gallery: dict) -> str:
+    """Return a conservative title signal for cumulative source galleries."""
+    titles = gallery_title_values(gallery)
+    for title in titles:
+        if CONTINUING_EXPLICIT_RE.search(title):
+            return "explicit archive/ongoing title"
+        if CONTINUING_DATE_RANGE_RE.search(title) and CONTINUING_SOURCE_RE.search(title):
+            return "source archive date range"
+    return ""
+
+
+def continuing_source_label(gallery: dict) -> str:
+    for title in gallery_title_values(gallery):
+        match = CONTINUING_SOURCE_RE.search(title)
+        if match:
+            return normalize_repeat_text(match.group(0))
+    return ""
+
+
+def continuing_series_title_key(gallery: dict) -> str:
+    """Build a key for source archives whose changing date suffix changes the gid."""
+    source = continuing_source_label(gallery)
+    has_snapshot_date = any(CONTINUING_TRAILING_DATE_RE.search(title) for title in gallery_title_values(gallery))
+    if not source or (not continuing_title_signal(gallery) and not has_snapshot_date):
+        return ""
+    identities = short_repeat_identity_values(gallery)
+    if not identities:
+        identities = sorted(
+            {identity for title in gallery_title_values(gallery) for identity in short_repeat_title_identity_values(title)}
+        )
+    if not identities:
+        return ""
+    for title in gallery_title_values(gallery):
+        without_range = CONTINUING_DATE_RANGE_RE.sub(" ", title)
+        without_date = CONTINUING_TRAILING_DATE_RE.sub("", without_range)
+        normalized = normalize_repeat_text(without_date)
+        if repeat_title_key_usable(normalized):
+            return f"source-series:{source}|{normalized}|{'|'.join(identities)}"
+    return ""
+
+
+def continuing_update_series_index(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Classify cumulative galleries and return series metadata keyed by gallery URL.
+
+    A three-version parent component is strong evidence by itself. Two-version
+    components require a source-platform title, while a lone gallery requires an
+    explicit archive/ongoing or source date-range signal. This keeps ordinary
+    revisions and translated editions out of the update bucket.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT url, gid, title, title_jpn, category, posted_at, page_count,
+               tags_json, parent_url, review_excluded, first_seen_at, last_seen_at
+        FROM galleries
+        """
+    ).fetchall()
+    galleries: dict[str, dict] = {}
+    for row in rows:
+        gallery = dict(row)
+        try:
+            gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        except json.JSONDecodeError:
+            gallery["tags"] = []
+        url = normalize_gallery_url(gallery.get("url"))
+        if url:
+            gallery["url"] = url
+            galleries[url] = gallery
+    if not galleries:
+        return {}
+    reviewed_urls = {
+        normalize_gallery_url(row["gallery_url"])
+        for row in conn.execute("SELECT DISTINCT gallery_url FROM feedback")
+    }
+    reviewed_urls.update(
+        normalize_gallery_url(row["gallery_url"])
+        for row in conn.execute("SELECT gallery_url FROM gallery_marks")
+    )
+
+    parent: dict[str, str] = {url: url for url in galleries}
+
+    def find(url: str) -> str:
+        while parent[url] != url:
+            parent[url] = parent[parent[url]]
+            url = parent[url]
+        return url
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    parent_edges: set[tuple[str, str]] = set()
+    for url, gallery in galleries.items():
+        parent_url = normalize_gallery_url(gallery.get("parent_url"))
+        if parent_url in galleries and parent_url != url:
+            union(url, parent_url)
+            parent_edges.add((url, parent_url))
+
+    title_groups: dict[str, list[str]] = {}
+    title_group_key_by_url: dict[str, str] = {}
+    for url, gallery in galleries.items():
+        key = continuing_series_title_key(gallery)
+        if key:
+            title_groups.setdefault(key, []).append(url)
+            title_group_key_by_url[url] = key
+    for urls in title_groups.values():
+        if len(urls) >= 2:
+            for url in urls[1:]:
+                union(urls[0], url)
+
+    components: dict[str, list[dict]] = {}
+    for url, gallery in galleries.items():
+        components.setdefault(find(url), []).append(gallery)
+
+    result: dict[str, dict] = {}
+    for members in components.values():
+        urls = {member["url"] for member in members}
+        edge_count = sum(1 for child, ancestor in parent_edges if child in urls and ancestor in urls)
+        source_labels = sorted({continuing_source_label(member) for member in members if continuing_source_label(member)})
+        explicit_signal = next((continuing_title_signal(member) for member in members if continuing_title_signal(member)), "")
+        has_translation = any("language:translated" in (member.get("tags") or []) for member in members)
+        repeated_source_key = any(
+            len(title_groups.get(title_group_key_by_url.get(url, ""), [])) >= 2 for url in urls
+        )
+
+        reason = ""
+        if edge_count >= 2 and len(members) >= 3 and (source_labels or not has_translation):
+            reason = f"{len(members)}-version parent update chain"
+        elif edge_count >= 1 and len(members) >= 2 and source_labels:
+            reason = f"{source_labels[0]} parent update chain"
+        elif repeated_source_key:
+            reason = f"repeated {source_labels[0] if source_labels else 'source'} archive"
+        elif len(members) == 1 and explicit_signal and (source_labels or CONTINUING_STANDALONE_RE.search(str(members[0].get("title") or ""))):
+            reason = explicit_signal
+        if not reason:
+            continue
+
+        reviewable = [member for member in members if not int(member.get("review_excluded") or 0)]
+        if not reviewable:
+            continue
+
+        def newest_key(member: dict) -> tuple:
+            gid = str(member.get("gid") or "")
+            numeric_gid = int(gid) if gid.isdigit() else -1
+            return (str(member.get("posted_at") or ""), numeric_gid, str(member.get("last_seen_at") or ""), member["url"])
+
+        latest = max(reviewable, key=newest_key)
+        oldest = min(members, key=newest_key)
+        series_id = normalize_gallery_url(oldest.get("url")) or continuing_series_title_key(oldest) or oldest["url"]
+        metadata = {
+            "series_id": series_id,
+            "version_count": len(members),
+            "latest_url": latest["url"],
+            "latest_title": latest.get("title"),
+            "reason": reason,
+            "source": source_labels[0] if source_labels else "",
+            "reviewed": bool(urls & reviewed_urls),
+        }
+        for member in members:
+            result[member["url"]] = metadata
+    return result
 
 
 def normalize_gallery_url(value: object) -> str:
@@ -1593,6 +2174,7 @@ def short_repeat_page(
     filter_text: str | None = None,
     candidate_limit: int = 2000,
     page_limit: int = SHORT_REPEAT_PAGE_LIMIT,
+    continuing_updates: dict[str, dict] | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -1601,6 +2183,8 @@ def short_repeat_page(
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
     candidate_limit = max(limit + offset, candidate_limit)
     reference_index = related_feedback_reference_index(conn)
+    if continuing_updates is None:
+        continuing_updates = continuing_update_series_index(conn)
     if not reference_index:
         return {
             "items": [],
@@ -1644,6 +2228,8 @@ def short_repeat_page(
     items: list[dict] = []
     for idx, row in enumerate(rows):
         gallery = apply_feedback_state(gallery_item_from_row(row))
+        if gallery.get("url") in continuing_updates:
+            continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
         related = short_repeat_related_references(gallery, reference_index, page_limit=page_limit)
@@ -1674,6 +2260,248 @@ def short_repeat_page(
         "candidate_limit": candidate_limit,
         "short_repeat_page_limit": page_limit,
     }
+
+
+def continuing_update_page(
+    conn: sqlite3.Connection,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+    candidate_limit: int = 2000,
+    continuing_updates: dict[str, dict] | None = None,
+) -> dict:
+    """Return one latest gallery card for every detected cumulative series."""
+    limit = max(1, min(100, int(limit)))
+    offset = max(0, int(offset))
+    filter_text = (filter_text or "").strip().lower()
+    candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
+    candidate_limit = max(limit + offset, candidate_limit)
+    series_index = continuing_updates if continuing_updates is not None else continuing_update_series_index(conn)
+    overrides = classification_overrides(conn)
+    latest = {
+        metadata["latest_url"]: metadata
+        for metadata in series_index.values()
+        if overrides.get(normalize_gallery_url(metadata["latest_url"])) != "review"
+    }
+    manual_update_urls = {url for url, classification in overrides.items() if classification == "updates"}
+    for url in manual_update_urls:
+        if url not in latest:
+            latest[url] = {
+                "series_id": url,
+                "version_count": 1,
+                "latest_url": url,
+                "latest_title": "",
+                "reason": "manual classification",
+                "source": "",
+                "reviewed": False,
+            }
+    classifier_rows = conn.execute(
+        """
+        SELECT * FROM galleries
+        WHERE review_excluded = 0
+        ORDER BY COALESCE(posted_at, last_seen_at) DESC, last_seen_at DESC
+        LIMIT ?
+        """,
+        (candidate_limit,),
+    ).fetchall()
+    classifier_inputs = [gallery_item_from_row(row) for row in classifier_rows]
+    classifier_decisions, classifier_status = continuing_classifier_decisions(conn, classifier_inputs)
+    for gallery in classifier_inputs:
+        url = normalize_gallery_url(gallery.get("url"))
+        decision = classifier_decisions.get(url)
+        if (
+            decision and decision.get("classification") == "updates"
+            and url not in latest and overrides.get(url) != "review"
+        ):
+            latest[url] = {
+                "series_id": url,
+                "version_count": 1,
+                "latest_url": url,
+                "latest_title": gallery.get("title") or "",
+                "reason": "learned classification",
+                "source": "",
+                "reviewed": False,
+            }
+    if not latest:
+        return {
+            "items": [], "limit": limit, "offset": offset, "next_offset": offset,
+            "total": 0, "has_more": False, "candidate_limit": candidate_limit,
+        }
+
+    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(conn)
+    tag_strengths = tag_corpus_strengths(conn)
+    manual_placeholders = ",".join("?" for _ in manual_update_urls) or "''"
+    rows = conn.execute(
+        f"""
+        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+               f.feedback_created_at,
+               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+        FROM galleries g
+        LEFT JOIN (
+            SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote,
+                   feedback.score AS user_score, feedback.created_at AS feedback_created_at
+            FROM feedback
+            JOIN (
+                SELECT gallery_url, MAX(id) AS latest_id FROM feedback GROUP BY gallery_url
+            ) latest_feedback
+              ON latest_feedback.gallery_url = feedback.gallery_url AND latest_feedback.latest_id = feedback.id
+        ) f ON f.gallery_url = g.url
+        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+        WHERE g.review_excluded = 0
+        ORDER BY COALESCE(g.posted_at, g.last_seen_at) DESC, g.last_seen_at DESC
+        LIMIT ?
+        """,
+        (candidate_limit,),
+    ).fetchall()
+    selected_urls = {normalize_gallery_url(row["url"]) for row in rows}
+    missing_manual_urls = manual_update_urls - selected_urls
+    if missing_manual_urls:
+        placeholders = ",".join("?" for _ in missing_manual_urls)
+        rows = [
+            *rows,
+            *conn.execute(
+                f"""
+                SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+                       f.feedback_created_at,
+                       m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
+                FROM galleries g
+                LEFT JOIN (
+                    SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote,
+                           feedback.score AS user_score, feedback.created_at AS feedback_created_at
+                    FROM feedback
+                    JOIN (
+                        SELECT gallery_url, MAX(id) AS latest_id FROM feedback GROUP BY gallery_url
+                    ) latest_feedback
+                      ON latest_feedback.gallery_url = feedback.gallery_url AND latest_feedback.latest_id = feedback.id
+                ) f ON f.gallery_url = g.url
+                LEFT JOIN gallery_marks m ON m.gallery_url = g.url
+                WHERE g.url IN ({placeholders}) AND g.review_excluded = 0
+                """,
+                tuple(missing_manual_urls),
+            ).fetchall(),
+        ]
+
+    items: list[dict] = []
+    for idx, row in enumerate(rows):
+        gallery = apply_feedback_state(gallery_item_from_row(row))
+        metadata = latest.get(gallery.get("url"))
+        if not metadata:
+            continue
+        if gallery["rated"]:
+            continue
+        if filter_text and not gallery_matches_filter(gallery, filter_text):
+            continue
+        score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
+        gallery.pop("visual_embedding", None)
+        freshness = freshness_bonus(idx, candidate_limit)
+        gallery["score"] = round(score + freshness, 3)
+        gallery["reasons"] = ["continuing update", metadata["reason"], *reasons][:5]
+        gallery["continuing_update"] = True
+        gallery["continuing_series"] = metadata
+        gallery["classification_override"] = overrides.get(normalize_gallery_url(gallery["url"]))
+        gallery["classification_prediction"] = classifier_decisions.get(normalize_gallery_url(gallery["url"]))
+        gallery["previous_feedback"] = continuing_previous_feedback(
+            conn, gallery["url"], metadata, series_index
+        )
+        items.append(gallery)
+
+    page_items = items[offset : offset + limit]
+    next_offset = offset + len(page_items)
+    return {
+        "items": page_items,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "total": len(items),
+        "has_more": next_offset < len(items),
+        "candidate_limit": candidate_limit,
+        "continuing_classifier": classifier_status,
+    }
+
+
+def continuing_previous_feedback(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    metadata: dict,
+    series_index: dict[str, dict],
+) -> dict | None:
+    gallery_url = normalize_gallery_url(gallery_url)
+    series_id = metadata.get("series_id")
+    member_urls = {
+        normalize_gallery_url(url)
+        for url, member_metadata in series_index.items()
+        if member_metadata.get("series_id") == series_id
+    }
+    member_urls.discard(gallery_url)
+    if not member_urls:
+        return None
+
+    ancestors: list[str] = []
+    seen = {gallery_url}
+    current = gallery_url
+    while current and len(ancestors) < 12:
+        row = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (current,)).fetchone()
+        parent_url = normalize_gallery_url(row["parent_url"]) if row else ""
+        if not parent_url or parent_url in seen:
+            break
+        seen.add(parent_url)
+        if parent_url in member_urls:
+            ancestors.append(parent_url)
+        current = parent_url
+
+    ordered_urls = [*ancestors, *sorted(member_urls - set(ancestors))]
+    placeholders = ",".join("?" for _ in ordered_urls)
+    rows = conn.execute(
+        f"""
+        SELECT f.id AS feedback_id, f.gallery_url AS url, f.vote AS user_vote,
+               f.score AS user_score, f.reason_code, f.created_at AS feedback_created_at,
+               g.title
+        FROM feedback f
+        JOIN galleries g ON g.url = f.gallery_url
+        JOIN (
+            SELECT gallery_url, MAX(id) AS latest_id
+            FROM feedback
+            GROUP BY gallery_url
+        ) latest ON latest.latest_id = f.id
+        WHERE f.gallery_url IN ({placeholders})
+        """,
+        ordered_urls,
+    ).fetchall()
+    by_url = {normalize_gallery_url(row["url"]): dict(row) for row in rows}
+    source = next((by_url[url] for url in ancestors if url in by_url), None)
+    if source is None and rows:
+        source = dict(max(rows, key=lambda row: int(row["feedback_id"])))
+    if source is None:
+        return None
+    source["user_vote"] = round(float(source.get("user_vote") or 0.0), 3)
+    source["is_parent"] = normalize_gallery_url(source["url"]) in ancestors
+    return source
+
+
+def copy_continuing_feedback(conn: sqlite3.Connection, gallery_url: str) -> dict:
+    gallery_url = normalize_gallery_url(gallery_url)
+    series_index = continuing_update_series_index(conn)
+    metadata = series_index.get(gallery_url)
+    if not metadata or metadata.get("latest_url") != gallery_url:
+        raise ValueError("gallery is not the latest continuing update")
+    source = continuing_previous_feedback(conn, gallery_url, metadata, series_index)
+    if source is None:
+        raise ValueError("no previous feedback is available for this continuing series")
+    score = source.get("user_score")
+    vote = None if score is not None else float(source.get("user_vote") or 0.0)
+    if score is None and vote == 0:
+        raise ValueError("previous feedback has no reusable preference signal")
+    record_feedback(
+        conn,
+        gallery_url,
+        vote=vote,
+        score=score,
+        reason_code=source.get("reason_code"),
+        surface="updates",
+    )
+    return source
 
 
 def reaction_history_page(
@@ -1831,6 +2659,8 @@ def marked_gallery_page(
 def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if len(scored) <= 2:
         return scored
+    if any(item.get("model_version", "").startswith("personalized-content-v1") for item in scored):
+        return diversify_probability_ranked_galleries(scored)
     remaining = list(scored)
     selected: list[dict] = []
     seen: dict[str, int] = {}
@@ -1850,6 +2680,36 @@ def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
             item = dict(item)
             item["score"] = round(float(item["score"]) - best_penalty, 3)
             item["reasons"] = [*item.get("reasons", []), f"diversity -{best_penalty:.2f}"][:5]
+        selected.append(item)
+        for key in diversity_keys(item):
+            seen[key] = seen.get(key, 0) + 1
+    return selected
+
+
+def diversify_probability_ranked_galleries(scored: list[dict], probability_window: float = 0.08) -> list[dict]:
+    remaining = list(scored)
+    selected: list[dict] = []
+    seen: dict[str, int] = {}
+    while remaining:
+        highest = max(float(item.get("like_probability") or 0.0) for item in remaining)
+        eligible = [
+            (index, item)
+            for index, item in enumerate(remaining)
+            if float(item.get("like_probability") or 0.0) >= highest - probability_window
+        ]
+        best_index, best_item = max(
+            eligible,
+            key=lambda pair: (
+                float(pair[1].get("like_probability") or 0.0) - diversity_penalty(pair[1], seen) * 0.03,
+                float(pair[1].get("confidence") or 0.0),
+                -pair[0],
+            ),
+        )
+        item = remaining.pop(best_index)
+        penalty = diversity_penalty(item, seen)
+        if penalty:
+            item = dict(item)
+            item["reasons"] = [*item.get("reasons", []), "near-score diversity"][:5]
         selected.append(item)
         for key in diversity_keys(item):
             seen[key] = seen.get(key, 0) + 1
@@ -2005,6 +2865,8 @@ def bootstrap_search_text(gallery: dict) -> str:
 def model_snapshot(conn: sqlite3.Connection) -> dict:
     visual_model = visual_preference_model(conn)
     visual_counts = visual_version_counts(conn)
+    personalized_model = model_public_status(load_personalized_model(conn))
+    continuing_classifier = public_classifier_status(train_continuing_classifier(conn))
     return {
         "bootstrap_tags": get_bootstrap_tags(conn),
         "learned_queries": learned_query_tags(conn, limit=12),
@@ -2038,6 +2900,8 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "versions": visual_counts,
             "ready": bool(visual_model),
         },
+        "personalized": personalized_model,
+        "continuing_classifier": continuing_classifier,
         "counts": {
             "galleries": conn.execute("SELECT COUNT(*) AS c FROM galleries").fetchone()["c"],
             "feedback_events": conn.execute("SELECT COUNT(*) AS c FROM feedback").fetchone()["c"],
@@ -2045,6 +2909,9 @@ def model_snapshot(conn: sqlite3.Connection) -> dict:
             "marked_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks").fetchone()["c"],
             "favorite_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks WHERE kind = 'favorite'").fetchone()["c"],
             "banned_galleries": conn.execute("SELECT COUNT(*) AS c FROM gallery_marks WHERE kind = 'ban'").fetchone()["c"],
+            "downloaded_galleries": conn.execute(
+                "SELECT COUNT(DISTINCT gallery_url) AS c FROM hath_downloads WHERE status = 'completed' AND gallery_url IS NOT NULL"
+            ).fetchone()["c"],
             "model_features": conn.execute("SELECT COUNT(*) AS c FROM feature_weights").fetchone()["c"],
         },
     }

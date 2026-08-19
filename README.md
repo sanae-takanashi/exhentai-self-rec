@@ -7,6 +7,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 ## Features
 
 - Local web UI for recommendations and voting.
+- Optional standard-library-only H@H observer subproject. It monitors an official downloader's output directory and logs, durably forwards idempotent progress/completion events, exposes client/download status through the local API, and learns from completed downloads without overriding explicit feedback.
 - Cookie-based ExHentai access.
 - Cookie input accepts a normal `Cookie:` header, multiline `name=value` cookie fragments, copied browser cookie-table rows with or without headers, or Netscape/curl cookie file rows.
 - Stored cookies can be cleared from the settings panel without deleting preferences.
@@ -28,6 +29,12 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - A settings "Danger zone" `Reset data` button (with a confirmation prompt) wipes fetched galleries, votes, the learned model, and fetch history while keeping your cookie and bootstrap tags. The same reset is available at `POST /api/reset` and is refused while a fetch or enrichment is running.
 - Paginated recommendation browsing with `Load More` once the local gallery pool grows.
 - Local filtering by stored gallery title, tag, category, or uploader.
+- Continuing-gallery detection separates cumulative Pixiv/Fanbox/Patreon archives and explicit ongoing series from ordinary one-shot galleries. Multi-version parent chains are grouped even when they contain hundreds of pages; two-version chains require a source-platform title, while ordinary single revisions and translated editions stay in Review. Review shows only the latest version once, then keeps later versions in the dedicated Updates view after any version in the series has been rated or skipped.
+- Calibrated single-user content ranking combines sparse metadata, title character n-grams, numeric metadata, and DINOv2 vectors with class-balanced logistic regression. It automatically falls back to the legacy ranker when scikit-learn is unavailable or fewer than 50 positive/negative labels (15 per class) exist.
+- A separate Discovery view samples uncertain boundary items, text/visual disagreements, and less-covered interests without diluting the high-confidence Review queue.
+- Optional negative-feedback reasons include visual style, content, creator, quality, gallery size, and too few relevant images. Matching feature branches activate only after 20 examples; image-ratio feedback remains diagnostic until per-image embeddings are available, and duplicate/update feedback is excluded from preference training.
+- Recommendation impressions are stored locally for diagnostics and are never treated as negative feedback.
+- Review and Updates cards can override a mistaken continuing-gallery classification, with `Use Auto` available to remove the override. Manual labels take effect immediately, survive preference export/import, and train a separate lightweight classifier after at least 20 labels with 5 examples in each class; learned predictions require cross-validated balanced accuracy of 0.65 and 80% per-item confidence.
 - Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
 - Fetch-plan preview showing recent, bootstrap, learned, or manual queries before a refresh.
 - Fetch status history so you can see recent refreshes, queries, counts, and errors.
@@ -41,13 +48,66 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 python3 -m exh_rec.app
 ```
 
-Open <http://127.0.0.1:8787>.
+Open <http://127.0.0.1:18787>.
 
-The server binds to `0.0.0.0` by default, so another device on the same network can open `http://<server-ip>:8787` if your firewall allows the port. To force local-only access, run:
+## H@H observer
+
+The repository includes a deployable sidecar under [`hath_observer`](hath_observer/README.md).
+Set `EXH_REC_HATH_TOKEN` on the recommendation server, then run
+`python -m hath_observer` on the H@H machine with its download directory,
+receiver URL, and the same token. No extra Python packages are required.
+
+The first observer scan establishes a baseline and does not import existing
+downloads. Use `--backfill` explicitly to learn from previously completed H@H
+directories. See the subproject README for Windows examples, event semantics,
+offline retry behavior, and deployment notes.
+
+The repository also includes an optional supervised launcher that starts rec
+and maintains a reverse SSH tunnel to the H@H host. Configure the credential
+file paths and SSH host alias explicitly before starting it:
+
+```powershell
+$env:EXH_REC_HATH_TOKEN_FILE = "C:\path\to\hath-token.secret"
+$env:EXH_REC_HATH_SSH_CONFIG = "C:\path\to\ssh-config"
+$env:EXH_REC_HATH_SSH_HOST = "exh-rec-hath"
+.\scripts\run.ps1 -VenvPath .venv-rocm
+```
+
+It reads the shared bearer token from the configured file, never puts the
+token value on the command line, and restarts the tunnel after a disconnect.
+The remote observer sends to `http://127.0.0.1:18788`; that loopback-only port
+forwards to local rec port `18787`. When both file variables are configured,
+the normal `run.ps1` entry point uses the H@H launcher automatically; pass
+`-NoHath` for an intentional rec-only start.
+
+The same supervised launcher also gives the rec process the existing SSH
+executable, config, and host alias for configurable remote archive jobs. The
+H@H page scans gallery directories and existing ZIP files, shows the active
+MEGA account, and lets you choose sources, archive name, MEGA destination,
+upload behavior, and recoverable cleanup behavior. `Dry Run` validates the
+selection on the remote host and returns the exact action plan without changing
+files. A formal run accepts only the ID of that preview, not paths or commands
+from the browser. Runs are asynchronous and mutually exclusive, with status at
+`GET /api/integrations/hath/pack/status`.
+
+The remote helper is `hath_observer/archive.py`. It creates the complete ZIP
+before uploading or moving sources. Cleanup moves items under
+`/srv/hath/archive/.trash/<job-id>` instead of permanently deleting them. The
+legacy `/srv/hath/download/auto_pack.sh` script is no longer used by the Web UI.
+
+The server binds to `0.0.0.0` by default, so another device on the same network can open `http://<server-ip>:18787` if your firewall allows the port. To force local-only access, run:
 
 ```bash
 EXH_REC_HOST=127.0.0.1 python3 -m exh_rec.app
 ```
+
+Run the read-only rolling temporal evaluation against a database with:
+
+```powershell
+python scripts/evaluate_recommender.py --output data/recommendation-evaluation.json
+```
+
+The evaluator compares legacy and personalized ROC-AUC, PR-AUC, NDCG, precision, Brier score, calibration error, high-confidence false positives, and low-score missed positives without changing the source database.
 
 ## Windows virtualenv
 
@@ -58,7 +118,7 @@ From PowerShell in the repo root:
 .\scripts\run.ps1
 ```
 
-Open <http://127.0.0.1:8787>. The helper creates `.venv`, installs runtime dependencies from `requirements.txt`, and runs `python -m exh_rec.app` from that virtualenv.
+Open <http://127.0.0.1:18787>. The helper creates `.venv`, installs runtime dependencies from `requirements.txt`, and runs `python -m exh_rec.app` from that virtualenv.
 
 For DINOv2 on CPU:
 
@@ -256,7 +316,7 @@ If a DINOv2 download fails because of a network problem, it is reported as the v
 Override the bind address or port with:
 
 ```bash
-EXH_REC_HOST=0.0.0.0 EXH_REC_PORT=8787 python3 -m exh_rec.app
+EXH_REC_HOST=0.0.0.0 EXH_REC_PORT=18787 python3 -m exh_rec.app
 ```
 
 ## Safety notes

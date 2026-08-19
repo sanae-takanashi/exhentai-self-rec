@@ -9,6 +9,9 @@ from exh_rec.recommender import (
     clear_feedback,
     clear_gallery_mark,
     clear_shared_thumbnail_metadata,
+    continuing_update_page,
+    continuing_update_series_index,
+    copy_continuing_feedback,
     bootstrap_search_text,
     export_preferences,
     feedback_history,
@@ -30,9 +33,11 @@ from exh_rec.recommender import (
     record_gallery_mark,
     retrain_model,
     score_gallery,
+    set_classification_override,
     short_repeat_page,
     store_gallery_samples,
     store_visual_embedding,
+    store_visual_image_embeddings,
     store_galleries,
     tag_corpus_strengths,
     upsert_bootstrap_tags,
@@ -486,6 +491,21 @@ class RecommenderTest(unittest.TestCase):
 
         row = self.conn.execute("SELECT samples_json FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         self.assertIn(sample_url, row["samples_json"])
+
+    def test_store_visual_image_embeddings_replaces_same_version_set(self):
+        gallery_url = "https://exhentai.org/g/visual-images/a/"
+        store_galleries(self.conn, [Gallery(url=gallery_url, gid="visual-images", token="a", title="Images")])
+        first = [{"image_url": "https://example.test/1.jpg", "embedding": [1, 0, 0, 0] * 16}]
+        second = [{"image_url": "https://example.test/2.jpg", "embedding": [0, 1, 0, 0] * 16}]
+
+        self.assertEqual(store_visual_image_embeddings(self.conn, gallery_url, first), 1)
+        self.assertEqual(store_visual_image_embeddings(self.conn, gallery_url, second), 1)
+        rows = self.conn.execute(
+            "SELECT image_url FROM gallery_visual_images WHERE gallery_url = ?",
+            (gallery_url,),
+        ).fetchall()
+
+        self.assertEqual([row["image_url"] for row in rows], ["https://example.test/2.jpg"])
 
     def test_store_galleries_list_fetch_updates_existing_last_seen(self):
         gallery_url = "https://exhentai.org/g/4c/d/"
@@ -1122,6 +1142,206 @@ class RecommenderTest(unittest.TestCase):
         self.assertNotIn(repeat_url, review_urls)
         self.assertIn(normal_url, review_urls)
 
+    def test_continuing_update_chain_is_grouped_at_any_page_count(self):
+        urls = [f"https://exhentai.org/g/{8100 + idx}/a/" for idx in range(3)]
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=urls[0], gid="8100", token="a", title="Creator cumulative gallery", page_count=400),
+                Gallery(url=urls[1], gid="8101", token="a", title="Creator cumulative gallery", page_count=430, parent_url=urls[0]),
+                Gallery(url=urls[2], gid="8102", token="a", title="Creator cumulative gallery", page_count=470, parent_url=urls[1]),
+            ],
+        )
+
+        index = continuing_update_series_index(self.conn)
+        updates = continuing_update_page(self.conn, limit=10)
+        review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
+
+        self.assertEqual(index[urls[2]]["version_count"], 3)
+        self.assertEqual([item["url"] for item in updates["items"]], [urls[2]])
+        self.assertEqual(review_urls, [urls[2]])
+
+        record_feedback(self.conn, urls[0], score=3)
+        self.assertNotIn(urls[2], [item["url"] for item in recommend_page(self.conn, limit=10)["items"]])
+
+    def test_two_version_platform_parent_chain_is_continuing(self):
+        old_url = "https://exhentai.org/g/8200/a/"
+        latest_url = "https://exhentai.org/g/8201/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8200", token="a", title="[Fanbox] Source Artist", tags=["artist:source artist"]),
+                Gallery(url=latest_url, gid="8201", token="a", title="[Fanbox] Source Artist", tags=["artist:source artist"], parent_url=old_url),
+            ],
+        )
+
+        page = continuing_update_page(self.conn, limit=10)
+
+        self.assertEqual([item["url"] for item in page["items"]], [latest_url])
+        self.assertIn("fanbox", page["items"][0]["continuing_series"]["reason"])
+
+    def test_continuing_update_can_copy_direct_parent_score(self):
+        old_url = "https://exhentai.org/g/8210/a/"
+        latest_url = "https://exhentai.org/g/8211/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8210", token="a", title="[Fanbox] Copy Parent", tags=["artist:copy"]),
+                Gallery(url=latest_url, gid="8211", token="a", title="[Fanbox] Copy Parent", tags=["artist:copy"], parent_url=old_url),
+            ],
+        )
+        record_feedback(self.conn, old_url, score=5)
+
+        item = continuing_update_page(self.conn, limit=10)["items"][0]
+        source = copy_continuing_feedback(self.conn, latest_url)
+        history = feedback_history(self.conn, latest_url)
+
+        self.assertEqual(item["previous_feedback"]["url"], old_url)
+        self.assertEqual(item["previous_feedback"]["user_score"], 5)
+        self.assertTrue(item["previous_feedback"]["is_parent"])
+        self.assertEqual(source["url"], old_url)
+        self.assertEqual(history[0]["score"], 5)
+        self.assertEqual(history[0]["surface"], "updates")
+
+    def test_continuing_update_copy_preserves_neutral_score(self):
+        old_url = "https://exhentai.org/g/8220/a/"
+        latest_url = "https://exhentai.org/g/8221/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8220", token="a", title="[Pixiv] Neutral Copy", tags=["artist:neutral copy"]),
+                Gallery(url=latest_url, gid="8221", token="a", title="[Pixiv] Neutral Copy", tags=["artist:neutral copy"], parent_url=old_url),
+            ],
+        )
+        record_feedback(self.conn, old_url, score=3)
+
+        copy_continuing_feedback(self.conn, latest_url)
+
+        self.assertEqual(feedback_history(self.conn, latest_url)[0]["score"], 3)
+
+    def test_continuing_feedback_copy_rejects_gallery_without_previous_rating(self):
+        old_url = "https://exhentai.org/g/8230/a/"
+        latest_url = "https://exhentai.org/g/8231/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8230", token="a", title="[Fanbox] No Copy", tags=["artist:no copy"]),
+                Gallery(url=latest_url, gid="8231", token="a", title="[Fanbox] No Copy", tags=["artist:no copy"], parent_url=old_url),
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "no previous feedback"):
+            copy_continuing_feedback(self.conn, latest_url)
+
+    def test_manual_classification_moves_review_gallery_to_updates_and_back(self):
+        url = "https://exhentai.org/g/8240/a/"
+        store_galleries(self.conn, [Gallery(url=url, gid="8240", token="a", title="Ordinary Manual Move")])
+
+        set_classification_override(self.conn, url, "updates")
+        self.assertNotIn(url, [item["url"] for item in recommend_page(self.conn, limit=10)["items"]])
+        update_item = next(item for item in continuing_update_page(self.conn, limit=10)["items"] if item["url"] == url)
+        self.assertEqual(update_item["classification_override"], "updates")
+
+        set_classification_override(self.conn, url, "review")
+        self.assertIn(url, [item["url"] for item in recommend_page(self.conn, limit=10)["items"]])
+        self.assertNotIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+        set_classification_override(self.conn, url, "auto")
+        self.assertIn(url, [item["url"] for item in recommend_page(self.conn, limit=10)["items"]])
+
+    def test_rated_manual_update_leaves_updates_and_returns_after_clear(self):
+        url = "https://exhentai.org/g/8243/a/"
+        store_galleries(self.conn, [Gallery(url=url, gid="8243", token="a", title="Manual Rated Update")])
+        set_classification_override(self.conn, url, "updates")
+        self.assertIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+        record_feedback(self.conn, url, vote=1)
+        self.assertNotIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+        clear_feedback(self.conn, url)
+        self.assertIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+    def test_neutral_score_hides_automatic_update(self):
+        old_url = "https://exhentai.org/g/8244/a/"
+        latest_url = "https://exhentai.org/g/8245/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8244", token="a", title="[Fanbox] Neutral Update", tags=["artist:neutral update"]),
+                Gallery(url=latest_url, gid="8245", token="a", title="[Fanbox] Neutral Update", tags=["artist:neutral update"], parent_url=old_url),
+            ],
+        )
+        self.assertIn(latest_url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+        record_feedback(self.conn, latest_url, score=3)
+
+        self.assertNotIn(latest_url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+    def test_manual_review_override_returns_auto_update_to_review(self):
+        old_url = "https://exhentai.org/g/8241/a/"
+        latest_url = "https://exhentai.org/g/8242/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8241", token="a", title="[Fanbox] Wrong Update", tags=["artist:wrong"]),
+                Gallery(url=latest_url, gid="8242", token="a", title="[Fanbox] Wrong Update", tags=["artist:wrong"], parent_url=old_url),
+            ],
+        )
+
+        set_classification_override(self.conn, latest_url, "review")
+
+        self.assertIn(latest_url, [item["url"] for item in recommend_page(self.conn, limit=10)["items"]])
+        self.assertNotIn(latest_url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+    def test_dated_source_snapshots_group_without_known_parent_rows(self):
+        old_url = "https://exhentai.org/g/8250/a/"
+        latest_url = "https://exhentai.org/g/8251/a/"
+        unrelated_url = "https://exhentai.org/g/8252/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=old_url, gid="8250", token="a", title="[Pixiv] Snapshot Artist (123456) 2026.08.01", tags=["artist:snapshot"]),
+                Gallery(url=latest_url, gid="8251", token="a", title="[Pixiv] Snapshot Artist (123456) 2026.08.11", tags=["artist:snapshot"]),
+                Gallery(url=unrelated_url, gid="8252", token="a", title="[Pixiv] One Off Work", tags=["artist:snapshot"]),
+            ],
+        )
+
+        index = continuing_update_series_index(self.conn)
+
+        self.assertEqual(index[latest_url]["version_count"], 2)
+        self.assertNotIn(unrelated_url, index)
+
+    def test_single_revision_and_translation_chain_stay_out_of_updates(self):
+        revision = [f"https://exhentai.org/g/{8300 + idx}/a/" for idx in range(2)]
+        translation = [f"https://exhentai.org/g/{8400 + idx}/a/" for idx in range(3)]
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=revision[0], gid="8300", token="a", title="One-shot Doujin"),
+                Gallery(url=revision[1], gid="8301", token="a", title="One-shot Doujin revised", parent_url=revision[0]),
+                Gallery(url=translation[0], gid="8400", token="a", title="One-shot Manga", tags=["language:japanese"]),
+                Gallery(url=translation[1], gid="8401", token="a", title="One-shot Manga English", tags=["language:english", "language:translated"], parent_url=translation[0]),
+                Gallery(url=translation[2], gid="8402", token="a", title="One-shot Manga Chinese", tags=["language:chinese", "language:translated"], parent_url=translation[1]),
+            ],
+        )
+
+        index = continuing_update_series_index(self.conn)
+
+        self.assertFalse(set(revision) & set(index))
+        self.assertFalse(set(translation) & set(index))
+
+    def test_standalone_source_archive_is_separated_but_reviewed_once(self):
+        url = "https://exhentai.org/g/8500/a/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=url, gid="8500", token="a", title="[Pixiv] Artist Archive 2025.01.01 - 2026.08.01", tags=["artist:archive artist"])],
+        )
+
+        self.assertEqual([item["url"] for item in continuing_update_page(self.conn)["items"]], [url])
+        self.assertEqual([item["url"] for item in recommend_page(self.conn)["items"]], [url])
+        record_feedback(self.conn, url, score=3)
+        self.assertEqual(recommend_page(self.conn)["items"], [])
+
     def test_short_repeat_page_uses_exact_titles_and_respects_page_limit(self):
         old_url = "https://exhentai.org/g/7exactold/a/"
         short_url = "https://exhentai.org/g/7exactshort/a/"
@@ -1256,11 +1476,12 @@ class RecommenderTest(unittest.TestCase):
         store_gallery_samples(self.conn, child_url, 80, [])
         record_feedback(self.conn, ancestor_url, score=5)
 
-        repeat_page = short_repeat_page(self.conn, limit=10)
-        child_item = next(item for item in repeat_page["items"] if item["url"] == child_url)
+        update_page = continuing_update_page(self.conn, limit=10)
+        child_item = next(item for item in update_page["items"] if item["url"] == child_url)
         review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
 
-        self.assertEqual(child_item["related_feedback"][0]["url"], ancestor_url)
+        self.assertEqual(child_item["continuing_series"]["version_count"], 3)
+        self.assertTrue(child_item["continuing_series"]["reviewed"])
         self.assertNotIn(child_url, review_urls)
 
     def test_short_repeat_page_matches_alternate_title_with_artist_tag(self):

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import mimetypes
 import os
+import queue
 import random
 import threading
 import time
@@ -40,6 +42,8 @@ from .net import (
     proxy_preview,
     temporary_ban_detected,
 )
+from .hath import HathPayloadError, hath_status, ingest_event_batch
+from .hath_pack import HATH_PACK_RUNNER, HathPackConflict, HathPackError
 from .recommender import (
     clear_feedback,
     clear_gallery_mark,
@@ -64,11 +68,18 @@ from .recommender import (
     reset_library,
     retrain_model,
     clear_shared_thumbnail_metadata,
+    continuing_update_page,
+    continuing_update_series_index,
+    copy_continuing_feedback,
+    discovery_page,
+    record_impressions,
     score_gallery,
+    set_classification_override,
     short_repeat_page,
     store_galleries,
     store_gallery_samples,
     store_visual_embedding,
+    store_visual_image_embeddings,
     tag_corpus_strengths,
     upsert_bootstrap_tags,
     visual_preference_model,
@@ -80,8 +91,9 @@ from .visual import (
     DINOV2_VISUAL_VERSION,
     SIMPLE_VISUAL_VERSION,
     VisualEncoderUnavailable,
+    average_embeddings,
     dinov2_dependency_status,
-    dinov2_embedding,
+    dinov2_image_embeddings,
     download_dinov2,
     normalize_dinov2_device,
     normalize_visual_encoder,
@@ -89,13 +101,17 @@ from .visual import (
 
 
 HOST = os.environ.get("EXH_REC_HOST", "0.0.0.0")
-PORT = int(os.environ.get("EXH_REC_PORT", "8787"))
+PORT = int(os.environ.get("EXH_REC_PORT", "18787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
 PARENT_UPDATE_STATE: dict[str, Any] = {"running": False, "logs": []}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
+FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
+FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
+FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
+FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
@@ -150,6 +166,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_settings())
             elif path == "/api/status":
                 self.send_json(get_status())
+            elif path == "/api/integrations/hath/status":
+                with db.connect() as conn:
+                    self.send_json(hath_status(conn))
+            elif path == "/api/integrations/hath/pack/status":
+                self.send_json(HATH_PACK_RUNNER.status())
+            elif path == "/api/integrations/hath/pack/inventory":
+                try:
+                    self.send_json(hath_archive_inventory())
+                except HathPackError as exc:
+                    raise ApiError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
             elif path == "/api/queue-counts":
                 with db.connect() as conn:
                     self.send_json(queue_counts_payload(conn))
@@ -192,6 +218,24 @@ class Handler(BaseHTTPRequestHandler):
                             require_bootstrap_match=require_bootstrap_match,
                         )
                     )
+            elif path == "/api/discovery":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                language_filter = query.get("language_filter", [None])[0]
+                seed = str(query.get("seed", [""])[0])[:80]
+                with db.connect() as conn:
+                    self.send_json(
+                        discovery_payload(
+                            conn,
+                            limit=limit,
+                            offset=offset,
+                            filter_text=filter_text,
+                            language_filter=language_filter,
+                            seed=seed,
+                        )
+                    )
             elif path == "/api/reactions":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
@@ -206,6 +250,13 @@ class Handler(BaseHTTPRequestHandler):
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(short_repeat_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
+            elif path == "/api/continuing-updates":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(continuing_update_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
             elif path == "/api/marks":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
@@ -240,6 +291,40 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json()
                 save_settings(payload)
                 self.send_json(get_settings())
+            elif path == "/api/integrations/hath/events":
+                require_hath_authorization(self.headers.get("Authorization"))
+                payload = self.read_json(max_bytes=1024 * 1024)
+                try:
+                    with db.connect() as conn:
+                        result = ingest_event_batch(conn, payload)
+                        if result["completed_changed"]:
+                            retrain_model(conn)
+                except HathPayloadError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json(result)
+            elif path == "/api/integrations/hath/pack/start":
+                payload = self.read_json()
+                try:
+                    self.send_json(HATH_PACK_RUNNER.start(payload.get("preview_id")), status=HTTPStatus.ACCEPTED)
+                except HathPackConflict as exc:
+                    raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+                except HathPackError as exc:
+                    raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, str(exc)) from exc
+            elif path == "/api/integrations/hath/pack/preview":
+                payload = self.read_json()
+                active = active_hath_archive_names()
+                selected = payload.get("selected")
+                selected_names = {str(name) for name in selected} if isinstance(selected, list) else set()
+                active_selected = sorted(selected_names & active)
+                if active_selected:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        f"Active H@H downloads cannot be archived: {', '.join(active_selected)}",
+                    )
+                try:
+                    self.send_json(HATH_PACK_RUNNER.preview(payload))
+                except HathPackError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
             elif path == "/api/fetch":
                 payload = self.read_json()
                 result = fetch_and_store(
@@ -268,6 +353,29 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json()
                 result = refresh_gallery_metadata_payload(payload)
                 self.send_json(result)
+            elif path == "/api/classification":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "").strip()
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                try:
+                    with db.connect() as conn:
+                        ensure_gallery_exists(conn, gallery_url)
+                        classification = set_classification_override(
+                            conn, gallery_url, str(payload.get("classification") or "")
+                        )
+                        review = recommendation_payload(
+                            conn,
+                            limit=40,
+                            filter_text=payload.get("filter_text"),
+                            require_bootstrap_match=configured_review_require_bootstrap_match(conn),
+                        )
+                        updates = continuing_update_payload(
+                            conn, limit=40, filter_text=payload.get("filter_text")
+                        )
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json({"ok": True, "classification": classification, "review": review, "updates": updates})
             elif path == "/api/feedback":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -282,7 +390,18 @@ class Handler(BaseHTTPRequestHandler):
                     before_signature = model_signature(conn)
                     update_started = time.perf_counter()
                     log_feedback_received("record", gallery_url, vote=vote, score=score)
-                    record_feedback(conn, gallery_url, vote=vote, score=score, note=payload.get("note"))
+                    try:
+                        record_feedback(
+                            conn,
+                            gallery_url,
+                            vote=vote,
+                            score=score,
+                            note=payload.get("note"),
+                            reason_code=payload.get("reason_code"),
+                            surface=payload.get("surface") or payload.get("view"),
+                        )
+                    except ValueError as exc:
+                        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
                     after_model = model_snapshot(conn)
                     after_signature = model_signature(conn)
@@ -304,6 +423,23 @@ class Handler(BaseHTTPRequestHandler):
                 with db.connect() as conn:
                     page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "feedback_update": feedback_update, "feedback_enrichment": feedback_enrichment, **page})
+            elif path == "/api/feedback/copy-continuing":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "").strip()
+                if not gallery_url:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
+                try:
+                    with db.connect() as conn:
+                        ensure_gallery_exists(conn, gallery_url)
+                        source = copy_continuing_feedback(conn, gallery_url)
+                        page = continuing_update_payload(
+                            conn,
+                            limit=40,
+                            filter_text=payload.get("filter_text"),
+                        )
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json({"ok": True, "copied_from": source, **page})
             elif path == "/api/mark":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -333,6 +469,22 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
                 self.send_json({"ok": True, "mark_update": mark_update, **page})
+            elif path == "/api/impressions":
+                payload = self.read_json()
+                items = payload.get("items") or []
+                if not isinstance(items, list):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "items must be a list")
+                try:
+                    with db.connect() as conn:
+                        inserted = record_impressions(
+                            conn,
+                            request_id=payload.get("request_id"),
+                            surface=payload.get("surface") or "review",
+                            items=items,
+                        )
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json({"ok": True, "inserted": inserted})
             elif path == "/api/mark/clear":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -447,8 +599,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.handle_error(exc)
 
-    def read_json(self) -> dict[str, Any]:
+    def read_json(self, max_bytes: int | None = None) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
+        if max_bytes is not None and length > max_bytes:
+            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large")
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         try:
             return json.loads(raw or "{}")
@@ -495,6 +649,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache, must-revalidate")
         self.end_headers()
         if body:
             self.wfile.write(data)
@@ -579,7 +734,42 @@ def get_status() -> dict:
                 "last_access_check": get_access_check(conn),
             },
             "visual": visual_settings(visual_encoder, dinov2_device),
+            "hath": hath_status(conn, recent_limit=8),
         }
+
+
+def require_hath_authorization(value: object) -> None:
+    expected = os.environ.get("EXH_REC_HATH_TOKEN", "").strip()
+    if not expected:
+        raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "H@H event ingestion is not configured")
+    authorization = str(value or "")
+    prefix = "Bearer "
+    provided = authorization[len(prefix) :].strip() if authorization.startswith(prefix) else ""
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise ApiError(HTTPStatus.UNAUTHORIZED, "Invalid H@H observer token")
+
+
+def active_hath_archive_names() -> set[str]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT directory_name
+            FROM hath_downloads
+            WHERE status = 'downloading' AND directory_name IS NOT NULL AND directory_name != ''
+            """
+        ).fetchall()
+    return {str(row["directory_name"]) for row in rows}
+
+
+def hath_archive_inventory() -> dict[str, Any]:
+    inventory = HATH_PACK_RUNNER.inventory()
+    active = active_hath_archive_names()
+    candidates = inventory.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate["active"] = str(candidate.get("name") or "") in active
+    return inventory
 
 
 def save_settings(payload: dict[str, Any]) -> None:
@@ -742,9 +932,22 @@ def save_visual_embedding_payload(payload: dict[str, Any]) -> dict:
     try:
         with db.connect() as conn:
             store_visual_embedding(conn, gallery_url, embedding, version=version)
+            image_count = store_visual_image_embeddings(
+                conn,
+                gallery_url,
+                payload.get("image_embeddings") or [],
+                version=version,
+            )
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-    return {"ok": True, "gallery_url": gallery_url, "encoder": encoder, "version": version, "visual_ready": True}
+    return {
+        "ok": True,
+        "gallery_url": gallery_url,
+        "encoder": encoder,
+        "version": version,
+        "visual_ready": True,
+        "image_count": image_count,
+    }
 
 
 def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> dict:
@@ -775,18 +978,22 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
             "fallback_encoder": "simple",
             "reason": dinov2_status.get("error") or "DINOv2 is unavailable",
         }
-    blobs = []
+    image_entries = []
     errors = []
     for raw_url in image_urls[:12]:
         try:
             data, _ = cached_thumbnail(str(raw_url), gallery_url)
-            blobs.append(data)
+            image_entries.append((str(raw_url), data))
         except Exception as exc:
             errors.append(str(exc))
-    if not blobs:
+    if not image_entries:
         raise ApiError(HTTPStatus.BAD_REQUEST, "no usable visual images")
     try:
-        embedding = dinov2_embedding(blobs, device=dinov2_device)
+        image_embeddings = dinov2_image_embeddings(
+            [blob for _image_url, blob in image_entries],
+            device=dinov2_device,
+        )
+        embedding = average_embeddings(image_embeddings)
     except VisualEncoderUnavailable as exc:
         return {
             "ok": False,
@@ -799,6 +1006,15 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
     try:
         with db.connect() as conn:
             store_visual_embedding(conn, gallery_url, embedding, version=DINOV2_VISUAL_VERSION)
+            image_count = store_visual_image_embeddings(
+                conn,
+                gallery_url,
+                [
+                    {"image_url": image_url, "embedding": image_embedding}
+                    for (image_url, _blob), image_embedding in zip(image_entries, image_embeddings)
+                ],
+                version=DINOV2_VISUAL_VERSION,
+            )
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
     return {
@@ -807,7 +1023,7 @@ def save_dinov2_visual_embedding(gallery_url: str, payload: dict[str, Any]) -> d
         "encoder": "dinov2",
         "version": DINOV2_VISUAL_VERSION,
         "visual_ready": True,
-        "image_count": len(blobs),
+        "image_count": image_count,
         "errors": errors,
     }
 
@@ -2393,6 +2609,22 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
     with db.connect() as conn:
         store_galleries(conn, [detailed], detail_fetched=True)
         store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
+    visual_urls = []
+    if detailed.thumb_url:
+        visual_urls.append(detailed.thumb_url)
+    visual_urls.extend(str(sample) for sample in samples if isinstance(sample, str) and sample)
+    visual_result = {"status": "skipped", "reason": "no standalone images"}
+    if visual_urls:
+        try:
+            encoded = save_dinov2_visual_embedding(detailed.url, {"image_urls": visual_urls})
+            visual_result = {
+                "status": "success" if encoded.get("ok") else "skipped",
+                "image_count": int(encoded.get("image_count") or 0),
+                "reason": encoded.get("reason"),
+            }
+        except Exception as exc:
+            visual_result = {"status": "failed", "reason": str(exc)}
+    with db.connect() as conn:
         retrain_model(conn)
     parent_error = None
     try:
@@ -2405,15 +2637,54 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         "gallery_url": gallery_url,
         "parent_enriched": parent_enriched,
         "parent_error": parent_error,
+        "visual": visual_result,
     }
+
+
+def feedback_enrichment_worker() -> None:
+    while True:
+        gallery_url = FEEDBACK_ENRICHMENT_QUEUE.get()
+        try:
+            result = enrich_feedback_gallery(gallery_url)
+            if result.get("status") == "failed":
+                print(f"feedback detail enrichment failed for {gallery_url}: {result.get('reason')}", flush=True)
+        except Exception as exc:
+            print(f"feedback detail enrichment failed for {gallery_url}: {exc}", flush=True)
+        finally:
+            with FEEDBACK_ENRICHMENT_LOCK:
+                FEEDBACK_ENRICHMENT_PENDING.discard(gallery_url)
+            FEEDBACK_ENRICHMENT_QUEUE.task_done()
+
+
+def queue_feedback_enrichment(gallery_url: str) -> dict:
+    global FEEDBACK_ENRICHMENT_WORKER
+    gallery_url = normalize_gallery_url(gallery_url)
+    if not gallery_url:
+        return {"status": "skipped", "reason": "gallery URL is invalid"}
+    with FEEDBACK_ENRICHMENT_LOCK:
+        if gallery_url in FEEDBACK_ENRICHMENT_PENDING:
+            return {"status": "queued", "gallery_url": gallery_url, "deduplicated": True}
+        FEEDBACK_ENRICHMENT_PENDING.add(gallery_url)
+        if FEEDBACK_ENRICHMENT_WORKER is None or not FEEDBACK_ENRICHMENT_WORKER.is_alive():
+            FEEDBACK_ENRICHMENT_WORKER = threading.Thread(
+                target=feedback_enrichment_worker,
+                name="feedback-detail-enrichment",
+                daemon=True,
+            )
+            FEEDBACK_ENRICHMENT_WORKER.start()
+    FEEDBACK_ENRICHMENT_QUEUE.put(gallery_url)
+    return {"status": "queued", "gallery_url": gallery_url, "deduplicated": False}
 
 
 def feedback_enrichment_plan(signal: float, payload: dict[str, Any]) -> dict:
     if signal == 0:
         return {"status": "skipped", "reason": "neutral feedback"}
+    mode = str(payload.get("enrich_feedback") or "").strip().lower()
+    if mode == "sync":
+        return enrich_feedback_gallery(str(payload.get("gallery_url") or ""))
     if not parse_bool(payload.get("enrich_feedback")):
         return {"status": "deferred", "reason": "review feedback does not fetch remote detail before responding"}
-    return enrich_feedback_gallery(str(payload.get("gallery_url") or ""))
+    return queue_feedback_enrichment(str(payload.get("gallery_url") or ""))
 
 
 def ensure_gallery_exists(conn, gallery_url: str) -> None:
@@ -2465,13 +2736,22 @@ def select_recommendation_detail_candidates(
         return []
     page = recommend_page(
         conn,
-        limit=100,
+        limit=min(100, max(limit * 8, 40)),
         include_rated=include_rated,
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
     )
     candidates: list[Gallery] = []
-    for item in page["items"]:
+    ranked = sorted(
+        page["items"],
+        key=lambda item: (
+            -(float(item.get("like_probability") or 0.0) * 0.55
+              + float(item.get("uncertainty") or 0.0) * 0.30
+              + float(item.get("text_visual_disagreement") or 0.0) * 0.15),
+            item.get("url") or "",
+        ),
+    )
+    for item in ranked:
         if item.get("detail_fetched_at") and has_visible_images(item):
             continue
         candidates.append(gallery_from_item(item))
@@ -2758,6 +3038,9 @@ def recommendation_payload(
         posted_after=posted_after,
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
+    page["request_id"] = hashlib.sha256(
+        f"review|{offset}|{filter_text or ''}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:24]
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
@@ -2801,8 +3084,52 @@ def short_repeat_payload(
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
+def discovery_payload(
+    conn,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+    language_filter: str | None = None,
+    seed: str | None = None,
+) -> dict:
+    if language_filter is None:
+        language_filter = configured_language_filter(conn)
+    page = discovery_page(
+        conn,
+        limit=limit,
+        offset=offset,
+        filter_text=filter_text,
+        candidate_limit=recommend_candidate_limit(conn),
+        language_filter=language_filter,
+        seed=seed,
+    )
+    page["items"] = gallery_item_payloads(conn, page["items"])
+    page["request_id"] = hashlib.sha256(
+        f"{page.get('seed')}|{offset}|{filter_text or ''}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:24]
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
+def continuing_update_payload(
+    conn,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    page = continuing_update_page(
+        conn,
+        limit=limit,
+        offset=offset,
+        filter_text=filter_text,
+        candidate_limit=recommend_candidate_limit(conn),
+    )
+    page["items"] = gallery_item_payloads(conn, page["items"])
+    return {**page, "last_fetch": last_fetch_run(conn)}
+
+
 def queue_counts_payload(conn) -> dict[str, int]:
     candidate_limit = recommend_candidate_limit(conn)
+    continuing_updates = continuing_update_series_index(conn)
     review = recommend_page(
         conn,
         limit=1,
@@ -2811,11 +3138,18 @@ def queue_counts_payload(conn) -> dict[str, int]:
         language_filter=configured_language_filter(conn),
         model_mode=configured_model_mode(conn),
         require_bootstrap_match=configured_review_require_bootstrap_match(conn),
+        continuing_updates=continuing_updates,
     )
-    short_repeats = short_repeat_page(conn, limit=1, candidate_limit=candidate_limit)
+    short_repeats = short_repeat_page(
+        conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
+    )
+    update_page = continuing_update_page(
+        conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
+    )
     return {
         "review": int(review["total"]),
         "short_repeats": int(short_repeats["total"]),
+        "continuing_updates": int(update_page["total"]),
     }
 
 
@@ -2832,6 +3166,10 @@ def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match
         return reaction_history_payload(conn, limit=40, filter_text=payload.get("filter_text"))
     if view == "short-repeats":
         return short_repeat_payload(conn, limit=40, filter_text=payload.get("filter_text"))
+    if view == "continuing-updates":
+        return continuing_update_payload(conn, limit=40, filter_text=payload.get("filter_text"))
+    if view == "discovery":
+        return discovery_payload(conn, limit=40, filter_text=payload.get("filter_text"))
     return recommendation_payload(
         conn,
         limit=40,
@@ -2864,10 +3202,24 @@ def gallery_db_row_payload(conn, row) -> dict:
 def gallery_item_payload(conn, item: dict) -> dict:
     updated = recommendation_item_with_image_fallback(item)
     parent_chain = gallery_parent_chain(conn, updated)
+    if updated.get("continuing_update"):
+        parent_chain = compact_continuing_parent_chain(parent_chain)
     if parent_chain:
         updated = dict(updated)
         updated["parent_chain"] = parent_chain
     return updated
+
+
+def compact_continuing_parent_chain(parent_chain: list[dict]) -> list[dict]:
+    if len(parent_chain) <= 3:
+        return parent_chain
+    omitted = len(parent_chain) - 3
+    return [
+        parent_chain[0],
+        parent_chain[1],
+        {"omitted": omitted, "known": False},
+        parent_chain[-1],
+    ]
 
 
 def gallery_parent_chain(conn, item: dict, limit: int = 12) -> list[dict]:

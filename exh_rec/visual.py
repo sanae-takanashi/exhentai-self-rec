@@ -175,7 +175,7 @@ def torch_device_status(requested_device: str) -> dict:
     }
 
 
-def dinov2_embedding(image_blobs: list[bytes], device: str | None = None) -> list[float]:
+def dinov2_image_embeddings(image_blobs: list[bytes], device: str | None = None) -> list[list[float]]:
     if not image_blobs:
         raise ValueError("at least one image is required")
     processor, model, torch, Image = load_dinov2(device)
@@ -189,8 +189,11 @@ def dinov2_embedding(image_blobs: list[bytes], device: str | None = None) -> lis
     with torch.no_grad():
         output = model(**inputs)
     cls_tokens = output.last_hidden_state[:, 0, :]
-    vector = cls_tokens.mean(dim=0)
-    return normalize_embedding(vector.detach().cpu().tolist())
+    return [normalize_embedding(vector) for vector in cls_tokens.detach().cpu().tolist()]
+
+
+def dinov2_embedding(image_blobs: list[bytes], device: str | None = None) -> list[float]:
+    return average_embeddings(dinov2_image_embeddings(image_blobs, device=device))
 
 
 def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:

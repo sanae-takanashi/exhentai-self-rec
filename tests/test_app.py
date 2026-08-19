@@ -26,6 +26,7 @@ from exh_rec.app import (
     cached_gallery_sample,
     check_saved_access,
     collect_gallery_samples,
+    compact_continuing_parent_chain,
     configured_dinov2_device,
     configured_language_filter,
     configured_model_mode,
@@ -66,6 +67,7 @@ from exh_rec.app import (
     reaction_history_payload,
     recommend_candidate_limit,
     recommendation_payload,
+    response_page_payload,
     refresh_gallery_metadata_payload,
     refresh_summary,
     refresh_thumbnails,
@@ -78,6 +80,7 @@ from exh_rec.app import (
     select_recommendation_detail_candidates,
     server_display_url,
     short_repeat_payload,
+    continuing_update_payload,
     thumbnail_referer,
 )
 from exh_rec.exhentai import Gallery
@@ -94,6 +97,20 @@ from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION
 
 
 class AppTest(unittest.TestCase):
+    def test_compact_continuing_parent_chain_keeps_two_recent_and_earliest(self):
+        chain = [{"url": f"https://exhentai.org/g/{index}/a/", "known": True} for index in range(10, 15)]
+
+        compact = compact_continuing_parent_chain(chain)
+
+        self.assertEqual(compact[0]["url"], chain[0]["url"])
+        self.assertEqual(compact[1]["url"], chain[1]["url"])
+        self.assertEqual(compact[2], {"omitted": 2, "known": False})
+        self.assertEqual(compact[3]["url"], chain[-1]["url"])
+
+    def test_compact_continuing_parent_chain_leaves_short_chain_unchanged(self):
+        chain = [{"url": str(index)} for index in range(3)]
+        self.assertIs(compact_continuing_parent_chain(chain), chain)
+
     def test_build_queries_combines_bootstrap_and_learned_tags(self):
         queries = build_queries(
             [{"tag": "artist:seed", "weight": 1.0}, {"tag": "female:skip", "weight": -1.0}],
@@ -439,8 +456,8 @@ class AppTest(unittest.TestCase):
                     "exh_rec.app.cached_thumbnail",
                     return_value=(b"image", "image/webp"),
                 ) as cached, patch(
-                    "exh_rec.app.dinov2_embedding",
-                    return_value=[1, 0, 0, 0] * 16,
+                    "exh_rec.app.dinov2_image_embeddings",
+                    return_value=[[1, 0, 0, 0] * 16],
                 ):
                     result = save_visual_embedding_payload(
                         {
@@ -454,10 +471,15 @@ class AppTest(unittest.TestCase):
                         "SELECT visual_embedding_version FROM galleries WHERE url = ?",
                         (gallery_url,),
                     ).fetchone()
+                    image_count = conn.execute(
+                        "SELECT COUNT(*) FROM gallery_visual_images WHERE gallery_url = ?",
+                        (gallery_url,),
+                    ).fetchone()[0]
 
         self.assertTrue(result["visual_ready"])
         self.assertEqual(result["encoder"], "dinov2")
         self.assertEqual(row["visual_embedding_version"], DINOV2_VISUAL_VERSION)
+        self.assertEqual(image_count, 1)
         cached.assert_called_once()
 
     def test_save_visual_embedding_payload_reports_simple_fallback_when_dinov2_unavailable(self):
@@ -634,6 +656,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 1)
         self.assertEqual(payload["last_fetch"]["status"], "success")
         self.assertEqual(payload["last_fetch"]["enriched_count"], 1)
+        self.assertTrue(payload["request_id"])
         conn.close()
 
     def test_recommendation_payload_uses_first_sample_as_thumbnail_fallback(self):
@@ -791,10 +814,20 @@ class AppTest(unittest.TestCase):
         self.assertEqual(result["status"], "deferred")
 
     def test_feedback_enrichment_plan_can_opt_in_to_remote_fetch(self):
-        with patch("exh_rec.app.enrich_feedback_gallery", return_value={"status": "success"}) as enrich:
+        with patch("exh_rec.app.queue_feedback_enrichment", return_value={"status": "queued"}) as enrich:
             result = feedback_enrichment_plan(
                 1.0,
                 {"gallery_url": "https://exhentai.org/g/10/a/", "enrich_feedback": True},
+            )
+
+        self.assertEqual(result["status"], "queued")
+        enrich.assert_called_once_with("https://exhentai.org/g/10/a/")
+
+    def test_feedback_enrichment_plan_supports_explicit_synchronous_fetch(self):
+        with patch("exh_rec.app.enrich_feedback_gallery", return_value={"status": "success"}) as enrich:
+            result = feedback_enrichment_plan(
+                1.0,
+                {"gallery_url": "https://exhentai.org/g/10/a/", "enrich_feedback": "sync"},
             )
 
         self.assertEqual(result["status"], "success")
@@ -1324,6 +1357,45 @@ class AppTest(unittest.TestCase):
         self.assertEqual(sent[0][0]["items"][0]["url"], repeat_url)
         conn.close()
 
+    def test_continuing_update_payload_exposes_reusable_parent_feedback(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        old_url = "https://exhentai.org/g/8610/a/"
+        latest_url = "https://exhentai.org/g/8611/a/"
+        store_galleries(
+            conn,
+            [
+                Gallery(url=old_url, gid="8610", token="a", title="[Fanbox] Payload Update", tags=["artist:update"]),
+                Gallery(url=latest_url, gid="8611", token="a", title="[Fanbox] Payload Update", tags=["artist:update"], parent_url=old_url),
+            ],
+        )
+        record_feedback(conn, old_url, score=4)
+
+        payload = continuing_update_payload(conn, limit=10)
+
+        previous = payload["items"][0]["previous_feedback"]
+        self.assertEqual(previous["url"], old_url)
+        self.assertEqual(previous["user_score"], 4)
+        self.assertTrue(previous["is_parent"])
+        conn.close()
+
+    def test_feedback_response_for_updates_omits_newly_rated_gallery(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        url = "https://exhentai.org/g/8612/a/"
+        store_galleries(conn, [Gallery(url=url, gid="8612", token="a", title="Manual Update Response")])
+        from exh_rec.recommender import set_classification_override
+
+        set_classification_override(conn, url, "updates")
+        record_feedback(conn, url, vote=1)
+
+        payload = response_page_payload(conn, {"view": "continuing-updates"})
+
+        self.assertNotIn(url, [item["url"] for item in payload["items"]])
+        conn.close()
+
     def test_queue_counts_payload_returns_review_and_short_repeat_totals(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -1347,7 +1419,7 @@ class AppTest(unittest.TestCase):
 
         counts = queue_counts_payload(conn)
 
-        self.assertEqual(counts, {"review": 1, "short_repeats": 1})
+        self.assertEqual(counts, {"review": 1, "short_repeats": 1, "continuing_updates": 0})
         conn.close()
 
     def test_queue_counts_endpoint_returns_payload(self):
@@ -1362,11 +1434,11 @@ class AppTest(unittest.TestCase):
 
         with patch("exh_rec.app.db.connect", return_value=conn), patch(
             "exh_rec.app.queue_counts_payload",
-            return_value={"review": 7, "short_repeats": 3},
+            return_value={"review": 7, "short_repeats": 3, "continuing_updates": 2},
         ):
             handler.do_GET()
 
-        self.assertEqual(sent, [({"review": 7, "short_repeats": 3}, HTTPStatus.OK)])
+        self.assertEqual(sent, [({"review": 7, "short_repeats": 3, "continuing_updates": 2}, HTTPStatus.OK)])
         conn.close()
 
     def test_marked_gallery_payload_returns_bookmark_cards(self):
@@ -1539,8 +1611,15 @@ class AppTest(unittest.TestCase):
                     token="a",
                     title="Needs Detail",
                     tags=["artist:detailfav"],
+                    thumb_url="https://ehgt.org/g/32.jpg",
                 )
-                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed) as fetch_detail:
+                with patch("exh_rec.app.fetch_gallery_detail", return_value=detailed) as fetch_detail, patch(
+                    "exh_rec.app.collect_gallery_samples",
+                    return_value=["https://example.test/sample.jpg"],
+                ), patch("exh_rec.app.cache_sample_thumbnails"), patch(
+                    "exh_rec.app.save_dinov2_visual_embedding",
+                    return_value={"ok": True, "image_count": 2},
+                ) as save_visual:
                     result = enrich_feedback_gallery(gallery_url)
 
                 with db.connect() as conn:
@@ -1552,6 +1631,11 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
                 self.assertIsNotNone(row["detail_fetched_at"])
                 self.assertIn("artist:detailfav", learned)
+                self.assertEqual(result["visual"]["image_count"], 2)
+                save_visual.assert_called_once_with(
+                    gallery_url,
+                    {"image_urls": ["https://ehgt.org/g/32.jpg", "https://example.test/sample.jpg"]},
+                )
 
     def test_refresh_thumbnails_backfills_missing_cover(self):
         with tempfile.TemporaryDirectory() as tmpdir:

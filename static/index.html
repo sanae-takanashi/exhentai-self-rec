@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ExHentai Recommender</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260818-2">
   </head>
   <body>
     <header class="topbar">
@@ -102,6 +102,7 @@
           <select id="modelMode">
             <option value="hybrid">Hybrid</option>
             <option value="visual">Visual only</option>
+            <option value="legacy">Legacy</option>
           </select>
         </label>
 
@@ -164,40 +165,141 @@
       <section class="content">
         <div class="view-tabs" role="tablist" aria-label="Gallery views">
           <button id="reviewTab" class="active" type="button" data-view="review">Review <span id="reviewQueueCount" class="queue-count" aria-live="polite">...</span></button>
+          <button id="discoveryTab" type="button" data-view="discovery">Discovery</button>
+          <button id="continuingUpdatesTab" type="button" data-view="continuing-updates">Updates <span id="continuingUpdatesQueueCount" class="queue-count" aria-live="polite">...</span></button>
           <button id="shortRepeatsTab" type="button" data-view="short-repeats">Short Repeats <span id="shortRepeatsQueueCount" class="queue-count" aria-live="polite">...</span></button>
           <button id="historyTab" type="button" data-view="history">History</button>
           <button id="favoriteTab" type="button" data-view="favorite">Favorites</button>
           <button id="banTab" type="button" data-view="ban">Bans</button>
           <button id="previewTab" type="button" data-view="preview">Preview</button>
+          <button id="hathTab" type="button" data-view="hath">H@H <span id="hathClientCount" class="queue-count" aria-live="polite">...</span></button>
         </div>
         <div class="view-heading">
           <h2 id="viewTitle">Review Queue</h2>
           <p id="viewSubtitle">Unrated galleries ready for feedback.</p>
         </div>
-        <div class="toolbar">
-          <input id="query" type="search" placeholder="Optional one-off search query">
-          <button id="searchFetchBtn" type="button">Fetch Query</button>
-          <input id="localFilter" type="search" placeholder="Filter local title, tag, category, uploader">
-          <button id="backfillReviewParentsBtn" type="button">Update Parents</button>
-          <button id="historySearchBtn" class="hidden" type="button">Search History</button>
-          <button id="backfillHistoryParentsBtn" class="hidden" type="button">Update Parents</button>
-          <button id="recalcShortRepeatsBtn" class="hidden" type="button">Recalculate Repeats</button>
-        </div>
-        <section id="parentProgress" class="parent-progress hidden" aria-live="polite">
-          <div class="parent-progress-head">
-            <div>
-              <strong id="parentProgressTitle">Parent Update</strong>
-              <span id="parentProgressSummary">Idle</span>
-            </div>
-            <span id="parentProgressCounts"></span>
+        <div id="galleryView">
+          <div class="toolbar">
+            <input id="query" type="search" placeholder="Optional one-off search query">
+            <button id="searchFetchBtn" type="button">Fetch Query</button>
+            <input id="localFilter" type="search" placeholder="Filter local title, tag, category, uploader">
+            <button id="backfillReviewParentsBtn" type="button">Update Parents</button>
+            <button id="historySearchBtn" class="hidden" type="button">Search History</button>
+            <button id="backfillHistoryParentsBtn" class="hidden" type="button">Update Parents</button>
+            <button id="recalcShortRepeatsBtn" class="hidden" type="button">Recalculate Repeats</button>
           </div>
-          <progress id="parentProgressBar" max="100" value="0"></progress>
-          <div id="parentProgressLog" class="parent-progress-log"></div>
-        </section>
-        <div id="recommendations" class="grid"></div>
-        <div class="loadbar">
-          <button id="loadMoreBtn" type="button">Load More</button>
+          <section id="parentProgress" class="parent-progress hidden" aria-live="polite">
+            <div class="parent-progress-head">
+              <div>
+                <strong id="parentProgressTitle">Parent Update</strong>
+                <span id="parentProgressSummary">Idle</span>
+              </div>
+              <span id="parentProgressCounts"></span>
+            </div>
+            <progress id="parentProgressBar" max="100" value="0"></progress>
+            <div id="parentProgressLog" class="parent-progress-log"></div>
+          </section>
+          <div id="recommendations" class="grid"></div>
+          <div class="loadbar">
+            <button id="loadMoreBtn" type="button">Load More</button>
+          </div>
         </div>
+        <section id="hathView" class="hath-view hidden" aria-live="polite">
+          <div class="hath-toolbar">
+            <div>
+              <strong id="hathConnectionSummary">No observer connected</strong>
+              <span id="hathUpdatedAt">Not refreshed</span>
+            </div>
+            <div class="hath-toolbar-actions">
+              <button id="hathRefreshBtn" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="hathSummary" class="hath-summary"></div>
+          <section class="hath-section">
+            <div class="hath-section-heading">
+              <h3>P2P Serving</h3>
+              <span id="hathP2pSummary"></span>
+            </div>
+            <div id="hathP2pOverview" class="hath-p2p-overview"></div>
+            <div id="hathP2pClients" class="hath-p2p-clients"></div>
+          </section>
+          <section class="hath-section">
+            <div class="hath-section-heading">
+              <h3>Clients</h3>
+              <span id="hathClientSummary"></span>
+            </div>
+            <div id="hathClients" class="hath-clients"></div>
+          </section>
+          <section class="hath-section hath-pack-section">
+            <div class="hath-section-heading">
+              <div>
+                <h3>Archive &amp; Upload</h3>
+                <span id="hathPackSummary">Loading remote archive inventory</span>
+              </div>
+              <button id="hathPackRefreshBtn" type="button">Refresh</button>
+            </div>
+            <div class="hath-pack-options">
+              <label>
+                Archive name
+                <input id="hathPackArchiveName" type="text" maxlength="240" autocomplete="off">
+              </label>
+              <label>
+                MEGA account
+                <output id="hathPackMegaAccount" class="hath-pack-output">Not connected</output>
+              </label>
+              <label>
+                MEGA destination
+                <input id="hathPackMegaDestination" type="text" maxlength="500" value="/H@H Archives" autocomplete="off">
+              </label>
+            </div>
+            <div class="hath-pack-toggles">
+              <label class="check inline"><input id="hathPackUpload" type="checkbox" checked> Upload to MEGA</label>
+              <label class="check inline"><input id="hathPackTrashSources" type="checkbox"> Trash selected sources after success</label>
+              <label class="check inline"><input id="hathPackTrashArchive" type="checkbox"> Trash local archive after upload</label>
+            </div>
+            <div class="hath-pack-selection-heading">
+              <div>
+                <strong>Source selection</strong>
+                <span id="hathPackSelectionSummary">No inventory loaded</span>
+              </div>
+              <div>
+                <button id="hathPackSelectAllBtn" type="button">Select all</button>
+                <button id="hathPackSelectNoneBtn" type="button">Clear</button>
+              </div>
+            </div>
+            <div id="hathPackCandidates" class="hath-pack-candidates">
+              <div class="hath-empty">Loading archive candidates.</div>
+            </div>
+            <div class="hath-pack-actions">
+              <button id="hathPackPreviewBtn" type="button" disabled>Dry Run</button>
+              <button id="hathPackBtn" class="danger" type="button" disabled>Run Plan</button>
+            </div>
+            <div id="hathPackPlan" class="hath-pack-plan hidden"></div>
+            <div class="hath-pack-status">
+              <span id="hathPackBadge" class="hath-badge hath-tone-neutral">Unknown</span>
+              <span id="hathPackTiming"></span>
+            </div>
+            <pre id="hathPackLog" class="hath-pack-log" aria-live="polite">No archive job has run in this server session.</pre>
+          </section>
+          <section class="hath-section">
+            <div class="hath-section-heading hath-download-heading">
+              <div>
+                <h3>Downloads</h3>
+                <span id="hathDownloadSummary"></span>
+              </div>
+              <div class="hath-download-controls">
+                <input id="hathDownloadSearch" type="search" aria-label="Search H@H downloads" placeholder="Search gallery, gid, directory">
+                <select id="hathDownloadFilter" aria-label="Filter H@H downloads by status">
+                  <option value="all">All statuses</option>
+                  <option value="active">Active</option>
+                  <option value="completed">Completed</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
+            </div>
+            <div id="hathDownloads" class="hath-downloads"></div>
+          </section>
+        </section>
       </section>
     </main>
 
@@ -211,6 +313,6 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260818-2"></script>
   </body>
 </html>

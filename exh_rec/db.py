@@ -60,7 +60,44 @@ CREATE TABLE IF NOT EXISTS feedback (
     vote REAL NOT NULL,
     score INTEGER,
     note TEXT,
+    reason_code TEXT,
+    surface TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS recommendation_impressions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    surface TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    model_version TEXT,
+    like_probability REAL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(request_id, gallery_url, surface)
+);
+
+CREATE TABLE IF NOT EXISTS model_training_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    positive_count INTEGER NOT NULL DEFAULT 0,
+    negative_count INTEGER NOT NULL DEFAULT 0,
+    selected_c REAL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gallery_visual_images (
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    image_key TEXT NOT NULL,
+    image_url TEXT,
+    embedding_json TEXT NOT NULL,
+    embedding_version TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(gallery_url, image_key, embedding_version)
 );
 
 CREATE TABLE IF NOT EXISTS gallery_marks (
@@ -69,6 +106,57 @@ CREATE TABLE IF NOT EXISTS gallery_marks (
     note TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gallery_classification_overrides (
+    gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
+    classification TEXT NOT NULL CHECK(classification IN ('review', 'updates')),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS hath_clients (
+    client_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    hostname TEXT,
+    agent_version TEXT,
+    active_gid TEXT,
+    active_title TEXT,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT,
+    last_event_at TEXT,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS hath_downloads (
+    client_id TEXT NOT NULL REFERENCES hath_clients(client_id) ON DELETE CASCADE,
+    gid TEXT NOT NULL,
+    resolution TEXT NOT NULL DEFAULT 'org',
+    gallery_url TEXT REFERENCES galleries(url) ON DELETE SET NULL,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'discovered'
+        CHECK(status IN ('discovered', 'downloading', 'completed', 'failed')),
+    directory_name TEXT,
+    total_files INTEGER,
+    downloaded_files INTEGER NOT NULL DEFAULT 0,
+    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(client_id, gid, resolution)
+);
+
+CREATE TABLE IF NOT EXISTS hath_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    client_id TEXT NOT NULL REFERENCES hath_clients(client_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    gid TEXT,
+    resolution TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    occurred_at TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS fetch_runs (
@@ -105,9 +193,34 @@ CREATE TABLE IF NOT EXISTS feature_weights (
 
 CREATE INDEX IF NOT EXISTS idx_galleries_last_seen ON galleries(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_feedback_gallery ON feedback(gallery_url, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_impressions_created ON recommendation_impressions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_impressions_gallery ON recommendation_impressions(gallery_url, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_training_created ON model_training_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gallery_marks_kind ON gallery_marks(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_classification_overrides_kind ON gallery_classification_overrides(classification, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hath_downloads_status ON hath_downloads(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hath_downloads_gallery ON hath_downloads(gallery_url, status);
+CREATE INDEX IF NOT EXISTS idx_hath_events_client ON hath_events(client_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_fetch_runs_started ON fetch_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fetch_query_state_updated ON fetch_query_state(updated_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_hath_download_gallery_insert
+AFTER INSERT ON galleries
+WHEN NEW.gid IS NOT NULL AND NEW.gid != ''
+BEGIN
+    UPDATE hath_downloads
+    SET gallery_url = NEW.url
+    WHERE gallery_url IS NULL AND gid = NEW.gid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_hath_download_gallery_gid_update
+AFTER UPDATE OF gid ON galleries
+WHEN NEW.gid IS NOT NULL AND NEW.gid != ''
+BEGIN
+    UPDATE hath_downloads
+    SET gallery_url = NEW.url
+    WHERE gallery_url IS NULL AND gid = NEW.gid;
+END;
 """
 
 
@@ -128,6 +241,8 @@ def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         ensure_column(conn, "feedback", "score", "INTEGER")
+        ensure_column(conn, "feedback", "reason_code", "TEXT")
+        ensure_column(conn, "feedback", "surface", "TEXT")
         ensure_column(conn, "galleries", "title_jpn", "TEXT")
         ensure_column(conn, "galleries", "parent_url", "TEXT")
         ensure_column(conn, "galleries", "review_excluded", "INTEGER NOT NULL DEFAULT 0")
@@ -156,12 +271,26 @@ def init_db() -> None:
             "preview_posted_after": "",
             "review_require_bootstrap_match": "1",
             "sample_extra_pages": "2",
+            "hath_download_signal_weight": "1.25",
         }
         for key, value in defaults.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                 (key, value),
             )
+        conn.execute(
+            """
+            UPDATE hath_downloads
+            SET gallery_url = (
+                SELECT g.url FROM galleries g
+                WHERE g.gid = hath_downloads.gid
+                ORDER BY g.detail_fetched_at DESC, g.last_seen_at DESC
+                LIMIT 1
+            )
+            WHERE gallery_url IS NULL
+              AND EXISTS (SELECT 1 FROM galleries g WHERE g.gid = hath_downloads.gid)
+            """
+        )
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

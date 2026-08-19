@@ -91,7 +91,7 @@ if ($VenvPythonVersion -ne "3.12") {
     throw "ROCm Windows PyTorch wheels require Python 3.12, but $PythonExe is Python $VenvPythonVersion. Choose a new -VenvPath or recreate this venv with Python 3.12."
 }
 
-Invoke-ProjectPython @("-m", "pip", "install", "--upgrade", "pip")
+Invoke-PipInstall @("--upgrade", "pip")
 
 if (-not $SkipProjectDeps) {
     Invoke-PipInstall @("-r", (Join-Path $RepoRoot "requirements.txt"))

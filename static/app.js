@@ -41,15 +41,58 @@ const modelDialog = document.querySelector("#modelDialog");
 const dialogTitle = document.querySelector("#dialogTitle");
 const modelBody = document.querySelector("#modelBody");
 const refreshStatusEl = document.querySelector("#refreshStatus");
+const galleryViewEl = document.querySelector("#galleryView");
+const hathViewEl = document.querySelector("#hathView");
+const hathClientCountEl = document.querySelector("#hathClientCount");
+const hathConnectionSummaryEl = document.querySelector("#hathConnectionSummary");
+const hathUpdatedAtEl = document.querySelector("#hathUpdatedAt");
+const hathSummaryEl = document.querySelector("#hathSummary");
+const hathP2pSummaryEl = document.querySelector("#hathP2pSummary");
+const hathP2pOverviewEl = document.querySelector("#hathP2pOverview");
+const hathP2pClientsEl = document.querySelector("#hathP2pClients");
+const hathClientSummaryEl = document.querySelector("#hathClientSummary");
+const hathClientsEl = document.querySelector("#hathClients");
+const hathDownloadSummaryEl = document.querySelector("#hathDownloadSummary");
+const hathDownloadSearchEl = document.querySelector("#hathDownloadSearch");
+const hathDownloadFilterEl = document.querySelector("#hathDownloadFilter");
+const hathDownloadsEl = document.querySelector("#hathDownloads");
+const hathRefreshBtn = document.querySelector("#hathRefreshBtn");
+const hathPackBtn = document.querySelector("#hathPackBtn");
+const hathPackRefreshBtn = document.querySelector("#hathPackRefreshBtn");
+const hathPackPreviewBtn = document.querySelector("#hathPackPreviewBtn");
+const hathPackSelectAllBtn = document.querySelector("#hathPackSelectAllBtn");
+const hathPackSelectNoneBtn = document.querySelector("#hathPackSelectNoneBtn");
+const hathPackArchiveNameEl = document.querySelector("#hathPackArchiveName");
+const hathPackMegaAccountEl = document.querySelector("#hathPackMegaAccount");
+const hathPackMegaDestinationEl = document.querySelector("#hathPackMegaDestination");
+const hathPackUploadEl = document.querySelector("#hathPackUpload");
+const hathPackTrashSourcesEl = document.querySelector("#hathPackTrashSources");
+const hathPackTrashArchiveEl = document.querySelector("#hathPackTrashArchive");
+const hathPackSelectionSummaryEl = document.querySelector("#hathPackSelectionSummary");
+const hathPackCandidatesEl = document.querySelector("#hathPackCandidates");
+const hathPackPlanEl = document.querySelector("#hathPackPlan");
+const hathPackSummaryEl = document.querySelector("#hathPackSummary");
+const hathPackBadgeEl = document.querySelector("#hathPackBadge");
+const hathPackTimingEl = document.querySelector("#hathPackTiming");
+const hathPackLogEl = document.querySelector("#hathPackLog");
 const viewTitleEl = document.querySelector("#viewTitle");
 const viewSubtitleEl = document.querySelector("#viewSubtitle");
 const reviewQueueCountEl = document.querySelector("#reviewQueueCount");
+const continuingUpdatesQueueCountEl = document.querySelector("#continuingUpdatesQueueCount");
 const shortRepeatsQueueCountEl = document.querySelector("#shortRepeatsQueueCount");
 const viewTabs = [...document.querySelectorAll("[data-view]")];
 let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
 let queueCountsPromise = null;
 let queueCountsRefreshQueued = false;
+let hathStatusPromise = null;
+let hathStatusPayload = null;
+let hathPackStatusPromise = null;
+let hathPackInventoryPromise = null;
+let hathPackPollTimer = null;
+let hathPackInventory = null;
+let hathPackPreview = null;
+let hathPackStatusPayload = null;
 let lastRenderedFetchId = null;
 let currentView = "review";
 let reviewExploreSeed = "";
@@ -107,11 +150,18 @@ const staticTooltips = {
   replaceImport: "When importing, replace existing preference data instead of merging into it.",
   resetBtn: "Delete fetched galleries, feedback, learned model, marks, visual embeddings, and fetch history. Cookie and bootstrap tags remain.",
   reviewTab: "Show unrated recommendations to review and train the model.",
+  discoveryTab: "Explore uncertain, under-estimated, and less-covered interests without diluting Review.",
+  continuingUpdatesTab: "Show the latest version of galleries detected as cumulative Pixiv, Fanbox, Patreon, archive, or ongoing series.",
   shortRepeatsTab: "Show short new galleries that resemble older rated source-prefix galleries, with old reactions shown for reference.",
   historyTab: "Show galleries you already rated, skipped, or voted on.",
   favoriteTab: "Show favorite bookmarked galleries, which act as strong positive signals.",
   banTab: "Show banned bookmarked galleries, which act as strong negative signals.",
   previewTab: "Show the full model ranking, including already rated galleries, with stronger freshness weighting.",
+  hathTab: "Show H@H observer connectivity, client health, and recent download activity.",
+  hathRefreshBtn: "Refresh H@H client and download status now.",
+  hathPackBtn: "Archive completed download directories on the H@H host and upload the daily archive to MEGA.",
+  hathPackPreviewBtn: "Validate the selected sources and show the exact archive, upload, and cleanup plan without changing files.",
+  hathPackRefreshBtn: "Rescan remote gallery directories, ZIP files, and the current MEGA account.",
   query: "Optional one-off ExHentai search query. It is used alone when you click Fetch Query.",
   searchFetchBtn: "Fetch galleries for only the one-off query in the search box.",
   localFilter: "Filter already stored local galleries by title, tag, category, or uploader.",
@@ -241,9 +291,12 @@ async function saveVisualEmbedding(task) {
     return;
   }
   const vectors = [];
+  const imageEmbeddings = [];
   for (const source of task.sources) {
     try {
-      vectors.push(await imageEmbedding(source));
+      const embedding = await imageEmbedding(source);
+      vectors.push(embedding);
+      imageEmbeddings.push({ image_url: source, embedding });
     } catch (_) {
       // Some image hosts return occasional broken thumbnails; one usable image is enough.
     }
@@ -259,6 +312,7 @@ async function saveVisualEmbedding(task) {
       encoder: visualFallbackEncoder,
       version: visualFallbackVersion,
       embedding,
+      image_embeddings: imageEmbeddings,
     }),
   });
   visualSavedUrls.add(task.galleryUrl);
@@ -458,6 +512,30 @@ function cookiePreviewText(settings) {
 }
 
 function viewCopy(view) {
+  if (view === "hath") {
+    return {
+      title: "H@H Status",
+      subtitle: "Observer connectivity, downloader health, and recent transfer activity.",
+      empty: "No H@H observer has connected yet.",
+      loaded: "H@H status loaded",
+    };
+  }
+  if (view === "discovery") {
+    return {
+      title: "Discovery",
+      subtitle: "Uncertain, model-disagreement, and less-covered candidates for finding missed interests.",
+      empty: "No discovery candidates yet.",
+      loaded: "discovery candidates loaded",
+    };
+  }
+  if (view === "continuing-updates") {
+    return {
+      title: "Continuing Updates",
+      subtitle: "Latest versions of cumulative galleries, separated from Review after the series has been judged once.",
+      empty: "No continuing gallery series detected yet.",
+      loaded: "continuing gallery series loaded",
+    };
+  }
   if (view === "short-repeats") {
     return {
       title: "Short Repeat Queue",
@@ -517,6 +595,7 @@ function renderQueueCount(element, value, label) {
 
 function renderQueueCounts(payload) {
   renderQueueCount(reviewQueueCountEl, payload.review, "galleries");
+  renderQueueCount(continuingUpdatesQueueCountEl, payload.continuing_updates, "continuing series");
   renderQueueCount(shortRepeatsQueueCountEl, payload.short_repeats, "short repeats");
 }
 
@@ -569,6 +648,9 @@ function setActiveView(view) {
   const copy = viewCopy(view);
   viewTitleEl.textContent = copy.title;
   viewSubtitleEl.textContent = copy.subtitle;
+  const hathView = view === "hath";
+  galleryViewEl.classList.toggle("hidden", hathView);
+  hathViewEl.classList.toggle("hidden", !hathView);
   const historyView = view === "history";
   const reviewView = view === "review";
   backfillReviewParentsBtn.classList.toggle("hidden", !reviewView);
@@ -579,6 +661,15 @@ function setActiveView(view) {
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
+  if (currentView === "hath") {
+    return loadHathStatus();
+  }
+  if (currentView === "discovery") {
+    return loadDiscovery(offset, append);
+  }
+  if (currentView === "continuing-updates") {
+    return loadContinuingUpdates(offset, append);
+  }
   if (currentView === "short-repeats") {
     return loadShortRepeats(offset, append);
   }
@@ -589,6 +680,675 @@ async function loadCurrentPage(offset = 0, append = false) {
     return loadMarkedGalleries(currentView, offset, append);
   }
   return loadRecommendations(offset, append);
+}
+
+const hathStaleAfterMs = 150000;
+
+async function loadHathStatus({ announce = true } = {}) {
+  if (hathStatusPromise) {
+    return hathStatusPromise;
+  }
+  hathRefreshBtn.disabled = true;
+  hathStatusPromise = api("/api/integrations/hath/status")
+    .then(async (payload) => {
+      renderHathStatus(payload);
+      await loadHathPackStatus();
+      if (!hathPackInventory) {
+        await loadHathPackInventory();
+      }
+      if (announce) {
+        const clientCount = (payload.clients || []).length;
+        const downloadCount = Object.values(payload.counts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+        setStatus(`H@H status loaded: ${clientCount} client${clientCount === 1 ? "" : "s"}, ${downloadCount} downloads`);
+      }
+      return payload;
+    })
+    .finally(() => {
+      hathStatusPromise = null;
+      hathRefreshBtn.disabled = false;
+    });
+  return hathStatusPromise;
+}
+
+async function loadHathPackStatus() {
+  if (hathPackStatusPromise) return hathPackStatusPromise;
+  hathPackStatusPromise = api("/api/integrations/hath/pack/status")
+    .then((payload) => {
+      renderHathPackStatus(payload);
+      return payload;
+    })
+    .finally(() => {
+      hathPackStatusPromise = null;
+    });
+  return hathPackStatusPromise;
+}
+
+async function loadHathPackInventory() {
+  if (hathPackInventoryPromise) return hathPackInventoryPromise;
+  hathPackRefreshBtn.disabled = true;
+  hathPackInventoryPromise = api("/api/integrations/hath/pack/inventory")
+    .then((payload) => {
+      hathPackInventory = payload;
+      renderHathPackInventory(payload);
+      return payload;
+    })
+    .finally(() => {
+      hathPackInventoryPromise = null;
+      hathPackRefreshBtn.disabled = false;
+    });
+  return hathPackInventoryPromise;
+}
+
+function defaultHathArchiveName() {
+  const now = new Date();
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}.zip`;
+}
+
+function renderHathPackInventory(payload) {
+  const candidates = payload.candidates || [];
+  const mega = payload.mega || {};
+  if (!hathPackArchiveNameEl.value.trim()) {
+    hathPackArchiveNameEl.value = defaultHathArchiveName();
+  }
+  hathPackMegaAccountEl.textContent = mega.account || "Not connected";
+  hathPackMegaAccountEl.title = mega.remote_cwd ? `Current MEGA folder: ${mega.remote_cwd}` : (mega.error || "");
+  if (!mega.available) {
+    hathPackUploadEl.checked = false;
+  }
+  hathPackUploadEl.disabled = !mega.available;
+  hathPackSummaryEl.textContent = `${candidates.length} archive candidate${candidates.length === 1 ? "" : "s"} on ${payload.download_dir || "the H@H host"}`;
+  hathPackCandidatesEl.innerHTML = candidates.length
+    ? `
+      <div class="hath-pack-candidate hath-pack-candidate-header" aria-hidden="true">
+        <span></span><span>Source</span><span>Kind</span><span>Files</span><span>Size</span><span>Modified</span>
+      </div>
+      ${candidates.map((candidate) => `
+        <label class="hath-pack-candidate${candidate.active ? " is-active" : ""}">
+          <input type="checkbox" data-hath-pack-source value="${escapeAttr(candidate.name)}" ${candidate.active ? "disabled" : ""}>
+          <span title="${escapeAttr(candidate.name)}">${escapeHtml(candidate.name)}</span>
+          <span>${candidate.active ? '<span class="hath-badge hath-tone-active">Active</span>' : escapeHtml(candidate.kind || "gallery")}</span>
+          <span>${escapeHtml(Number(candidate.file_count || 0).toLocaleString())}</span>
+          <span>${escapeHtml(formatHathBytes(candidate.size_bytes || 0))}</span>
+          <span title="${escapeAttr(formatHathDate(candidate.modified_at))}">${escapeHtml(relativeHathTime(candidate.modified_at))}</span>
+        </label>
+      `).join("")}
+    `
+    : '<div class="hath-empty">No gallery directories or ZIP files are available.</div>';
+  invalidateHathPackPreview();
+  updateHathPackSelection();
+}
+
+function selectedHathPackNames() {
+  return [...hathPackCandidatesEl.querySelectorAll("input[data-hath-pack-source]:checked")]
+    .map((input) => input.value);
+}
+
+function updateHathPackSelection() {
+  const selectedNames = new Set(selectedHathPackNames());
+  const candidates = hathPackInventory?.candidates || [];
+  const selected = candidates.filter((candidate) => selectedNames.has(candidate.name));
+  const selectedBytes = selected.reduce((sum, candidate) => sum + Number(candidate.size_bytes || 0), 0);
+  hathPackSelectionSummaryEl.textContent = `${selected.length} selected · ${formatHathBytes(selectedBytes)}`;
+  updateHathPackControls();
+}
+
+function updateHathPackControls() {
+  const running = hathPackStatusPayload?.state === "running";
+  const hasSelection = selectedHathPackNames().length > 0;
+  const configured = hathPackStatusPayload?.configured === true;
+  hathPackPreviewBtn.disabled = running || !configured || !hasSelection;
+  hathPackBtn.disabled = running || !configured || !hathPackPreview;
+  hathPackMegaDestinationEl.disabled = !hathPackUploadEl.checked;
+  hathPackTrashArchiveEl.disabled = !hathPackUploadEl.checked;
+}
+
+function invalidateHathPackPreview() {
+  hathPackPreview = null;
+  hathPackPlanEl.classList.add("hidden");
+  hathPackPlanEl.innerHTML = "";
+  updateHathPackControls();
+}
+
+function hathPackRequest() {
+  return {
+    selected: selectedHathPackNames(),
+    archive_name: hathPackArchiveNameEl.value.trim(),
+    upload: hathPackUploadEl.checked,
+    mega_destination: hathPackMegaDestinationEl.value.trim(),
+    trash_sources: hathPackTrashSourcesEl.checked,
+    trash_archive_after_upload: hathPackTrashArchiveEl.checked,
+  };
+}
+
+async function previewHathPack() {
+  invalidateHathPackPreview();
+  hathPackPreviewBtn.disabled = true;
+  setStatus("Generating H@H archive dry run");
+  const payload = await api("/api/integrations/hath/pack/preview", {
+    method: "POST",
+    body: JSON.stringify(hathPackRequest()),
+  });
+  hathPackPreview = payload;
+  renderHathPackPlan(payload);
+  updateHathPackControls();
+  setStatus(`Dry run ready for ${payload.selected_count || 0} archive sources`);
+}
+
+function renderHathPackPlan(plan) {
+  const request = plan.request || {};
+  hathPackPlanEl.classList.remove("hidden");
+  hathPackPlanEl.innerHTML = `
+    <div class="hath-pack-plan-summary">
+      <span class="hath-badge hath-tone-good">Dry Run</span>
+      <strong>${escapeHtml(request.archive_name || "Archive")}</strong>
+      <span>${escapeHtml(Number(plan.selected_count || 0).toLocaleString())} sources</span>
+      <span>${escapeHtml(Number(plan.input_files || 0).toLocaleString())} files</span>
+      <span>${escapeHtml(formatHathBytes(plan.input_bytes || 0))}</span>
+    </div>
+    <ol>${(plan.actions || []).map((action) => `<li>${escapeHtml(action.message)}</li>`).join("")}</ol>
+  `;
+}
+
+function renderHathPackStatus(payload) {
+  hathPackStatusPayload = payload;
+  const state = String(payload.state || "idle");
+  const states = {
+    idle: { label: "Idle", tone: "neutral" },
+    running: { label: "Running", tone: "active" },
+    succeeded: { label: "Succeeded", tone: "good" },
+    failed: { label: "Failed", tone: "danger" },
+  };
+  const display = states[state] || states.idle;
+  hathPackBadgeEl.textContent = payload.configured ? display.label : "Unavailable";
+  hathPackBadgeEl.className = `hath-badge hath-tone-${payload.configured ? display.tone : "warning"}`;
+
+  if (!payload.configured) {
+    hathPackSummaryEl.textContent = payload.configuration_error || "Remote archive task is not configured";
+  } else if (state === "running") {
+    hathPackSummaryEl.textContent = payload.message || `Running on ${payload.remote_host || "the H@H host"}`;
+  } else if (state === "succeeded") {
+    hathPackSummaryEl.textContent = payload.message || "Archive job completed successfully";
+  } else if (state === "failed") {
+    hathPackSummaryEl.textContent = payload.error || "The remote archive task failed";
+  } else if (!hathPackInventory) {
+    hathPackSummaryEl.textContent = `Ready on ${payload.remote_host || "the H@H host"}`;
+  }
+
+  const timing = [];
+  if (payload.started_at) timing.push(`Started ${formatHathDate(payload.started_at)}`);
+  if (payload.finished_at) timing.push(`Finished ${formatHathDate(payload.finished_at)}`);
+  if (Number.isInteger(payload.exit_code)) timing.push(`Exit ${payload.exit_code}`);
+  if (payload.completed != null && payload.total != null) {
+    timing.push(`${Number(payload.completed).toLocaleString()}/${Number(payload.total).toLocaleString()}`);
+  }
+  hathPackTimingEl.textContent = timing.join(" · ") || "Not run in this server session";
+  const logs = payload.logs || [];
+  hathPackLogEl.textContent = logs.length ? logs.join("\n") : "No archive job has run in this server session.";
+  hathPackLogEl.scrollTop = hathPackLogEl.scrollHeight;
+
+  if (hathPackPollTimer) {
+    clearTimeout(hathPackPollTimer);
+    hathPackPollTimer = null;
+  }
+  if (state === "running") {
+    hathPackPollTimer = setTimeout(() => {
+      loadHathPackStatus().catch((error) => setStatus(error.message, true));
+    }, 2000);
+  }
+  updateHathPackControls();
+}
+
+async function startHathPack() {
+  if (!hathPackPreview) return;
+  const request = hathPackPreview.request || {};
+  const cleanup = [];
+  if (request.trash_sources) cleanup.push("selected sources");
+  if (request.trash_archive_after_upload) cleanup.push("the local archive");
+  if (!confirm(
+    `Run the previewed archive plan?\n\nArchive: ${request.archive_name}\nSources: ${hathPackPreview.selected_count}\nMEGA: ${request.upload ? `${hathPackMegaAccountEl.textContent} · ${request.mega_destination}` : "No upload"}`
+    + (cleanup.length ? `\nCleanup: move ${cleanup.join(" and ")} to recoverable trash` : "")
+  )) {
+    return;
+  }
+  hathPackBtn.disabled = true;
+  setStatus("Starting H@H archive job");
+  const payload = await api("/api/integrations/hath/pack/start", {
+    method: "POST",
+    body: JSON.stringify({ preview_id: hathPackPreview.preview_id }),
+  });
+  hathPackPreview = null;
+  renderHathPackStatus(payload);
+  setStatus("H@H archive job started");
+}
+
+function renderHathStatus(payload) {
+  hathStatusPayload = payload;
+  const clients = payload.clients || [];
+  const downloads = payload.downloads || [];
+  const counts = payload.counts || {};
+  const summary = payload.summary || {};
+  const signals = summary.signals || {};
+  const now = Date.now();
+  const connectedClients = clients.filter((client) => !hathClientIsStale(client, now));
+  const activeDownloads = connectedClients.reduce(
+    (sum, client) => sum + Math.max(0, Number((client.metrics || {}).active_downloads || 0)),
+    0,
+  );
+  const completed = Number(counts.completed || 0);
+  const failed = Number(counts.failed || 0);
+  const lastActivity = newestHathTimestamp(clients, downloads, summary);
+  const downloadedFiles = Number(summary.downloaded_files || 0);
+  const downloadedBytes = Number(summary.downloaded_bytes || 0);
+  const implicitLikes = Number(signals["hath-download"] || 0);
+
+  hathClientCountEl.textContent = connectedClients.length.toLocaleString();
+  hathClientCountEl.title = `${connectedClients.length} of ${clients.length} observers connected`;
+  if (!clients.length) {
+    hathConnectionSummaryEl.textContent = "No observer connected";
+  } else if (connectedClients.length === clients.length) {
+    hathConnectionSummaryEl.textContent = `${connectedClients.length} observer${connectedClients.length === 1 ? "" : "s"} connected`;
+  } else {
+    hathConnectionSummaryEl.textContent = `${connectedClients.length} of ${clients.length} observers connected`;
+  }
+  hathUpdatedAtEl.textContent = `Refreshed ${new Date().toLocaleTimeString()}`;
+  hathSummaryEl.innerHTML = [
+    hathSummaryItem("Connected", `${connectedClients.length}/${clients.length}`, clients.length && connectedClients.length === clients.length ? "good" : connectedClients.length ? "warning" : "neutral"),
+    hathSummaryItem("Active", activeDownloads.toLocaleString(), activeDownloads ? "active" : "neutral"),
+    hathSummaryItem("Completed", completed.toLocaleString(), completed ? "good" : "neutral"),
+    hathSummaryItem("Failed", failed.toLocaleString(), failed ? "danger" : "neutral"),
+    hathSummaryItem("Stored", formatHathBytes(downloadedBytes), downloadedBytes ? "good" : "neutral"),
+    hathSummaryItem("Files", downloadedFiles.toLocaleString(), downloadedFiles ? "good" : "neutral"),
+    hathSummaryItem("Implicit Likes", implicitLikes.toLocaleString(), implicitLikes ? "active" : "neutral"),
+    hathSummaryItem("Last Event", lastActivity ? relativeHathTime(lastActivity, now) : "Never", "neutral"),
+  ].join("");
+
+  hathClientSummaryEl.textContent = clients.length
+    ? `${connectedClients.length} connected, ${clients.length - connectedClients.length} stale`
+    : "No clients";
+  hathClientsEl.innerHTML = clients.length
+    ? clients.map((client) => renderHathClient(client, now)).join("")
+    : '<div class="hath-empty">No H@H observer has connected yet.</div>';
+  renderHathP2p(clients, connectedClients, now);
+  renderHathDownloadList(payload, now);
+}
+
+function hathSummaryItem(label, value, tone) {
+  return `
+    <div class="hath-stat">
+      <span>${escapeHtml(label)}</span>
+      <strong class="hath-tone-${escapeAttr(tone)}">${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function renderHathClient(client, now) {
+  const metrics = client.metrics || {};
+  const statistics = client.statistics || {};
+  const health = hathClientHealth(client, now);
+  const activeCount = Math.max(0, Number(metrics.active_downloads || 0));
+  const currentTitle = client.active_title || (client.active_gid ? `Gallery ${client.active_gid}` : "");
+  const recentServes = Math.max(0, Number(metrics.serve_requests_5m || 0));
+  const current = currentTitle
+    ? `${currentTitle}${client.active_gid ? ` (#${client.active_gid})` : ""}`
+    : activeCount
+      ? `${activeCount} active download${activeCount === 1 ? "" : "s"}`
+      : recentServes
+        ? `Serving cached images · ${recentServes.toLocaleString()} in 5 min`
+        : "Idle";
+  const process = typeof metrics.process_running === "boolean"
+    ? metrics.process_running ? "Running" : "Stopped"
+    : client.status === "offline" ? "Stopped" : "Unknown";
+  const lastSeen = client.last_event_at || client.last_seen_at;
+  const hostname = client.hostname || "Unknown host";
+  const agentVersion = client.agent_version ? `observer ${client.agent_version}` : "observer version unknown";
+  const disk = Number.isFinite(Number(metrics.disk_free_bytes)) ? formatHathBytes(metrics.disk_free_bytes) : "Unknown";
+  const logState = metrics.log_available === true ? "Available" : metrics.log_available === false ? "Unavailable" : "Unknown";
+  const reportedStatus = String(client.status || "unknown").replaceAll("-", " ");
+  const eventType = formatHathEventType(statistics.last_event_type);
+  const eventTime = statistics.last_event_received_at || client.last_event_at;
+  return `
+    <article class="hath-client">
+      <header>
+        <div>
+          <strong>${escapeHtml(client.client_id || "Unnamed client")}</strong>
+          <span>${escapeHtml(hostname)} · ${escapeHtml(agentVersion)}</span>
+        </div>
+        <span class="hath-badge hath-tone-${escapeAttr(health.tone)}">${escapeHtml(health.label)}</span>
+      </header>
+      <div class="hath-current">
+        <span>Current</span>
+        <strong>${escapeHtml(current)}</strong>
+      </div>
+      <dl class="hath-client-metrics">
+        <div><dt>H@H Process</dt><dd>${escapeHtml(process)}</dd></div>
+        <div><dt>Observer State</dt><dd>${escapeHtml(reportedStatus)}</dd></div>
+        <div><dt>Last Heartbeat</dt><dd title="${escapeAttr(formatHathDate(lastSeen))}">${escapeHtml(relativeHathTime(lastSeen, now))}</dd></div>
+        <div><dt>Disk Available</dt><dd>${escapeHtml(disk)}</dd></div>
+        <div><dt>Active</dt><dd>${escapeHtml(activeCount.toLocaleString())}</dd></div>
+        <div><dt>Tracked</dt><dd>${escapeHtml(Number(statistics.tracked_downloads ?? metrics.downloads_seen ?? 0).toLocaleString())}</dd></div>
+        <div><dt>Completed</dt><dd>${escapeHtml(Number(statistics.completed_downloads || 0).toLocaleString())}</dd></div>
+        <div><dt>Failed</dt><dd class="${Number(statistics.failed_downloads || 0) ? "hath-tone-danger" : ""}">${escapeHtml(Number(statistics.failed_downloads || 0).toLocaleString())}</dd></div>
+        <div><dt>Downloaded</dt><dd>${escapeHtml(formatHathBytes(statistics.downloaded_bytes || 0))}</dd></div>
+        <div><dt>Files</dt><dd>${escapeHtml(Number(statistics.downloaded_files || 0).toLocaleString())}</dd></div>
+        <div><dt>Log</dt><dd>${escapeHtml(logState)}</dd></div>
+        <div><dt>Events</dt><dd>${escapeHtml(Number(statistics.event_count || 0).toLocaleString())}</dd></div>
+        <div><dt>Latest Event</dt><dd title="${escapeAttr(formatHathDate(eventTime))}">${escapeHtml(eventType)} · ${escapeHtml(relativeHathTime(eventTime, now))}</dd></div>
+      </dl>
+      ${client.last_error ? `<div class="hath-error">${escapeHtml(client.last_error)}</div>` : ""}
+    </article>
+  `;
+}
+
+function formatHathEventType(value) {
+  const eventType = String(value || "").trim();
+  if (!eventType) return "None";
+  return eventType.split(".").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+
+function hathClientHealth(client, now = Date.now()) {
+  if (hathClientIsStale(client, now)) {
+    return { label: "Stale", tone: "danger" };
+  }
+  const metrics = client.metrics || {};
+  if (metrics.process_running === false || client.status === "offline") {
+    return { label: "H@H stopped", tone: "danger" };
+  }
+  if (String(client.status || "").startsWith("suspended")) {
+    return { label: "Suspended", tone: "warning" };
+  }
+  if (Number(metrics.active_downloads || 0) > 0 || client.active_gid) {
+    return { label: "Downloading", tone: "active" };
+  }
+  if (Number(metrics.serve_requests_5m || 0) > 0) {
+    return { label: "Serving", tone: "active" };
+  }
+  return { label: client.status === "idle" ? "Idle" : "Connected", tone: "good" };
+}
+
+function renderHathP2p(clients, connectedClients, now) {
+  const allMetrics = clients.map((client) => client.metrics || {});
+  const liveMetrics = connectedClients.map((client) => client.metrics || {});
+  const totalRequests = sumHathMetric(allMetrics, "serve_requests_total");
+  const totalBytes = sumHathMetric(allMetrics, "serve_bytes_total");
+  const totalSuccesses = sumHathMetric(allMetrics, "serve_successes_total");
+  const requests5m = sumHathMetric(liveMetrics, "serve_requests_5m");
+  const bytes5m = sumHathMetric(liveMetrics, "serve_bytes_5m");
+  const requests1h = sumHathMetric(liveMetrics, "serve_requests_1h");
+  const bytes1h = sumHathMetric(liveMetrics, "serve_bytes_1h");
+  const errorsTotal = Math.max(0, totalRequests - totalSuccesses);
+  const successRate = totalRequests ? totalSuccesses / totalRequests * 100 : null;
+  const activeServers = connectedClients.filter((client) => Number((client.metrics || {}).serve_requests_5m || 0) > 0).length;
+
+  hathP2pSummaryEl.textContent = clients.length
+    ? `${activeServers} serving recently · ${formatHathBytes(bytes1h)} in the last hour`
+    : "No serving telemetry";
+  hathP2pOverviewEl.innerHTML = [
+    hathSummaryItem("Requests · 5 min", requests5m.toLocaleString(), requests5m ? "active" : "neutral"),
+    hathSummaryItem("Traffic · 5 min", formatHathBytes(bytes5m), bytes5m ? "active" : "neutral"),
+    hathSummaryItem("Average · 5 min", formatHathRate(bytes5m / 300), bytes5m ? "good" : "neutral"),
+    hathSummaryItem("Requests · 1 hour", requests1h.toLocaleString(), requests1h ? "good" : "neutral"),
+    hathSummaryItem("Traffic · 1 hour", formatHathBytes(bytes1h), bytes1h ? "good" : "neutral"),
+    hathSummaryItem("Requests · total", totalRequests.toLocaleString(), totalRequests ? "good" : "neutral"),
+    hathSummaryItem("Traffic · total", formatHathBytes(totalBytes), totalBytes ? "good" : "neutral"),
+    hathSummaryItem("Success", successRate == null ? "No data" : `${successRate.toFixed(2)}%`, errorsTotal ? "warning" : totalRequests ? "good" : "neutral"),
+  ].join("");
+  hathP2pClientsEl.innerHTML = clients.length
+    ? clients.map((client) => renderHathP2pClient(client, now)).join("")
+    : '<div class="hath-empty">No H@H serving telemetry has been reported.</div>';
+}
+
+function renderHathP2pClient(client, now) {
+  const metrics = client.metrics || {};
+  const totalRequests = Math.max(0, Number(metrics.serve_requests_total || 0));
+  const totalSuccesses = Math.max(0, Number(metrics.serve_successes_total || 0));
+  const successRate = totalRequests ? totalSuccesses / totalRequests * 100 : null;
+  const cacheSize = Math.max(0, Number(metrics.cache_size_bytes || 0));
+  const cacheOverhead = Math.max(cacheSize, Number(metrics.cache_size_with_overhead_bytes || 0));
+  const cacheLimit = Math.max(0, Number(metrics.cache_limit_bytes || 0));
+  const cachePercent = cacheLimit ? Math.max(0, Math.min(100, cacheOverhead / cacheLimit * 100)) : 0;
+  const jvmTotal = Math.max(0, Number(metrics.jvm_memory_total_bytes || 0));
+  const jvmFree = Math.max(0, Number(metrics.jvm_memory_free_bytes || 0));
+  const jvmUsed = Math.max(0, jvmTotal - jvmFree);
+  const jvmMax = Math.max(0, Number(metrics.jvm_memory_max_bytes || 0));
+  const requests1h = Math.max(0, Number(metrics.serve_requests_1h || 0));
+  const bytes1h = Math.max(0, Number(metrics.serve_bytes_1h || 0));
+  const lastServe = metrics.last_serve_at;
+  const isStale = hathClientIsStale(client, now);
+  const serving = !isStale && Number(metrics.serve_requests_5m || 0) > 0;
+  const stateLabel = isStale ? "Telemetry stale" : serving ? "Serving now" : "Ready";
+  const stateTone = isStale ? "danger" : serving ? "active" : "good";
+  return `
+    <article class="hath-p2p-client">
+      <header>
+        <div>
+          <strong>${escapeHtml(client.client_id || "Unnamed client")}</strong>
+          <span>${lastServe ? `Last served ${escapeHtml(relativeHathTime(lastServe, now))}` : "No image request observed"}</span>
+        </div>
+        <span class="hath-badge hath-tone-${stateTone}">${stateLabel}</span>
+      </header>
+      <div class="hath-p2p-metrics">
+        <div><span>Requests · 1 hour</span><strong>${requests1h.toLocaleString()}</strong></div>
+        <div><span>Traffic · 1 hour</span><strong>${escapeHtml(formatHathBytes(bytes1h))}</strong></div>
+        <div><span>Average · 1 hour</span><strong>${escapeHtml(formatHathRate(bytes1h / 3600))}</strong></div>
+        <div><span>Requests · total</span><strong>${totalRequests.toLocaleString()}</strong></div>
+        <div><span>Traffic · total</span><strong>${escapeHtml(formatHathBytes(metrics.serve_bytes_total || 0))}</strong></div>
+        <div><span>Success</span><strong>${successRate == null ? "No data" : `${successRate.toFixed(2)}%`}</strong></div>
+        <div><span>Proxy tests</span><strong>${Math.max(0, Number(metrics.proxy_tests_total || 0)).toLocaleString()}</strong></div>
+        <div><span>Handshake stops · 1 hour</span><strong class="${Number(metrics.handshake_interrupts_1h || 0) ? "hath-tone-warning" : ""}">${Math.max(0, Number(metrics.handshake_interrupts_1h || 0)).toLocaleString()}</strong></div>
+        <div><span>H@H uptime</span><strong>${escapeHtml(formatHathDuration(metrics.process_uptime_seconds))}</strong></div>
+      </div>
+      <div class="hath-resource-bars">
+        ${hathResourceBar("Cache", cacheOverhead, cacheLimit, cachePercent, `${formatHathBytes(cacheSize)} data · ${formatHathBytes(metrics.cache_free_bytes || 0)} free`)}
+        ${hathResourceBar("JVM memory", jvmUsed, jvmMax, jvmMax ? Math.max(0, Math.min(100, jvmUsed / jvmMax * 100)) : 0, `${formatHathBytes(jvmUsed)} used · ${formatHathBytes(jvmMax)} max`)}
+      </div>
+      <span class="hath-metrics-since">Observed since ${escapeHtml(formatHathDate(metrics.metrics_started_at))}</span>
+    </article>
+  `;
+}
+
+function hathResourceBar(label, value, maximum, percent, detail) {
+  const hasLimit = Number(maximum) > 0;
+  return `
+    <div class="hath-resource-bar">
+      <div><span>${escapeHtml(label)}</span><strong>${hasLimit ? `${percent.toFixed(1)}%` : "Unknown"}</strong></div>
+      <progress max="100" value="${hasLimit ? percent : 0}" aria-label="${escapeAttr(label)} utilization"></progress>
+      <span>${escapeHtml(hasLimit ? detail : "Not reported")}</span>
+    </div>
+  `;
+}
+
+function sumHathMetric(metrics, key) {
+  return metrics.reduce((sum, item) => sum + Math.max(0, Number(item[key] || 0)), 0);
+}
+
+function formatHathRate(bytesPerSecond) {
+  return `${formatHathBytes(Math.max(0, Number(bytesPerSecond || 0)))}/s`;
+}
+
+function formatHathDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "Unknown";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor(seconds % 86400 / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function hathClientIsStale(client, now = Date.now()) {
+  const timestamp = parseHathTimestamp(client.last_event_at || client.last_seen_at);
+  return !timestamp || now - timestamp > hathStaleAfterMs;
+}
+
+function renderHathDownloadList(payload, now = Date.now()) {
+  const downloads = payload.downloads || [];
+  const summary = payload.summary || {};
+  const filter = hathDownloadFilterEl.value;
+  const query = hathDownloadSearchEl.value.trim().toLocaleLowerCase();
+  const filtered = downloads.filter((download) => {
+    const status = String(download.status || "discovered");
+    const statusMatches = filter === "all"
+      || filter === status
+      || (filter === "active" && (status === "discovered" || status === "downloading"));
+    if (!statusMatches) return false;
+    if (!query) return true;
+    const haystack = [
+      download.gallery_title,
+      download.title,
+      download.gid,
+      download.directory_name,
+      download.client_id,
+      download.category,
+      download.uploader,
+    ].filter(Boolean).join(" ").toLocaleLowerCase();
+    return haystack.includes(query);
+  });
+  const totalDownloads = Number(summary.tracked_downloads
+    ?? Object.values(payload.counts || {}).reduce((sum, value) => sum + Number(value || 0), 0));
+  const linked = Number(summary.linked_downloads || 0);
+  const scope = filtered.length === downloads.length ? `${downloads.length} shown` : `${filtered.length} of ${downloads.length} shown`;
+  hathDownloadSummaryEl.textContent = totalDownloads
+    ? `${totalDownloads.toLocaleString()} tracked · ${linked.toLocaleString()} linked · ${scope}`
+    : "No downloads";
+  hathDownloadsEl.innerHTML = filtered.length
+    ? renderHathDownloads(filtered, now)
+    : `<div class="hath-empty">${downloads.length ? "No downloads match the current filter." : "No download activity has been reported."}</div>`;
+}
+
+function renderHathDownloads(downloads, now) {
+  const rows = downloads.map((download) => {
+    const status = String(download.status || "discovered");
+    const tone = status === "completed" ? "good" : status === "failed" ? "danger" : status === "downloading" ? "active" : "neutral";
+    const title = download.gallery_title || download.title || `Gallery ${download.gid || "unknown"}`;
+    const resolution = download.resolution === "org" ? "Original" : download.resolution ? `${download.resolution}px` : "Unknown";
+    const downloadedFiles = Math.max(0, Number(download.downloaded_files || 0));
+    const totalFiles = Number(download.total_files);
+    const progress = Number.isFinite(totalFiles) && totalFiles > 0
+      ? `${downloadedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
+      : `${downloadedFiles.toLocaleString()} files`;
+    const progressValue = Number.isFinite(totalFiles) && totalFiles > 0
+      ? Math.max(0, Math.min(100, downloadedFiles / totalFiles * 100))
+      : null;
+    const titleMarkup = download.gallery_url
+      ? `<a href="${escapeAttr(download.gallery_url)}" target="_blank" rel="noreferrer">${escapeHtml(title)}</a>`
+      : `<strong>${escapeHtml(title)}</strong>`;
+    const galleryMeta = [
+      download.category,
+      download.uploader ? `by ${download.uploader}` : "",
+      Number(download.page_count) > 0 ? `${Number(download.page_count).toLocaleString()} pages` : "",
+      download.rating != null && Number.isFinite(Number(download.rating)) ? `rating ${Number(download.rating).toFixed(2)}` : "",
+    ].filter(Boolean).join(" · ");
+    const directory = download.directory_name
+      ? `<span class="hath-directory" title="${escapeAttr(download.directory_name)}">${escapeHtml(download.directory_name)}</span>`
+      : "";
+    const signal = hathDownloadSignal(download);
+    const error = download.last_error ? `<span class="hath-row-error">${escapeHtml(download.last_error)}</span>` : "";
+    const activityAt = download.completed_at || download.failed_at || download.started_at || download.updated_at;
+    const activityLabel = download.completed_at ? "Completed" : download.failed_at ? "Failed" : download.started_at ? "Started" : "Updated";
+    return `
+      <tr>
+        <td><span class="hath-badge hath-tone-${escapeAttr(tone)}">${escapeHtml(status)}</span></td>
+        <td class="hath-gallery-cell">
+          ${titleMarkup}
+          <span>gid ${escapeHtml(download.gid || "-")} · ${escapeHtml(resolution)}${galleryMeta ? ` · ${escapeHtml(galleryMeta)}` : ""}</span>
+          ${directory}${error}
+        </td>
+        <td><span class="hath-badge hath-tone-${escapeAttr(signal.tone)}">${escapeHtml(signal.label)}</span></td>
+        <td class="hath-progress-cell">
+          <span>${escapeHtml(progress)}</span>
+          ${progressValue == null ? "" : `<progress max="100" value="${escapeAttr(progressValue.toFixed(2))}"></progress>`}
+        </td>
+        <td>${escapeHtml(formatHathBytes(download.downloaded_bytes || 0))}</td>
+        <td>${escapeHtml(download.client_id || "-")}</td>
+        <td class="hath-time-cell">
+          <span title="${escapeAttr(formatHathDate(activityAt))}">${escapeHtml(activityLabel)} ${escapeHtml(relativeHathTime(activityAt, now))}</span>
+          <span title="${escapeAttr(formatHathDate(download.updated_at))}">Updated ${escapeHtml(relativeHathTime(download.updated_at, now))}</span>
+        </td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <div class="hath-table-wrap">
+      <table class="hath-table">
+        <thead><tr><th>Status</th><th>Gallery</th><th>Signal</th><th>Progress</th><th>Size</th><th>Client</th><th>Activity</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function hathDownloadSignal(download) {
+  const signal = String(download.recommendation_signal || "");
+  if (signal === "favorite") return { label: "Favorite", tone: "good" };
+  if (signal === "ban") return { label: "Ban", tone: "danger" };
+  if (signal === "positive-vote") {
+    return download.feedback_score != null
+      ? { label: `Score ${download.feedback_score}`, tone: "good" }
+      : { label: "Thumbs up", tone: "good" };
+  }
+  if (signal === "negative-vote") {
+    return download.feedback_score != null
+      ? { label: `Score ${download.feedback_score}`, tone: "danger" }
+      : { label: "Thumbs down", tone: "danger" };
+  }
+  if (signal === "hath-download") return { label: "Implicit like", tone: "active" };
+  return { label: "None", tone: "neutral" };
+}
+
+function newestHathTimestamp(clients, downloads, summary = {}) {
+  const timestamps = [
+    ...clients.map((client) => client.last_event_at || client.last_seen_at),
+    ...downloads.map((download) => download.updated_at),
+    summary.last_event_received_at,
+    summary.last_download_at,
+  ].map(parseHathTimestamp).filter(Boolean);
+  return timestamps.length ? Math.max(...timestamps) : null;
+}
+
+function parseHathTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+  const text = String(value).trim();
+  const normalized = /(?:Z|[+-]\d\d:\d\d)$/.test(text) ? text : `${text.replace(" ", "T")}Z`;
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function relativeHathTime(value, now = Date.now()) {
+  const timestamp = typeof value === "number" ? value : parseHathTimestamp(value);
+  if (!timestamp) {
+    return "Unknown";
+  }
+  const seconds = Math.max(0, Math.round((now - timestamp) / 1000));
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function formatHathDate(value) {
+  const timestamp = parseHathTimestamp(value);
+  return timestamp ? new Date(timestamp).toLocaleString() : "Unknown";
+}
+
+function formatHathBytes(value) {
+  let size = Math.max(0, Number(value || 0));
+  if (!Number.isFinite(size)) {
+    return "Unknown";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const precision = unit === 0 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(precision)} ${units[unit]}`;
 }
 
 async function loadReactionHistory(offset = 0, append = false) {
@@ -691,7 +1451,7 @@ async function loadRecommendations(offset = 0, append = false) {
   const includeRated = currentView === "preview" ? "1" : "0";
   const freshnessWeight = currentView === "preview" ? previewFreshnessWeightEl.value || "8" : "1";
   const postedAfter = currentView === "preview" ? previewPostedAfterEl.value || "" : "";
-  const bootstrapExploreCount = currentView === "review" ? "6" : "0";
+  const bootstrapExploreCount = "0";
   const requireBootstrapMatch = currentView === "review" && reviewRequireBootstrapMatchEl.checked ? "1" : "0";
   const languageFilter = languageFilterEl.value.trim();
   const modelMode = modelModeEl.value || "hybrid";
@@ -702,6 +1462,7 @@ async function loadRecommendations(offset = 0, append = false) {
     `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
   applyGalleryPage(payload, append);
+  recordPageImpressions(payload, currentView === "preview" ? "preview" : "review", offset);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
 
@@ -851,9 +1612,11 @@ async function vote(galleryUrl, voteValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         vote: voteValue,
+        reason_code: voteValue < 0 ? optionalNegativeReason(galleryUrl) : null,
+        surface: currentView,
         view: currentView,
         include_rated: false,
-        enrich_feedback: false,
+        enrich_feedback: true,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
@@ -871,9 +1634,11 @@ async function score(galleryUrl, scoreValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: scoreValue,
+        reason_code: scoreValue < 3 ? optionalNegativeReason(galleryUrl) : null,
+        surface: currentView,
         view: currentView,
         include_rated: false,
-        enrich_feedback: false,
+        enrich_feedback: true,
         require_bootstrap_match: reviewRequireBootstrapMatchEl.checked,
         filter_text: localFilterEl.value.trim(),
       }),
@@ -891,6 +1656,7 @@ async function skip(galleryUrl) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: 3,
+        surface: currentView,
         view: currentView,
         include_rated: false,
         enrich_feedback: false,
@@ -968,6 +1734,92 @@ async function applyFeedbackResult(payload) {
   refreshQueueCounts();
 }
 
+async function copyContinuingFeedback(galleryUrl) {
+  await withPendingFeedback(galleryUrl, async () => {
+    setStatus("Copying previous series rating");
+    const payload = await api("/api/feedback/copy-continuing", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyGalleryPage(payload);
+    refreshQueueCounts();
+    setStatus(`Copied ${feedbackLabel(payload.copied_from)} from previous ${payload.copied_from.is_parent ? "parent" : "series version"}`);
+  });
+}
+
+async function classifyGallery(galleryUrl, classification) {
+  await withPendingFeedback(galleryUrl, async () => {
+    const label = classification === "updates" ? "Updates" : classification === "review" ? "Review" : "Auto";
+    setStatus(`Classifying gallery as ${label}`);
+    const payload = await api("/api/classification", {
+      method: "POST",
+      body: JSON.stringify({
+        gallery_url: galleryUrl,
+        classification,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyGalleryPage(currentView === "continuing-updates" ? payload.updates : payload.review);
+    refreshQueueCounts();
+    setStatus(`Classification saved as ${label}`);
+  });
+}
+
+function feedbackLabel(feedback) {
+  if (feedback && Number.isFinite(Number(feedback.user_score))) {
+    return `score ${Number(feedback.user_score)}`;
+  }
+  const vote = Number(feedback && feedback.user_vote);
+  return vote > 0 ? "upvote" : vote < 0 ? "downvote" : "rating";
+}
+
+function optionalNegativeReason(galleryUrl) {
+  const select = recommendationsEl.querySelector(`select[data-reason-for="${CSS.escape(galleryUrl)}"]`);
+  return select && select.value ? select.value : null;
+}
+
+async function loadDiscovery(offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const languageFilter = languageFilterEl.value.trim();
+  const payload = await api(
+    `/api/discovery?language_filter=${encodeURIComponent(languageFilter)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  recordPageImpressions(payload, "discovery", offset);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
+function recordPageImpressions(payload, surface, offset = 0) {
+  if (!payload.request_id || !Array.isArray(payload.items) || !payload.items.length) {
+    return;
+  }
+  api("/api/impressions", {
+    method: "POST",
+    body: JSON.stringify({
+      request_id: payload.request_id,
+      surface,
+      items: payload.items.map((item, index) => ({
+        gallery_url: item.url,
+        position: offset + index,
+        model_version: item.model_version,
+        like_probability: item.like_probability,
+      })),
+    }),
+  }).catch(() => null);
+}
+
+async function loadContinuingUpdates(offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const payload = await api(
+    `/api/continuing-updates?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
 async function showModel() {
   const payload = await api("/api/model");
   dialogTitle.textContent = "Learned Model";
@@ -1008,7 +1860,7 @@ async function resetLibrary() {
     body: JSON.stringify({}),
   });
   applyGalleryPage(payload);
-  renderQueueCounts({ review: 0, short_repeats: 0 });
+  renderQueueCounts({ review: 0, continuing_updates: 0, short_repeats: 0 });
   await loadStatus();
   refreshQueueCounts();
   const removed = payload.removed || {};
@@ -1109,6 +1961,9 @@ function renderParentChain(item) {
   }
   const links = entries
     .map((entry) => {
+      if (entry.omitted) {
+        return `<span class="chain-omitted">${Number(entry.omitted)} older ${Number(entry.omitted) === 1 ? "version" : "versions"} omitted</span>`;
+      }
       const title = entry.title || entry.url || "Parent gallery";
       const label = entry.known ? title : `Unknown parent ${entry.url}`;
       return entry.url
@@ -1174,6 +2029,29 @@ function renderGalleryCards(items, append = false) {
     const detailStatus = item.detail_fetched_at ? "Full metadata" : "List metadata";
     const uploader = item.uploader ? `Uploader ${item.uploader}` : "Uploader unknown";
     const postedAt = item.posted_at ? `Posted ${item.posted_at}` : "";
+    const continuingSeries = item.continuing_series || null;
+    const continuingMeta = continuingSeries
+      ? `<div class="meta">Continuing series · ${Number(continuingSeries.version_count || 1)} stored versions · ${escapeHtml(continuingSeries.reason || "cumulative updates")}</div>`
+      : "";
+    const previousFeedback = item.previous_feedback || null;
+    const copyPreviousFeedback = currentView === "continuing-updates" && previousFeedback && !hasFeedback
+      ? `<div class="copy-feedback">
+          <span>Previous ${previousFeedback.is_parent ? "parent" : "series version"}: ${escapeHtml(previousFeedback.title || previousFeedback.url)} · ${escapeHtml(feedbackLabel(previousFeedback))}</span>
+          <button class="up" type="button" data-copy-continuing="1" data-url="${escapeAttr(item.url)}" title="Apply this previous rating to the current update. You can still rate it manually instead.">Copy ${escapeHtml(feedbackLabel(previousFeedback))}</button>
+        </div>`
+      : "";
+    const classificationOverride = item.classification_override || null;
+    const classificationPrediction = item.classification_prediction || null;
+    const classificationMeta = classificationOverride
+      ? `<div class="meta">Manual classification: ${escapeHtml(classificationOverride === "updates" ? "Updates" : "Review")}</div>`
+      : classificationPrediction
+        ? `<div class="meta">Learned classification: ${escapeHtml(classificationPrediction.classification)} · ${Math.round(Number(classificationPrediction.confidence || 0) * 100)}% confidence</div>`
+        : "";
+    const classificationActions = currentView === "review"
+      ? `<div class="card-actions"><button class="clear" type="button" data-classification="updates" data-url="${escapeAttr(item.url)}" title="This gallery is a continuing update and should be shown in Updates.">Mark as Updates</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
+      : currentView === "continuing-updates"
+        ? `<div class="card-actions"><button class="clear" type="button" data-classification="review" data-url="${escapeAttr(item.url)}" title="This is a normal gallery and should be shown in Review.">Move to Review</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
+        : "";
     const reactionAt = item.feedback_created_at ? `Reacted ${item.feedback_created_at}` : "";
     const markAt = item.mark_updated_at ? `Bookmarked ${item.mark_updated_at}` : "";
     const clearButton = hasFeedback && mode !== "preview"
@@ -1203,6 +2081,20 @@ function renderGalleryCards(items, append = false) {
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
           <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal for this gallery.">Thumb up</button>
         </div>
+        <label class="feedback-reason">
+          <span>Why not?</span>
+          <select data-reason-for="${escapeAttr(item.url)}" aria-label="Optional negative feedback reason">
+            <option value="">Optional reason</option>
+            <option value="visual_style">Visual style</option>
+            <option value="content_tags">Content or tags</option>
+            <option value="creator_character">Creator or character</option>
+            <option value="quality">Quality</option>
+            <option value="gallery_too_small">Gallery too small</option>
+            <option value="too_few_relevant_images">Too few relevant images</option>
+            <option value="duplicate_update">Duplicate or update</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
         <div class="scorebar" aria-label="Score">
           ${[1, 2, 3, 4, 5]
             .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))}">${value}</button>`)
@@ -1219,9 +2111,13 @@ function renderGalleryCards(items, append = false) {
       </div>
       <div class="body">
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
-        <div class="meta">${escapeHtml(item.category || "Unknown")} · score ${item.score}${escapeHtml(pageCount)}</div>
+        <div class="meta">${escapeHtml(item.category || "Unknown")} · ${Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}</div>
+        ${Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
+        ${continuingMeta}
+        ${copyPreviousFeedback}
+        ${classificationMeta}
         <div class="meta">${escapeHtml(userFeedback)}</div>
         ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
@@ -1230,6 +2126,7 @@ function renderGalleryCards(items, append = false) {
         <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
         ${relatedFeedback}
+        ${classificationActions}
         ${feedbackControls}
       </div>
     `;
@@ -1280,6 +2177,8 @@ function feedbackStatusMessage(base, payload) {
   const enrichment = payload.feedback_enrichment || {};
   if (enrichment.status === "success") {
     details.push("full metadata learned");
+  } else if (enrichment.status === "queued") {
+    details.push("detail queued");
   } else if (enrichment.status === "failed") {
     details.push("detail fetch failed");
   }
@@ -1684,6 +2583,63 @@ document.querySelector("#retrainBtn").addEventListener("click", () => retrain().
 document.querySelector("#exportBtn").addEventListener("click", () => exportPreferences().catch((error) => setStatus(error.message, true)));
 document.querySelector("#importBtn").addEventListener("click", () => importFileEl.click());
 document.querySelector("#resetBtn").addEventListener("click", () => resetLibrary().catch((error) => setStatus(error.message, true)));
+hathRefreshBtn.addEventListener("click", () => loadHathStatus().catch((error) => setStatus(error.message, true)));
+hathPackBtn.addEventListener("click", () => startHathPack().catch((error) => {
+  setStatus(error.message, true);
+  updateHathPackControls();
+  loadHathPackStatus().catch(() => {});
+}));
+hathPackPreviewBtn.addEventListener("click", () => previewHathPack().catch((error) => {
+  setStatus(error.message, true);
+  updateHathPackControls();
+}));
+hathPackRefreshBtn.addEventListener("click", () => loadHathPackInventory().catch((error) => setStatus(error.message, true)));
+hathPackSelectAllBtn.addEventListener("click", () => {
+  for (const input of hathPackCandidatesEl.querySelectorAll("input[data-hath-pack-source]:not(:disabled)")) {
+    input.checked = true;
+  }
+  invalidateHathPackPreview();
+  updateHathPackSelection();
+});
+hathPackSelectNoneBtn.addEventListener("click", () => {
+  for (const input of hathPackCandidatesEl.querySelectorAll("input[data-hath-pack-source]")) {
+    input.checked = false;
+  }
+  invalidateHathPackPreview();
+  updateHathPackSelection();
+});
+hathPackCandidatesEl.addEventListener("change", (event) => {
+  if (!event.target.matches("input[data-hath-pack-source]")) return;
+  invalidateHathPackPreview();
+  updateHathPackSelection();
+});
+for (const element of [
+  hathPackArchiveNameEl,
+  hathPackMegaDestinationEl,
+  hathPackUploadEl,
+  hathPackTrashSourcesEl,
+  hathPackTrashArchiveEl,
+]) {
+  element.addEventListener("change", () => {
+    if (!hathPackUploadEl.checked) {
+      hathPackTrashArchiveEl.checked = false;
+    }
+    invalidateHathPackPreview();
+    updateHathPackControls();
+  });
+}
+for (const element of [hathPackArchiveNameEl, hathPackMegaDestinationEl]) {
+  element.addEventListener("input", () => {
+    invalidateHathPackPreview();
+    updateHathPackControls();
+  });
+}
+hathDownloadSearchEl.addEventListener("input", () => {
+  if (hathStatusPayload) renderHathDownloadList(hathStatusPayload);
+});
+hathDownloadFilterEl.addEventListener("change", () => {
+  if (hathStatusPayload) renderHathDownloadList(hathStatusPayload);
+});
 loadMoreBtn.addEventListener("click", () => {
   if (!hasMoreRecommendations) return;
   loadCurrentPage(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
@@ -1720,6 +2676,16 @@ recommendationsEl.addEventListener("click", (event) => {
     score(scoreButton.dataset.url, Number(scoreButton.dataset.score)).catch((error) => setStatus(error.message, true));
     return;
   }
+  const copyContinuingButton = event.target.closest("button[data-copy-continuing]");
+  if (copyContinuingButton) {
+    copyContinuingFeedback(copyContinuingButton.dataset.url).catch((error) => setStatus(error.message, true));
+    return;
+  }
+  const classificationButton = event.target.closest("button[data-classification]");
+  if (classificationButton) {
+    classifyGallery(classificationButton.dataset.url, classificationButton.dataset.classification).catch((error) => setStatus(error.message, true));
+    return;
+  }
   const skipButton = event.target.closest("button[data-skip]");
   if (skipButton) {
     skip(skipButton.dataset.url).catch((error) => setStatus(error.message, true));
@@ -1754,11 +2720,15 @@ loadSettings()
   .then(async () => {
     setActiveView(currentView);
     const counts = loadQueueCounts();
+    const hathStatus = loadHathStatus({ announce: false }).catch(() => null);
     await loadCurrentPage();
-    await counts;
+    await Promise.all([counts, hathStatus]);
   })
   .catch((error) => setStatus(error.message, true));
 
 setInterval(() => {
   loadStatus().catch(() => {});
+  if (currentView === "hath") {
+    loadHathStatus({ announce: false }).catch(() => {});
+  }
 }, 10000);
