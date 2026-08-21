@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ExHentai Recommender</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260818-2">
+    <link rel="stylesheet" href="/static/styles.css?v=20260821-1">
   </head>
   <body>
     <header class="topbar">
@@ -80,6 +80,10 @@
           <label>
             Ban pause
             <input id="banPause" type="number" min="0" max="600" step="5" value="90">
+          </label>
+          <label>
+            Download signal
+            <input id="hathDownloadSignalWeight" type="number" min="0" max="2" step="0.05" value="1.25">
           </label>
           <label>
             Minutes
@@ -251,11 +255,18 @@
                 MEGA destination
                 <input id="hathPackMegaDestination" type="text" maxlength="500" value="/H@H Archives" autocomplete="off">
               </label>
+              <label>
+                Cleanup method
+                <select id="hathPackCleanupMode">
+                  <option value="trash">Move to recoverable trash</option>
+                  <option value="delete">Permanently delete</option>
+                </select>
+              </label>
             </div>
             <div class="hath-pack-toggles">
               <label class="check inline"><input id="hathPackUpload" type="checkbox" checked> Upload to MEGA</label>
-              <label class="check inline"><input id="hathPackTrashSources" type="checkbox"> Trash selected sources after success</label>
-              <label class="check inline"><input id="hathPackTrashArchive" type="checkbox"> Trash local archive after upload</label>
+              <label class="check inline"><input id="hathPackTrashSources" type="checkbox"> Clean up selected sources after success</label>
+              <label class="check inline"><input id="hathPackTrashArchive" type="checkbox"> Clean up local archive after upload</label>
             </div>
             <div class="hath-pack-selection-heading">
               <div>
@@ -280,6 +291,26 @@
               <span id="hathPackTiming"></span>
             </div>
             <pre id="hathPackLog" class="hath-pack-log" aria-live="polite">No archive job has run in this server session.</pre>
+            <div class="hath-trash-section">
+              <div class="hath-pack-selection-heading">
+                <div>
+                  <strong>Recoverable Trash</strong>
+                  <span id="hathTrashSummary">No trash inventory loaded</span>
+                </div>
+                <div>
+                  <button id="hathTrashSelectAllBtn" type="button">Select all</button>
+                  <button id="hathTrashSelectNoneBtn" type="button">Clear</button>
+                </div>
+              </div>
+              <div id="hathTrashCandidates" class="hath-pack-candidates hath-trash-candidates">
+                <div class="hath-empty">Loading recoverable trash.</div>
+              </div>
+              <div class="hath-pack-actions">
+                <button id="hathTrashPreviewBtn" type="button" disabled>Dry Run</button>
+                <button id="hathTrashDeleteBtn" class="danger" type="button" disabled>Permanently Delete</button>
+              </div>
+              <div id="hathTrashPlan" class="hath-pack-plan hidden"></div>
+            </div>
           </section>
           <section class="hath-section">
             <div class="hath-section-heading hath-download-heading">
@@ -313,6 +344,6 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js?v=20260818-2"></script>
+    <script src="/static/app.js?v=20260821-1"></script>
   </body>
 </html>

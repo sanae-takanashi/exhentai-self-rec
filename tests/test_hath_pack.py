@@ -51,6 +51,19 @@ class HathPackTest(unittest.TestCase):
                 "arbitrary-command",
             )
 
+    def test_ssh_command_supports_trash_operations(self):
+        command = build_pack_ssh_command(
+            {
+                "ssh_executable": "ssh.exe",
+                "ssh_config": "config",
+                "ssh_host": "host",
+                "remote_helper": "/helper.py",
+            },
+            "trash-run",
+        )
+
+        self.assertEqual(command[-1], "/usr/bin/python3 /helper.py trash-run")
+
     def test_unconfigured_runner_reports_missing_configuration(self):
         with patch.dict("os.environ", {}, clear=True):
             status = HathPackRunner().status()
@@ -118,6 +131,59 @@ class HathPackTest(unittest.TestCase):
 
         with self.assertRaisesRegex(HathPackConflict, "Preview is missing or stale"):
             runner.start("missing")
+
+    def test_runner_binds_trash_preview_to_trash_run(self):
+        request = {"selected": ["job-one"]}
+        plan = {
+            "schema": "hath-archive-v1",
+            "kind": "trash-delete",
+            "request": request,
+            "selected_count": 1,
+            "input_bytes": 100,
+            "input_files": 2,
+            "actions": [],
+        }
+
+        class FakeProcess:
+            stdin = io.StringIO()
+            stdout = iter(
+                [
+                    json.dumps(
+                        {
+                            "event": "result",
+                            "state": "succeeded",
+                            "message": "Trash deleted",
+                            "result": {"freed_bytes": 100},
+                        }
+                    )
+                    + "\n"
+                ]
+            )
+
+            @staticmethod
+            def wait():
+                return 0
+
+        environment = {
+            "EXH_REC_HATH_SSH_EXECUTABLE": "ssh.exe",
+            "EXH_REC_HATH_SSH_CONFIG": "config",
+            "EXH_REC_HATH_SSH_HOST": "host",
+        }
+        runner = HathPackRunner()
+        with patch.dict("os.environ", environment, clear=True), patch(
+            "exh_rec.hath_pack.run_remote_json", return_value=plan
+        ) as remote, patch(
+            "exh_rec.hath_pack.subprocess.Popen", return_value=FakeProcess()
+        ) as popen:
+            preview = runner.preview_trash(request)
+            runner.start(preview["preview_id"])
+            deadline = time.monotonic() + 1
+            while runner.status()["state"] == "running" and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        remote.assert_called_once_with("trash-plan", request)
+        self.assertTrue(popen.call_args.args[0][-1].endswith("archive.py trash-run"))
+        self.assertEqual(runner.status()["result"], {"freed_bytes": 100})
 
 
 if __name__ == "__main__":

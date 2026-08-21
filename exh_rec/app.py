@@ -44,6 +44,7 @@ from .net import (
 )
 from .hath import HathPayloadError, hath_status, ingest_event_batch
 from .hath_pack import HATH_PACK_RUNNER, HathPackConflict, HathPackError
+from .personalized import hath_download_signal_weight
 from .recommender import (
     clear_feedback,
     clear_gallery_mark,
@@ -112,6 +113,9 @@ FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
 FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
 FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
 FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
+QUEUE_COUNTS_CACHE_LOCK = threading.Lock()
+QUEUE_COUNTS_CACHE_TTL_SECONDS = 5.0
+QUEUE_COUNTS_CACHE: dict[str, tuple[tuple, float, dict[str, int]]] = {}
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
@@ -325,6 +329,23 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(HATH_PACK_RUNNER.preview(payload))
                 except HathPackError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+            elif path == "/api/integrations/hath/trash/start":
+                payload = self.read_json()
+                try:
+                    self.send_json(
+                        HATH_PACK_RUNNER.start(payload.get("preview_id")),
+                        status=HTTPStatus.ACCEPTED,
+                    )
+                except HathPackConflict as exc:
+                    raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+                except HathPackError as exc:
+                    raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, str(exc)) from exc
+            elif path == "/api/integrations/hath/trash/preview":
+                payload = self.read_json()
+                try:
+                    self.send_json(HATH_PACK_RUNNER.preview_trash(payload))
+                except HathPackError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
             elif path == "/api/fetch":
                 payload = self.read_json()
                 result = fetch_and_store(
@@ -386,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
                 require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn)
+                    before_model = model_snapshot(conn, train_if_needed=False)
                     before_signature = model_signature(conn)
                     update_started = time.perf_counter()
                     log_feedback_received("record", gallery_url, vote=vote, score=score)
@@ -449,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                 require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn)
+                    before_model = model_snapshot(conn, train_if_needed=False)
                     before_signature = model_signature(conn)
                     update_started = time.perf_counter()
                     record_gallery_mark(conn, gallery_url, kind=kind, note=payload.get("note"))
@@ -493,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
                 require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn)
+                    before_model = model_snapshot(conn, train_if_needed=False)
                     before_signature = model_signature(conn)
                     update_started = time.perf_counter()
                     removed = clear_gallery_mark(conn, gallery_url)
@@ -522,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
                 require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn)
+                    before_model = model_snapshot(conn, train_if_needed=False)
                     before_signature = model_signature(conn)
                     update_started = time.perf_counter()
                     log_feedback_received("clear", gallery_url)
@@ -687,6 +708,7 @@ def get_settings() -> dict:
             "recommend_model_mode": configured_model_mode(conn),
             "preview_freshness_weight": preview_freshness_weight(conn),
             "preview_posted_after": preview_posted_after(conn),
+            "hath_download_signal_weight": hath_download_signal_weight(conn),
             "review_require_bootstrap_match": configured_review_require_bootstrap_match(conn),
             "sample_extra_pages": sample_extra_pages(conn),
             "network_proxy": proxy_url,
@@ -725,6 +747,7 @@ def get_status() -> dict:
                 "recommend_model_mode": configured_model_mode(conn),
                 "preview_freshness_weight": preview_freshness_weight(conn),
                 "preview_posted_after": preview_posted_after(conn),
+                "hath_download_signal_weight": hath_download_signal_weight(conn),
                 "review_require_bootstrap_match": configured_review_require_bootstrap_match(conn),
                 "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
                 "network_proxy": proxy_url,
@@ -774,6 +797,7 @@ def hath_archive_inventory() -> dict[str, Any]:
 
 def save_settings(payload: dict[str, Any]) -> None:
     refresh_relevant_change = False
+    model_relevant_change = False
     with db.connect() as conn:
         if parse_bool(payload.get("clear_cookie")):
             db.set_setting(conn, "cookie_header", "")
@@ -834,6 +858,11 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "preview_posted_after", normalize_posted_after(str(payload["preview_posted_after"])))
         if "review_require_bootstrap_match" in payload:
             db.set_setting(conn, "review_require_bootstrap_match", "1" if parse_bool(payload["review_require_bootstrap_match"]) else "0")
+        if "hath_download_signal_weight" in payload:
+            weight = bounded_float(payload["hath_download_signal_weight"], default=1.25, lower=0.0, upper=2.0)
+            previous_weight = hath_download_signal_weight(conn)
+            db.set_setting(conn, "hath_download_signal_weight", str(weight))
+            model_relevant_change = weight != previous_weight
         if "sample_extra_pages" in payload:
             extra = bounded_int(payload["sample_extra_pages"], default=2, lower=0, upper=10)
             db.set_setting(conn, "sample_extra_pages", str(extra))
@@ -861,6 +890,8 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "bootstrap_tags_raw" in payload:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
             refresh_relevant_change = True
+        if model_relevant_change:
+            retrain_model(conn)
         configure_request_rate_limit_from_conn(conn)
     if refresh_relevant_change:
         wake_background_refresh()
@@ -2128,6 +2159,7 @@ def persist_gallery_metadata(conn, gallery: Gallery) -> dict[str, int]:
         return {"updated": 0, "parent_updated": 0, "title_jpn_updated": 0}
     assignments = ", ".join(f"{field} = ?" for field in updates)
     conn.execute(f"UPDATE galleries SET {assignments} WHERE url = ?", (*updates.values(), gallery.url))
+    db.snapshot_gallery_features(conn, gallery.url, "metadata-refresh")
     return {
         "updated": 1,
         "parent_updated": 1 if "parent_url" in updates else 0,
@@ -3128,6 +3160,27 @@ def continuing_update_payload(
 
 
 def queue_counts_payload(conn) -> dict[str, int]:
+    database_row = next((row for row in conn.execute("PRAGMA database_list") if row[1] == "main"), None)
+    database_key = str(database_row[2] or "") if database_row else ""
+    database_key = database_key or f"memory:{id(conn)}"
+    fingerprint_row = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM galleries) AS gallery_count,
+            (SELECT COALESCE(MAX(last_seen_at), '') FROM galleries) AS gallery_version,
+            (SELECT COALESCE(MAX(id), 0) FROM feedback) AS feedback_version,
+            (SELECT COALESCE(MAX(updated_at), '') FROM gallery_marks) AS mark_version,
+            (SELECT COALESCE(MAX(updated_at), '') FROM gallery_classification_overrides) AS classification_version,
+            (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, '|'), '') FROM settings
+             WHERE key IN ('recommend_candidate_limit', 'recommend_language_filter',
+                           'recommend_model_mode', 'review_require_bootstrap_match')) AS settings_version
+        """
+    ).fetchone()
+    fingerprint = tuple(fingerprint_row)
+    with QUEUE_COUNTS_CACHE_LOCK:
+        cached = QUEUE_COUNTS_CACHE.get(database_key)
+        if cached and cached[0] == fingerprint and time.monotonic() - cached[1] < QUEUE_COUNTS_CACHE_TTL_SECONDS:
+            return dict(cached[2])
     candidate_limit = recommend_candidate_limit(conn)
     continuing_updates = continuing_update_series_index(conn)
     review = recommend_page(
@@ -3146,11 +3199,14 @@ def queue_counts_payload(conn) -> dict[str, int]:
     update_page = continuing_update_page(
         conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
     )
-    return {
+    result = {
         "review": int(review["total"]),
         "short_repeats": int(short_repeats["total"]),
         "continuing_updates": int(update_page["total"]),
     }
+    with QUEUE_COUNTS_CACHE_LOCK:
+        QUEUE_COUNTS_CACHE[database_key] = (fingerprint, time.monotonic(), result)
+    return dict(result)
 
 
 def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match: bool = False) -> dict:

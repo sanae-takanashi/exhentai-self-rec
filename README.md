@@ -32,7 +32,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Continuing-gallery detection separates cumulative Pixiv/Fanbox/Patreon archives and explicit ongoing series from ordinary one-shot galleries. Multi-version parent chains are grouped even when they contain hundreds of pages; two-version chains require a source-platform title, while ordinary single revisions and translated editions stay in Review. Review shows only the latest version once, then keeps later versions in the dedicated Updates view after any version in the series has been rated or skipped.
 - Calibrated single-user content ranking combines sparse metadata, title character n-grams, numeric metadata, and DINOv2 vectors with class-balanced logistic regression. It automatically falls back to the legacy ranker when scikit-learn is unavailable or fewer than 50 positive/negative labels (15 per class) exist.
 - A separate Discovery view samples uncertain boundary items, text/visual disagreements, and less-covered interests without diluting the high-confidence Review queue.
-- Optional negative-feedback reasons include visual style, content, creator, quality, gallery size, and too few relevant images. Matching feature branches activate only after 20 examples; image-ratio feedback remains diagnostic until per-image embeddings are available, and duplicate/update feedback is excluded from preference training.
+- Optional negative-feedback reasons include visual style, content, creator, quality, gallery size, and too few relevant images. Reasons remain diagnostic metadata and do not alter feature values; duplicate/update feedback is excluded from preference training.
 - Recommendation impressions are stored locally for diagnostics and are never treated as negative feedback.
 - Review and Updates cards can override a mistaken continuing-gallery classification, with `Use Auto` available to remove the override. Manual labels take effect immediately, survive preference export/import, and train a separate lightweight classifier after at least 20 labels with 5 examples in each class; learned predictions require cross-validated balanced accuracy of 0.65 and 80% per-item confidence.
 - Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
@@ -84,16 +84,40 @@ The same supervised launcher also gives the rec process the existing SSH
 executable, config, and host alias for configurable remote archive jobs. The
 H@H page scans gallery directories and existing ZIP files, shows the active
 MEGA account, and lets you choose sources, archive name, MEGA destination,
-upload behavior, and recoverable cleanup behavior. `Dry Run` validates the
+upload behavior, and either recoverable or permanent cleanup. `Dry Run` validates the
 selection on the remote host and returns the exact action plan without changing
 files. A formal run accepts only the ID of that preview, not paths or commands
 from the browser. Runs are asynchronous and mutually exclusive, with status at
 `GET /api/integrations/hath/pack/status`.
 
-The remote helper is `hath_observer/archive.py`. It creates the complete ZIP
-before uploading or moving sources. Cleanup moves items under
-`/srv/hath/archive/.trash/<job-id>` instead of permanently deleting them. The
-legacy `/srv/hath/download/auto_pack.sh` script is no longer used by the Web UI.
+The remote helper is `hath_observer/archive.py`. Matching the legacy
+`auto_pack.sh` layout, it first creates one ZIP per selected gallery (including
+that gallery's root directory), then stores those gallery ZIPs and any selected
+existing ZIPs as the flat members of the outer archive. The outer ZIP uses store
+mode because its members are already compressed. It completes that two-level
+archive before uploading or cleaning up sources. Before upload it creates the configured
+MEGA destination directory, then uploads to an explicit path containing the
+archive `.zip` file name. Cleanup moves items under
+`/srv/hath/archive/.trash/<job-id>` by default. For space-constrained hosts,
+the cleanup method can permanently delete the selected sources and uploaded
+local archive instead. Permanent cleanup only starts after archive creation and
+any requested upload succeed.
+
+Existing recoverable trash still consumes local disk. After deploying the
+current helper, the H@H page lists each trash job with its file count, size,
+and modification time. Select one or more jobs, run the deletion dry run, then
+confirm the previewed permanent deletion. The preview is revalidated remotely
+and deletion shares the archive job lock.
+
+The equivalent maintenance command for emptying all helper-owned trash is:
+
+```bash
+/usr/bin/python3 /srv/hath-observer/hath_observer/archive.py purge-trash --confirm PURGE-ARCHIVE-TRASH
+```
+
+The purge command rejects missing confirmation and only operates on the fixed
+`.trash` directory below the configured archive directory. The legacy
+`/srv/hath/download/auto_pack.sh` script is no longer used by the Web UI.
 
 The server binds to `0.0.0.0` by default, so another device on the same network can open `http://<server-ip>:18787` if your firewall allows the port. To force local-only access, run:
 

@@ -6,10 +6,12 @@ import math
 import random
 import re
 import sqlite3
+import threading
 import time
 import urllib.parse
 from dataclasses import asdict
 
+from .db import snapshot_gallery_features
 from .exhentai import Gallery
 from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
 from .personalized import (
@@ -22,7 +24,12 @@ from .personalized import (
     score_personalized_galleries,
     train_personalized_model,
 )
-from .classification import continuing_classifier_decisions, public_classifier_status, train_continuing_classifier
+from .classification import (
+    continuing_classifier_decisions,
+    load_continuing_classifier,
+    public_classifier_status,
+    train_continuing_classifier,
+)
 
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_:+.-]{1,}", re.I)
@@ -78,6 +85,10 @@ BOOTSTRAP_NAMESPACES = {
 MODEL_MODE_HYBRID = "hybrid"
 MODEL_MODE_VISUAL = "visual"
 MODEL_MODE_LEGACY = "legacy"
+RETRAIN_LOCK = threading.RLock()
+SCAN_CACHE_LOCK = threading.RLock()
+SCAN_CACHE_TTL_SECONDS = 30.0
+SCAN_CACHE: dict[tuple[str, str], tuple[tuple, float, object]] = {}
 MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL, MODEL_MODE_LEGACY}
 SHORT_REPEAT_PAGE_LIMIT = 10
 RELATED_FEEDBACK_REFERENCE_LIMIT = 5
@@ -100,6 +111,27 @@ SOURCE_PREFIX_RE = re.compile(r"^\s*((?:[\[\(【「『][^\]\)】」』]{1,50}[\]
 SOURCE_LABEL_RE = re.compile(r"[\[\(【「『]\s*([^\]\)】」』]{1,50})\s*[\]\)】」』]")
 TITLE_ARTIST_ID_RE = re.compile(r"^\s*(?P<name>.+?)\s*[\(（](?P<artist_id>\d{4,})[\)）]\s*$")
 PARENT_GALLERY_RE = re.compile(r"(?:https?:)?(?://(?:exhentai|e-hentai)\.org)?/g/(\d+)/([0-9a-fA-F]+)/?")
+
+
+def _database_identity(conn: sqlite3.Connection) -> str:
+    row = next((row for row in conn.execute("PRAGMA database_list") if row[1] == "main"), None)
+    path = str(row[2] or "") if row else ""
+    return path or f"memory:{id(conn)}"
+
+
+def _cached_scan(conn: sqlite3.Connection, name: str, fingerprint: tuple, builder):
+    identity = _database_identity(conn)
+    if identity.startswith("memory:"):
+        return builder()
+    key = (name, identity)
+    with SCAN_CACHE_LOCK:
+        cached = SCAN_CACHE.get(key)
+        if cached and cached[0] == fingerprint and time.monotonic() - cached[1] < SCAN_CACHE_TTL_SECONDS:
+            return cached[2]
+    value = builder()
+    with SCAN_CACHE_LOCK:
+        SCAN_CACHE[key] = (fingerprint, time.monotonic(), value)
+    return value
 
 
 def parse_bootstrap_tags(raw: str) -> list[tuple[str, float]]:
@@ -252,6 +284,11 @@ def store_galleries(
         )
         if detail_fetched:
             conn.execute("UPDATE galleries SET detail_fetched_at = CURRENT_TIMESTAMP WHERE url = ?", (gallery.url,))
+        snapshot_gallery_features(
+            conn,
+            gallery.url,
+            "detail" if detail_fetched else "listing",
+        )
         if not existing:
             count += 1
     return count
@@ -277,6 +314,7 @@ def store_gallery_samples(
         """,
         (page_count, samples_json, samples_json, url),
     )
+    snapshot_gallery_features(conn, url, "samples")
 
 
 def clear_shared_thumbnail_metadata(conn: sqlite3.Connection) -> int:
@@ -324,6 +362,7 @@ def store_visual_embedding(
         """,
         (json.dumps(normalized, ensure_ascii=True), version, gallery_url),
     )
+    snapshot_gallery_features(conn, gallery_url, "visual")
 
 
 def store_visual_image_embeddings(
@@ -459,6 +498,7 @@ def record_feedback(
     reason_code: str | None = None,
     surface: str | None = None,
 ) -> None:
+    snapshot_gallery_features(conn, gallery_url, "feedback")
     previous = conn.execute(
         """
         SELECT vote
@@ -471,9 +511,12 @@ def record_feedback(
     ).fetchone()
     previous_signal = float(previous["vote"] or 0) if previous else 0.0
     signal = feedback_signal(vote=vote, score=score)
+    normalized_reason = normalize_reason_code(reason_code)
+    if normalized_reason and signal >= 0:
+        raise ValueError("reason_code is only valid for negative feedback")
     conn.execute(
         "INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface) VALUES (?, ?, ?, ?, ?, ?)",
-        (gallery_url, signal, score, note, normalize_reason_code(reason_code), normalize_surface(surface)),
+        (gallery_url, signal, score, note, normalized_reason, normalize_surface(surface)),
     )
     if signal != 0 or previous_signal != 0:
         retrain_model(conn)
@@ -481,11 +524,13 @@ def record_feedback(
 
 def clear_feedback(conn: sqlite3.Connection, gallery_url: str) -> int:
     cursor = conn.execute("DELETE FROM feedback WHERE gallery_url = ?", (gallery_url,))
-    retrain_model(conn)
+    if cursor.rowcount:
+        retrain_model(conn)
     return cursor.rowcount
 
 
 def record_gallery_mark(conn: sqlite3.Connection, gallery_url: str, kind: str, note: str | None = None) -> None:
+    snapshot_gallery_features(conn, gallery_url, "mark")
     kind = normalize_mark_kind(kind)
     existing = conn.execute("SELECT kind FROM gallery_marks WHERE gallery_url = ?", (gallery_url,)).fetchone()
     if existing and existing["kind"] == kind:
@@ -540,7 +585,8 @@ def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     removed: dict[str, int] = {}
     for table in (
         "hath_events", "hath_downloads", "hath_clients",
-        "gallery_visual_images", "recommendation_impressions", "model_training_runs", "gallery_classification_overrides",
+        "gallery_visual_images", "gallery_feature_snapshots", "recommendation_impressions", "model_training_runs",
+        "gallery_classification_samples", "gallery_classification_overrides",
         "gallery_marks", "feedback", "feature_weights", "fetch_runs", "fetch_query_state", "galleries",
     ):
         cursor = conn.execute(f"DELETE FROM {table}")
@@ -759,6 +805,9 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
             vote = import_feedback_vote(item.get("vote")) if "vote" in item else None
         if vote is None:
             continue
+        reason_code = normalize_reason_code(item.get("reason_code"))
+        if vote >= 0:
+            reason_code = None
         conn.execute(
             """
             INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface, created_at)
@@ -769,7 +818,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
                 vote,
                 score,
                 item.get("note"),
-                normalize_reason_code(item.get("reason_code")),
+                reason_code,
                 normalize_surface(item.get("surface")),
                 item.get("created_at"),
             ),
@@ -907,8 +956,14 @@ def import_feedback_score(value: object) -> int | None:
 
 
 def retrain_model(conn: sqlite3.Connection) -> None:
+    with RETRAIN_LOCK:
+        _retrain_model(conn)
+
+
+def _retrain_model(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM feature_weights")
     tag_strengths = tag_corpus_strengths(conn)
+    confidence_by_id = feedback_confidence_index(conn)
     rows = conn.execute(
         """
         SELECT g.*, f.id AS feedback_id, f.vote AS feedback_signal, f.score AS feedback_score
@@ -927,7 +982,7 @@ def retrain_model(conn: sqlite3.Connection) -> None:
         signal = float(gallery.pop("feedback_signal") or 0)
         feedback_id = int(gallery.pop("feedback_id"))
         score = gallery.pop("feedback_score")
-        signal *= feedback_confidence(conn, gallery["url"], feedback_id, signal)
+        signal *= confidence_by_id.get(feedback_id, 1.0)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
         apply_feedback_features(conn, gallery, signal, score=score, tag_strengths=tag_strengths)
@@ -966,6 +1021,7 @@ def retrain_model(conn: sqlite3.Connection) -> None:
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
+    confidence_by_id = feedback_confidence_index(conn)
     feedback_rows = conn.execute(
         """
         SELECT g.url, g.visual_embedding_json, g.visual_embedding_version, f.id AS feedback_id, f.vote AS feedback_signal
@@ -984,7 +1040,7 @@ def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
     rows: list[dict] = []
     for row in feedback_rows:
         signal = float(row["feedback_signal"] or 0)
-        signal *= feedback_confidence(conn, row["url"], int(row["feedback_id"]), signal)
+        signal *= confidence_by_id.get(int(row["feedback_id"]), 1.0)
         rows.append(
             {
                 "url": row["url"],
@@ -1112,6 +1168,43 @@ def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id:
     return 1.0 + boost
 
 
+def feedback_confidence_index(conn: sqlite3.Connection) -> dict[int, float]:
+    fingerprint_row = conn.execute(
+        "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM feedback"
+    ).fetchone()
+    fingerprint = (int(fingerprint_row["count"]), int(fingerprint_row["max_id"]))
+
+    def build() -> dict[int, float]:
+        rows = conn.execute(
+            "SELECT id, gallery_url, vote FROM feedback ORDER BY gallery_url, id DESC"
+        ).fetchall()
+        result: dict[int, float] = {}
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["gallery_url"]), []).append(row)
+        for gallery_rows in grouped.values():
+            for index, row in enumerate(gallery_rows):
+                vote = float(row["vote"] or 0.0)
+                if vote == 0:
+                    result[int(row["id"])] = 0.0
+                    continue
+                direction = 1 if vote > 0 else -1
+                streak = 0
+                for previous in gallery_rows[index : index + MAX_FEEDBACK_CONFIDENCE_HISTORY]:
+                    previous_vote = float(previous["vote"] or 0.0)
+                    if previous_vote == 0 or (1 if previous_vote > 0 else -1) != direction:
+                        break
+                    streak += 1
+                boost = min(
+                    MAX_FEEDBACK_CONFIDENCE_BOOST,
+                    max(0, streak - 1) * FEEDBACK_CONFIDENCE_STEP,
+                )
+                result[int(row["id"])] = 1.0 + boost
+        return result
+
+    return _cached_scan(conn, "feedback-confidence", fingerprint, build)
+
+
 def apply_feedback_features(
     conn: sqlite3.Connection,
     gallery: dict,
@@ -1163,6 +1256,22 @@ def is_identity_feature(feature: str) -> bool:
 
 
 def tag_corpus_strengths(conn: sqlite3.Connection) -> dict[str, float]:
+    fingerprint_row = conn.execute(
+        """
+        SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(tags_json)), 0) AS tag_bytes,
+               COALESCE(MAX(last_seen_at), '') AS last_seen
+        FROM galleries
+        """
+    ).fetchone()
+    fingerprint = (
+        int(fingerprint_row["count"]),
+        int(fingerprint_row["tag_bytes"]),
+        str(fingerprint_row["last_seen"]),
+    )
+    return _cached_scan(conn, "tag-corpus-strengths", fingerprint, lambda: _build_tag_corpus_strengths(conn))
+
+
+def _build_tag_corpus_strengths(conn: sqlite3.Connection) -> dict[str, float]:
     rows = conn.execute("SELECT tags_json FROM galleries").fetchall()
     total = len(rows)
     if total < MIN_CORPUS_TAG_STRENGTH_GALLERIES:
@@ -1263,8 +1372,9 @@ def recommend_page(
     posted_after: str | None = None,
     exclude_short_repeats: bool = True,
     continuing_updates: dict[str, dict] | None = None,
+    personalized_artifact: dict | None = None,
 ) -> dict:
-    limit = max(1, min(100, int(limit)))
+    limit = max(1, min(10000, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
@@ -1286,7 +1396,7 @@ def recommend_page(
     )
     if continuing_updates is None:
         continuing_updates = continuing_update_series_index(conn) if exclude_short_repeats and not include_rated else {}
-    overrides = classification_overrides(conn) if exclude_short_repeats and not include_rated else {}
+    overrides = classification_overrides(conn)
     unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL AND hd.gallery_url IS NULL" if not include_rated else ""
     rows = conn.execute(
         f"""
@@ -1347,9 +1457,9 @@ def recommend_page(
         gallery["classification_override"] = manual_classification
         learned_classification = classifier_decisions.get(gallery.get("url")) if not manual_classification else None
         gallery["classification_prediction"] = learned_classification
-        if manual_classification == "updates" or (
+        if not include_rated and (manual_classification == "updates" or (
             learned_classification and learned_classification.get("classification") == "updates"
-        ):
+        )):
             continue
         if exclude_short_repeats and not include_rated and continuing and manual_classification != "review":
             if continuing["reviewed"] or gallery.get("url") != continuing["latest_url"]:
@@ -1385,6 +1495,7 @@ def recommend_page(
         if model_mode != MODEL_MODE_VISUAL:
             freshness = freshness_bonus(idx, candidate_limit) * freshness_weight
             score += freshness
+            gallery["freshness_bonus"] = round(freshness, 6)
             if freshness and reasons != ["recent"]:
                 freshness_reason = f"fresh {freshness:+.2f}"
                 if freshness_weight > 1.0:
@@ -1399,15 +1510,25 @@ def recommend_page(
 
     personalized_status: dict = {"ready": False, "status": "not-requested"}
     if model_mode == MODEL_MODE_HYBRID and personalized_inputs:
-        predictions, artifact = score_personalized_galleries(conn, personalized_inputs)
+        if personalized_artifact is None:
+            predictions, artifact = score_personalized_galleries(conn, personalized_inputs)
+        else:
+            predictions, artifact = score_personalized_galleries(
+                conn, personalized_inputs, artifact=personalized_artifact
+            )
         personalized_status = model_public_status(artifact)
         if artifact.get("ready") and artifact.get("accepted") and len(predictions) == len(scored):
             for gallery, prediction in zip(scored, predictions):
-                probability = apply_bootstrap_probability_prior(
+                probability = float(prediction["like_probability"])
+                prior_rank_score = apply_bootstrap_probability_prior(
                     float(prediction["like_probability"]), gallery, bootstrap
                 )
+                freshness_offset = min(0.5, max(0.0, float(gallery.get("freshness_bonus") or 0.0)) * 0.1)
                 prediction["like_probability"] = round(probability, 6)
-                prediction["rank_score"] = round(probability, 6)
+                prediction["rank_score"] = round(
+                    apply_probability_logit_offset(prior_rank_score, freshness_offset),
+                    6,
+                )
                 gallery.update(prediction)
                 gallery["score"] = gallery["rank_score"]
                 gallery["reasons"] = personalized_reasons(gallery, prediction, bootstrap)
@@ -1455,19 +1576,24 @@ def apply_bootstrap_probability_prior(probability: float, gallery: dict, bootstr
     exact_values = bootstrap_exact_values(gallery)
     matched = [weight for tag, weight in bootstrap.items() if bootstrap_matches(tag, searchable, exact_values)]
     prior = max(-0.45, min(0.45, sum(matched) * 0.08))
-    logit = math.log(probability / (1.0 - probability)) + prior
+    return apply_probability_logit_offset(probability, prior)
+
+
+def apply_probability_logit_offset(probability: float, offset: float) -> float:
+    probability = min(1.0 - 1e-6, max(1e-6, probability))
+    logit = math.log(probability / (1.0 - probability)) + offset
     return 1.0 / (1.0 + math.exp(-logit))
 
 
 def legacy_prediction_fields(gallery: dict, model_status: dict | None = None) -> dict:
     raw_score = float(gallery.get("score") or 0.0)
-    probability = 1.0 / (1.0 + math.exp(-max(-12.0, min(12.0, raw_score))))
     return {
-        "like_probability": round(probability, 6),
+        "like_probability": None,
         "uncertainty": None,
         "confidence": None,
         "rank_score": round(raw_score, 6),
         "model_version": "legacy-linear-v1",
+        "score_scale": "additive",
         "reason_details": {"positive": [], "negative": []},
         "model_fallback": (model_status or {}).get("status"),
         "text_visual_disagreement": 0.0,
@@ -1503,9 +1629,11 @@ def discovery_page(
         (page.get("personalized_model") or {}).get("ready")
         and (page.get("personalized_model") or {}).get("accepted")
     ):
-        items = candidates[offset : offset + limit]
-        for item in items:
+        items = []
+        for candidate in candidates[offset : offset + limit]:
+            item = dict(candidate)
             item["discovery_reason"] = "legacy fallback"
+            items.append(item)
         return {**page, "items": items, "offset": offset, "next_offset": offset + len(items)}
 
     daily_seed = seed or time.strftime("%Y-%m-%d", time.gmtime())
@@ -1523,14 +1651,18 @@ def discovery_page(
         candidates,
         key=lambda item: (-float(item.get("text_visual_disagreement") or 0.0), tie_break[item["url"]]),
     )
+    interest_frequency: dict[str, int] = {}
+    for item in candidates:
+        for key in diversity_keys(item):
+            interest_frequency[key] = interest_frequency.get(key, 0) + 1
     coverage = sorted(
         candidates,
         key=lambda item: (
-            min((seen_interest_count(item, other) for other in candidates if other is not item), default=0),
+            sum(interest_frequency.get(key, 0) for key in diversity_keys(item)),
             tie_break[item["url"]],
         ),
     )
-    total_needed = min(len(candidates), offset + limit)
+    total_needed = len(candidates)
     quotas = [math.ceil(total_needed * 0.4), math.ceil(total_needed * 0.3), total_needed]
     selected: list[dict] = []
     selected_urls: set[str] = set()
@@ -1610,11 +1742,18 @@ def personalized_reasons(gallery: dict, prediction: dict, bootstrap: dict[str, f
         reasons.append(f"for {item.get('feature')} {float(item.get('contribution') or 0):+.2f}")
     for item in (details.get("negative") or [])[:1]:
         reasons.append(f"against {item.get('feature')} {float(item.get('contribution') or 0):+.2f}")
-    if any(
-        bootstrap_matches(tag, bootstrap_search_text(gallery), bootstrap_exact_values(gallery))
-        for tag in bootstrap
-    ):
-        reasons.append("bootstrap prior")
+    matched_weight = sum(
+        float(weight)
+        for tag, weight in bootstrap.items()
+        if bootstrap_matches(tag, bootstrap_search_text(gallery), bootstrap_exact_values(gallery))
+    )
+    if matched_weight > 0:
+        reasons.append("bootstrap boost")
+    elif matched_weight < 0:
+        reasons.append("bootstrap penalty")
+    freshness = float(gallery.get("freshness_bonus") or 0.0)
+    if freshness:
+        reasons.append(f"fresh {freshness:+.2f}")
     return reasons[:5]
 
 
@@ -1694,11 +1833,12 @@ def mix_bootstrap_exploration(
         return scored
     keep_count = max(1, limit - count)
     protected = scored[:keep_count]
+    score_floor = exploration_score_floor(scored)
     pool = [
         item
         for item in scored[keep_count:]
         if normalize_source_query(item.get("source_query")) in bootstrap_queries
-        and float(item.get("score") or 0) >= MIN_BOOTSTRAP_EXPLORE_SCORE
+        and float(item.get("rank_score", item.get("score") or 0)) >= score_floor
         and has_bootstrap_score_reason(item)
     ]
     rng = random.Random(str(seed)) if seed else random.Random()
@@ -1716,6 +1856,15 @@ def mix_bootstrap_exploration(
         return scored
     remainder = [item for item in scored[keep_count:] if item["url"] not in selected_urls]
     return [*protected, *selected, *remainder]
+
+
+def exploration_score_floor(scored: list[dict]) -> float:
+    if not scored:
+        return MIN_BOOTSTRAP_EXPLORE_SCORE
+    if all(item.get("score_scale") == "probability" for item in scored):
+        values = sorted(float(item.get("rank_score", item.get("score") or 0.0)) for item in scored)
+        return values[min(len(values) - 1, len(values) // 5)]
+    return MIN_BOOTSTRAP_EXPLORE_SCORE
 
 
 def has_bootstrap_score_reason(item: dict) -> bool:
@@ -1819,7 +1968,37 @@ def continuing_series_title_key(gallery: dict) -> str:
     return ""
 
 
+def _relationship_fingerprint(conn: sqlite3.Connection) -> tuple:
+    galleries = conn.execute(
+        """
+        SELECT COUNT(*) AS count, COALESCE(MAX(last_seen_at), '') AS last_seen,
+               COALESCE(SUM(LENGTH(COALESCE(parent_url, '')) + LENGTH(title) + LENGTH(tags_json)), 0) AS bytes
+        FROM galleries
+        """
+    ).fetchone()
+    feedback = conn.execute(
+        "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM feedback"
+    ).fetchone()
+    marks = conn.execute(
+        "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at FROM gallery_marks"
+    ).fetchone()
+    return (
+        int(galleries["count"]), str(galleries["last_seen"]), int(galleries["bytes"]),
+        int(feedback["count"]), int(feedback["max_id"]),
+        int(marks["count"]), str(marks["updated_at"]),
+    )
+
+
 def continuing_update_series_index(conn: sqlite3.Connection) -> dict[str, dict]:
+    return _cached_scan(
+        conn,
+        "continuing-series-index",
+        _relationship_fingerprint(conn),
+        lambda: _build_continuing_update_series_index(conn),
+    )
+
+
+def _build_continuing_update_series_index(conn: sqlite3.Connection) -> dict[str, dict]:
     """Classify cumulative galleries and return series metadata keyed by gallery URL.
 
     A three-version parent component is strong evidence by itself. Two-version
@@ -2074,6 +2253,15 @@ def related_feedback_payload(gallery: dict) -> dict:
 
 
 def related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    return _cached_scan(
+        conn,
+        "related-feedback-index",
+        _relationship_fingerprint(conn),
+        lambda: _build_related_feedback_reference_index(conn),
+    )
+
+
+def _build_related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list[dict]]:
     rows = conn.execute(
         """
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
@@ -2659,7 +2847,7 @@ def marked_gallery_page(
 def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if len(scored) <= 2:
         return scored
-    if any(item.get("model_version", "").startswith("personalized-content-v1") for item in scored):
+    if all(item.get("score_scale") == "probability" for item in scored):
         return diversify_probability_ranked_galleries(scored)
     remaining = list(scored)
     selected: list[dict] = []
@@ -2691,16 +2879,17 @@ def diversify_probability_ranked_galleries(scored: list[dict], probability_windo
     selected: list[dict] = []
     seen: dict[str, int] = {}
     while remaining:
-        highest = max(float(item.get("like_probability") or 0.0) for item in remaining)
+        highest = max(float(item.get("rank_score", item.get("like_probability") or 0.0)) for item in remaining)
         eligible = [
             (index, item)
             for index, item in enumerate(remaining)
-            if float(item.get("like_probability") or 0.0) >= highest - probability_window
+            if float(item.get("rank_score", item.get("like_probability") or 0.0)) >= highest - probability_window
         ]
         best_index, best_item = max(
             eligible,
             key=lambda pair: (
-                float(pair[1].get("like_probability") or 0.0) - diversity_penalty(pair[1], seen) * 0.03,
+                float(pair[1].get("rank_score", pair[1].get("like_probability") or 0.0))
+                - diversity_penalty(pair[1], seen) * 0.03,
                 float(pair[1].get("confidence") or 0.0),
                 -pair[0],
             ),
@@ -2862,11 +3051,15 @@ def bootstrap_search_text(gallery: dict) -> str:
     return " ".join(value.lower() for value in values if value)
 
 
-def model_snapshot(conn: sqlite3.Connection) -> dict:
+def model_snapshot(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
     visual_model = visual_preference_model(conn)
     visual_counts = visual_version_counts(conn)
-    personalized_model = model_public_status(load_personalized_model(conn))
-    continuing_classifier = public_classifier_status(train_continuing_classifier(conn))
+    personalized_model = model_public_status(load_personalized_model(conn, train_if_needed=train_if_needed))
+    continuing_classifier = (
+        public_classifier_status(load_continuing_classifier(conn))
+        if train_if_needed
+        else {"ready": False, "status": "not-loaded"}
+    )
     return {
         "bootstrap_tags": get_bootstrap_tags(conn),
         "learned_queries": learned_query_tags(conn, limit=12),

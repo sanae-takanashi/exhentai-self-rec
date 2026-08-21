@@ -551,7 +551,7 @@ button.danger:hover {
 
 .hath-pack-options {
   display: grid;
-  grid-template-columns: minmax(150px, 0.7fr) minmax(200px, 1fr) minmax(220px, 1.2fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -720,6 +720,22 @@ button.danger:hover {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.hath-trash-section {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.hath-trash-candidates {
+  max-height: 260px;
+}
+
+.hath-trash-candidate {
+  grid-template-columns: 24px minmax(260px, 1fr) 80px 100px 130px;
+  min-width: 650px;
 }
 
 .hath-download-heading {
@@ -1366,6 +1382,20 @@ dd {
   .hath-pack-candidate > span:nth-child(5),
   .hath-pack-candidate > span:nth-child(6) {
     display: none;
+  }
+
+  .hath-trash-candidate {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    min-width: 0;
+  }
+
+  .hath-trash-candidate > span:nth-child(3),
+  .hath-trash-candidate > span:nth-child(5) {
+    display: none;
+  }
+
+  .hath-trash-candidate > span:nth-child(4) {
+    display: block;
   }
 }
 

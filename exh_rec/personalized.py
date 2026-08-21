@@ -6,17 +6,22 @@ import math
 import os
 import sqlite3
 import tempfile
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-MODEL_SCHEMA = "personalized-content-v2"
-FEATURE_SCHEMA = "content-features-v3"
+MODEL_SCHEMA = "personalized-content-v4"
+FEATURE_SCHEMA = "content-features-v6"
 MIN_LABELED = 50
 MIN_CLASS = 15
+MIN_CALIBRATION_SAMPLES = 20
+CALIBRATION_HOLDOUT_FRACTION = 0.20
 BOOTSTRAP_MODELS = 8
 CALIBRATION_RECENCY_DECAY = 3.0
+CALIBRATION_C = 0.2
 NEGATIVE_REASON_CODES = {
     "visual_style",
     "content_tags",
@@ -40,6 +45,7 @@ EVALUATION_PATH = Path(
     )
 )
 _MODEL_CACHE: dict[str, Any] = {}
+_MODEL_LOCK = threading.RLock()
 
 
 class PersonalizedModelUnavailable(RuntimeError):
@@ -87,51 +93,21 @@ def normalize_surface(value: object, default: str = "review") -> str:
     return surface
 
 
-def model_data_signature(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS events, COALESCE(MAX(id), 0) AS latest_id,
-               COALESCE(MAX(created_at), '') AS latest_at
-        FROM feedback
-        """
-    ).fetchone()
-    marks = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS latest_at FROM gallery_marks"
-    ).fetchone()
-    downloads = conn.execute(
-        """
-        SELECT COUNT(DISTINCT gallery_url) AS count, COALESCE(MAX(updated_at), '') AS latest_at
-        FROM hath_downloads
-        WHERE status = 'completed' AND gallery_url IS NOT NULL
-        """
-    ).fetchone()
-    galleries = conn.execute(
-        """
-        SELECT COUNT(*) AS count,
-               COALESCE(SUM(LENGTH(title) + LENGTH(tags_json) + LENGTH(COALESCE(tag_weights_json, ''))), 0) AS text_size,
-               COALESCE(SUM(CASE WHEN detail_fetched_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS detailed,
-               COALESCE(SUM(CASE WHEN visual_embedding_json IS NOT NULL AND visual_embedding_json != '' THEN 1 ELSE 0 END), 0) AS visual,
-               COALESCE(MAX(visual_embedding_at), '') AS latest_visual
-        FROM galleries
-        """
-    ).fetchone()
-    visual_images = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(MAX(created_at), '') AS latest_at FROM gallery_visual_images"
-    ).fetchone()
-    labels = conn.execute(
-        """
-        SELECT COALESCE(GROUP_CONCAT(gallery_url || ':' || vote || ':' || COALESCE(score, '') || ':' || COALESCE(reason_code, ''), '|'), '')
-        FROM feedback
-        """
-    ).fetchone()[0]
-    payload = (
-        f"{row['events']}|{row['latest_id']}|{row['latest_at']}|{marks['count']}|{marks['latest_at']}|"
-        f"{downloads['count']}|{downloads['latest_at']}|{hath_download_signal_weight(conn)}|"
-        f"{galleries['count']}|{galleries['text_size']}|{galleries['detailed']}|{galleries['visual']}|"
-        f"{galleries['latest_visual']}|{visual_images['count']}|{visual_images['latest_at']}|"
-        f"{FEATURE_SCHEMA}|{labels}"
+def model_data_signature(conn: sqlite3.Connection, examples: list[dict] | None = None) -> str:
+    examples = training_examples(conn) if examples is None else examples
+    keys = (
+        "url", "label", "sample_weight", "label_source", "feedback_at", "title", "title_jpn",
+        "category", "uploader", "rating", "page_count", "tags", "tag_weights", "detail_fetched_at",
+        "visual_embedding_json", "visual_embedding_version", "visual_image_count",
+        "visual_image_cohesion", "visual_image_min_similarity",
+        "feature_snapshot_id", "feature_snapshot_at",
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    payload = {
+        "feature_schema": FEATURE_SCHEMA,
+        "examples": [{key: item.get(key) for key in keys} for item in examples],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
 def _decoded_gallery(row: sqlite3.Row | dict) -> dict:
@@ -151,6 +127,44 @@ def _decoded_gallery(row: sqlite3.Row | dict) -> dict:
     return gallery
 
 
+def gallery_feature_snapshot(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    at: str,
+) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT id AS feature_snapshot_id, captured_at AS feature_snapshot_at,
+               title, title_jpn, category, uploader, rating, tags_json,
+               tag_weights_json, page_count, detail_fetched_at,
+               visual_embedding_json, visual_embedding_version, visual_embedding_at
+        FROM gallery_feature_snapshots
+        WHERE gallery_url = ?
+          AND julianday(captured_at) IS NOT NULL
+          AND julianday(captured_at) <= julianday(?)
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+        """,
+        (gallery_url, at),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _apply_feature_snapshot(
+    conn: sqlite3.Connection,
+    item: dict,
+    at: str,
+    strict: bool,
+) -> dict | None:
+    snapshot = gallery_feature_snapshot(conn, str(item.get("url") or ""), at)
+    if snapshot is None:
+        return None if strict else item
+    item.pop("tags", None)
+    item.pop("tag_weights", None)
+    item.update(snapshot)
+    return _decoded_gallery(item)
+
+
 def _attach_visual_image_features(conn: sqlite3.Connection, galleries: list[dict]) -> None:
     targets = {str(item.get("url") or ""): item for item in galleries if item.get("url")}
     if not targets:
@@ -162,7 +176,7 @@ def _attach_visual_image_features(conn: sqlite3.Connection, galleries: list[dict
         placeholders = ",".join("?" for _ in chunk)
         rows = conn.execute(
             f"""
-            SELECT gallery_url, embedding_json, embedding_version
+            SELECT gallery_url, embedding_json, embedding_version, created_at
             FROM gallery_visual_images
             WHERE gallery_url IN ({placeholders})
             """,
@@ -174,6 +188,9 @@ def _attach_visual_image_features(conn: sqlite3.Connection, galleries: list[dict
                 continue
             expected_version = str(gallery.get("visual_embedding_version") or "")
             if expected_version and str(row["embedding_version"] or "") != expected_version:
+                continue
+            snapshot_at = str(gallery.get("feature_snapshot_at") or "")
+            if snapshot_at and str(row["created_at"] or "") > snapshot_at:
                 continue
             try:
                 vector = [float(value) for value in json.loads(row["embedding_json"] or "[]")]
@@ -204,7 +221,7 @@ def _attach_visual_image_features(conn: sqlite3.Connection, galleries: list[dict
         )
 
 
-def training_examples(conn: sqlite3.Connection) -> list[dict]:
+def training_examples(conn: sqlite3.Connection, strict_temporal: bool = False) -> list[dict]:
     feedback = conn.execute(
         """
         SELECT g.*, f.id AS feedback_id, f.vote, f.score, f.reason_code, f.surface,
@@ -216,19 +233,16 @@ def training_examples(conn: sqlite3.Connection) -> list[dict]:
         """
     ).fetchall()
     examples: dict[str, dict] = {}
-    reason_counts = {
-        str(row["reason_code"]): int(row["count"])
-        for row in conn.execute(
-            """
-            SELECT reason_code, COUNT(*) AS count
-            FROM feedback
-            WHERE vote < 0 AND reason_code IS NOT NULL AND reason_code != ''
-            GROUP BY reason_code
-            """
-        )
-    }
     for row in feedback:
         item = _decoded_gallery(row)
+        item = _apply_feature_snapshot(
+            conn,
+            item,
+            str(item.get("feedback_at") or ""),
+            strict_temporal,
+        )
+        if item is None:
+            continue
         if item.get("reason_code") == "duplicate_update":
             continue
         vote = float(item.get("vote") or 0)
@@ -236,8 +250,6 @@ def training_examples(conn: sqlite3.Connection) -> list[dict]:
             continue
         item["label"] = 1 if vote > 0 else 0
         item["sample_weight"] = max(0.75, min(2.0, abs(vote)))
-        reason = str(item.get("reason_code") or "")
-        item["active_reason_code"] = reason if reason_counts.get(reason, 0) >= 20 else None
         item["label_source"] = "score" if item.get("score") is not None else "vote"
         examples[item["url"]] = item
     download_weight = hath_download_signal_weight(conn)
@@ -256,6 +268,14 @@ def training_examples(conn: sqlite3.Connection) -> list[dict]:
         ).fetchall()
         for row in downloads:
             item = _decoded_gallery(row)
+            item = _apply_feature_snapshot(
+                conn,
+                item,
+                str(item.get("feedback_at") or ""),
+                strict_temporal,
+            )
+            if item is None:
+                continue
             item["label"] = 1
             item["sample_weight"] = download_weight
             item["label_source"] = "hath-download"
@@ -269,6 +289,14 @@ def training_examples(conn: sqlite3.Connection) -> list[dict]:
     ).fetchall()
     for row in marks:
         item = _decoded_gallery(row)
+        item = _apply_feature_snapshot(
+            conn,
+            item,
+            str(item.get("feedback_at") or ""),
+            strict_temporal,
+        )
+        if item is None:
+            continue
         item["label"] = 1 if item["mark_kind"] == "favorite" else 0
         item["sample_weight"] = 3.0
         item["label_source"] = item["mark_kind"]
@@ -297,15 +325,10 @@ def _metadata_features(gallery: dict) -> dict[str, float]:
         result[f"category={category}"] = 1.0
     if uploader:
         result[f"uploader={uploader}"] = 1.0
-    active_reason = gallery.get("active_reason_code")
     for raw in gallery.get("tags") or []:
         tag = str(raw or "").strip().lower()
         if tag:
-            result[f"tag={tag}"] = 1.35 if active_reason == "content_tags" else 1.0
-    if active_reason == "creator_character":
-        for feature in list(result):
-            if feature.startswith("uploader=") or feature.startswith("tag=artist:") or feature.startswith("tag=character:"):
-                result[feature] *= 1.35
+            result[f"tag={tag}"] = 1.0
     return result
 
 
@@ -319,26 +342,23 @@ def _numeric_features(gallery: dict) -> dict[str, float]:
             visual = json.loads(gallery.get("visual_embedding_json") or "null")
         except (TypeError, json.JSONDecodeError):
             visual = None
-    active_reason = gallery.get("active_reason_code")
-    quality_scale = 1.35 if active_reason == "quality" else 1.0
-    image_reason_scale = 1.35 if active_reason == "too_few_relevant_images" else 1.0
     page_value = 0.0 if pages is None else min(1.0, math.log1p(max(0, int(pages))) / 7.0)
     image_count = max(0, int(gallery.get("visual_image_count") or 0))
     image_cohesion = float(gallery.get("visual_image_cohesion") or 1.0)
     image_min_similarity = float(gallery.get("visual_image_min_similarity") or 1.0)
     return {
-        "site_rating": (0.0 if rating is None else (float(rating) - 3.5) / 1.5) * quality_scale,
+        "site_rating": 0.0 if rating is None else (float(rating) - 3.5) / 1.5,
         "site_rating_missing": 1.0 if rating is None else 0.0,
         "log_pages": page_value,
-        "short_gallery": (1.0 - page_value) * (1.35 if active_reason == "gallery_too_small" else 1.0),
+        "short_gallery": 1.0 - page_value,
         "page_count_missing": 1.0 if pages is None else 0.0,
         "detail_ready": 1.0 if gallery.get("detail_fetched_at") else 0.0,
         "tag_coverage": min(1.0, len(tags) / 50.0),
         "visual_ready": 1.0 if isinstance(visual, list) and visual else 0.0,
         "visual_image_stats_ready": 1.0 if image_count else 0.0,
         "visual_image_count": min(1.0, math.log1p(image_count) / math.log(13.0)),
-        "visual_image_diversity": min(1.0, max(0.0, (1.0 - image_cohesion) * 4.0) * image_reason_scale),
-        "visual_image_outlier": min(1.0, max(0.0, (1.0 - image_min_similarity) * 2.0) * image_reason_scale),
+        "visual_image_diversity": min(1.0, max(0.0, (1.0 - image_cohesion) * 4.0)),
+        "visual_image_outlier": min(1.0, max(0.0, (1.0 - image_min_similarity) * 2.0)),
     }
 
 
@@ -356,8 +376,7 @@ def _visual(gallery: dict, dims: int) -> list[float]:
     if not isinstance(raw, list) or len(raw) != dims:
         return [0.0] * dims
     try:
-        scale = 1.35 if gallery.get("active_reason_code") == "visual_style" else 1.0
-        return [float(value) * scale for value in raw]
+        return [float(value) for value in raw]
     except (TypeError, ValueError):
         return [0.0] * dims
 
@@ -372,6 +391,26 @@ def _active_visual_dims(examples: list[dict]) -> int:
         if isinstance(values, list) and values:
             counts[len(values)] = counts.get(len(values), 0) + 1
     return max(counts, key=counts.get) if counts else 0
+
+
+def _center_visual_matrix(visual, modules: dict[str, Any], mean=None):
+    np = modules["np"]
+    if visual.shape[1] == 0:
+        return visual, []
+    present = np.linalg.norm(visual, axis=1) > 0
+    if mean is None:
+        mean_array = visual[present].mean(axis=0) if int(present.sum()) else np.zeros(visual.shape[1])
+    else:
+        mean_array = np.asarray(mean, dtype="float32")
+    centered = visual.copy()
+    indices = np.flatnonzero(present)
+    values = centered[indices] - mean_array
+    norms = np.linalg.norm(values, axis=1)
+    nonzero = norms > 0
+    values[nonzero] /= norms[nonzero, None]
+    centered[indices] = values
+    centered[~present] = 0.0
+    return centered, [float(value) for value in mean_array]
 
 
 def _fit_vectorizers(examples: list[dict], modules: dict[str, Any]) -> dict:
@@ -391,6 +430,7 @@ def _fit_vectorizers(examples: list[dict], modules: dict[str, Any]) -> dict:
     )
     visual_dims = _active_visual_dims(examples)
     visual = modules["np"].asarray([_visual(item, visual_dims) for item in examples], dtype="float32")
+    visual, visual_mean = _center_visual_matrix(visual, modules)
     matrix = modules["sparse"].hstack(
         [metadata, titles, modules["sparse"].csr_matrix(numeric), modules["sparse"].csr_matrix(visual)],
         format="csr",
@@ -404,6 +444,7 @@ def _fit_vectorizers(examples: list[dict], modules: dict[str, Any]) -> dict:
         "title_vectorizer": title_vectorizer,
         "numeric_names": numeric_names,
         "visual_dims": visual_dims,
+        "visual_mean": visual_mean,
         "metadata_support": metadata_support,
         "matrix": matrix,
     }
@@ -421,6 +462,7 @@ def _transform(examples: list[dict], artifact: dict, modules: dict[str, Any]):
     visual = modules["np"].asarray(
         [_visual(item, artifact["visual_dims"]) for item in examples], dtype="float32"
     )
+    visual, _mean = _center_visual_matrix(visual, modules, artifact.get("visual_mean") or None)
     return modules["sparse"].hstack(
         [metadata, titles, modules["sparse"].csr_matrix(numeric), modules["sparse"].csr_matrix(visual)],
         format="csr",
@@ -438,16 +480,19 @@ def _classifier(modules: dict[str, Any], c_value: float):
 
 
 def _rolling_splits(count: int) -> list[tuple[int, int]]:
-    window = max(20, min(100, count // 5))
-    starts = sorted({max(MIN_LABELED, int(count * fraction)) for fraction in (0.5, 0.65, 0.8)})
-    starts = sorted({*starts, max(MIN_LABELED, count - window)})
+    if count <= MIN_CLASS * 2:
+        return []
+    minimum_train = min(MIN_LABELED, max(MIN_CLASS * 2, count // 2))
+    window = max(10, min(100, count // 5))
+    starts = sorted({max(minimum_train, int(count * fraction)) for fraction in (0.5, 0.65, 0.8)})
+    starts = sorted({*starts, max(minimum_train, count - window)})
     return [(start, min(count, start + window)) for start in starts if start < count]
 
 
 def _select_c(matrix, labels, weights, modules: dict[str, Any]) -> tuple[float, list[dict]]:
     reports: list[dict] = []
     best_c = 0.2
-    best_auc = -1.0
+    best_auc: float | None = None
     for c_value in (0.05, 0.2, 1.0, 4.0):
         aucs = []
         for start, end in _rolling_splits(len(labels)):
@@ -459,34 +504,44 @@ def _select_c(matrix, labels, weights, modules: dict[str, Any]) -> tuple[float, 
             model.fit(matrix[:start], train_labels, sample_weight=weights[:start])
             probabilities = model.predict_proba(matrix[start:end])[:, 1]
             aucs.append(float(modules["roc_auc_score"](test_labels, probabilities)))
-        mean_auc = sum(aucs) / len(aucs) if aucs else 0.0
-        reports.append({"c": c_value, "mean_auc": round(mean_auc, 6), "folds": len(aucs)})
-        if mean_auc > best_auc:
+        mean_auc = sum(aucs) / len(aucs) if aucs else None
+        reports.append({"c": c_value, "mean_auc": None if mean_auc is None else round(mean_auc, 6), "folds": len(aucs)})
+        if mean_auc is not None and (best_auc is None or mean_auc > best_auc):
             best_auc = mean_auc
             best_c = c_value
     return best_c, reports
 
 
-def _fit_calibrator(matrix, labels, weights, c_value: float, modules: dict[str, Any]):
-    records: dict[int, tuple[float, int, float]] = {}
-    for start, end in _rolling_splits(len(labels)):
-        if len(set(labels[:start])) < 2:
-            continue
-        model = _classifier(modules, c_value)
-        model.fit(matrix[:start], labels[:start], sample_weight=weights[:start])
-        for index, (logit, target) in enumerate(
-            zip(model.decision_function(matrix[start:end]), labels[start:end]),
-            start=start,
-        ):
-            relative_position = index / max(1, len(labels) - 1)
-            recency_weight = math.exp(CALIBRATION_RECENCY_DECAY * (relative_position - 1.0))
-            records[index] = (float(logit), int(target), float(weights[index]) * recency_weight)
-    logits = [record[0] for _index, record in sorted(records.items())]
-    targets = [record[1] for _index, record in sorted(records.items())]
-    calibration_weights = [record[2] for _index, record in sorted(records.items())]
-    if len(logits) < 30 or len(set(targets)) < 2:
+def _calibration_start(labels) -> int | None:
+    count = len(labels)
+    start = max(MIN_LABELED, int(count * (1.0 - CALIBRATION_HOLDOUT_FRACTION)))
+    if count - start < MIN_CALIBRATION_SAMPLES:
+        start = count - MIN_CALIBRATION_SAMPLES
+    if start < MIN_CLASS * 2 or len(set(labels[:start])) < 2 or len(set(labels[start:])) < 2:
         return None
-    calibrator = modules["LogisticRegression"](C=1.0, solver="liblinear", max_iter=300, random_state=1702)
+    return start
+
+
+def _fit_calibrator(matrix, labels, weights, c_value: float, modules: dict[str, Any], start: int | None):
+    if start is None:
+        return None
+    model = _classifier(modules, c_value)
+    model.fit(matrix[:start], labels[:start], sample_weight=weights[:start])
+    logits = [float(value) for value in model.decision_function(matrix[start:])]
+    targets = [int(value) for value in labels[start:]]
+    calibration_weights = []
+    for index, weight in enumerate(weights[start:], start=start):
+        relative_position = index / max(1, len(labels) - 1)
+        recency_weight = math.exp(CALIBRATION_RECENCY_DECAY * (relative_position - 1.0))
+        calibration_weights.append(float(weight) * recency_weight)
+    if len(logits) < MIN_CALIBRATION_SAMPLES or len(set(targets)) < 2:
+        return None
+    calibrator = modules["LogisticRegression"](
+        C=CALIBRATION_C,
+        solver="liblinear",
+        max_iter=300,
+        random_state=1702,
+    )
     calibrator.fit(
         modules["np"].asarray(logits).reshape(-1, 1),
         targets,
@@ -528,9 +583,23 @@ def _ece(labels, probabilities, modules: dict[str, Any], bins: int = 10) -> floa
     return result
 
 
-def train_personalized_model(conn: sqlite3.Connection, persist: bool = True) -> dict:
-    signature = model_data_signature(conn)
-    examples = training_examples(conn)
+def train_personalized_model(
+    conn: sqlite3.Connection,
+    persist: bool = True,
+    strict_temporal: bool = False,
+) -> dict:
+    with _MODEL_LOCK:
+        examples = training_examples(conn, strict_temporal=strict_temporal)
+        signature = model_data_signature(conn, examples)
+        return _train_personalized_model(conn, persist=persist, examples=examples, signature=signature)
+
+
+def _train_personalized_model(
+    conn: sqlite3.Connection,
+    persist: bool,
+    examples: list[dict],
+    signature: str,
+) -> dict:
     positives = sum(int(item["label"]) for item in examples)
     negatives = len(examples) - positives
     base = {
@@ -549,13 +618,21 @@ def train_personalized_model(conn: sqlite3.Connection, persist: bool = True) -> 
         fitted = _fit_vectorizers(examples, modules)
         labels = modules["np"].asarray([int(item["label"]) for item in examples], dtype="int8")
         weights = modules["np"].asarray([float(item["sample_weight"]) for item in examples], dtype="float32")
-        selected_c, validation = _select_c(fitted["matrix"], labels, weights, modules)
-        calibrator = _fit_calibrator(fitted["matrix"], labels, weights, selected_c, modules)
+        calibration_start = _calibration_start(labels)
+        selection_end = calibration_start if calibration_start is not None else len(labels)
+        selected_c, validation = _select_c(
+            fitted["matrix"][:selection_end], labels[:selection_end], weights[:selection_end], modules
+        )
+        calibrator = _fit_calibrator(
+            fitted["matrix"], labels, weights, selected_c, modules, calibration_start
+        )
         classifier = _classifier(modules, selected_c)
         classifier.fit(fitted["matrix"], labels, sample_weight=weights)
         bootstrap_models = _bootstrap_classifiers(fitted["matrix"], labels, weights, selected_c, modules)
         version = f"{MODEL_SCHEMA}-{signature}"
-        accepted, acceptance = evaluation_acceptance() if _is_file_database(conn) else (True, {"source": "test"})
+        accepted, acceptance = (
+            evaluation_acceptance(len(examples)) if _is_file_database(conn) else (True, {"source": "test"})
+        )
         artifact = {
             **base,
             "ready": True,
@@ -563,8 +640,15 @@ def train_personalized_model(conn: sqlite3.Connection, persist: bool = True) -> 
             "accepted": accepted,
             "acceptance": acceptance,
             "model_version": version,
+            "score_scale": "probability",
             "selected_c": selected_c,
             "validation": validation,
+            "calibration": {
+                "method": "independent-temporal-holdout",
+                "start": calibration_start,
+                "sample_count": 0 if calibration_start is None else len(labels) - calibration_start,
+                "ready": calibrator is not None,
+            },
             "trained_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
             "classifier": classifier,
             "calibrator": calibrator,
@@ -573,6 +657,7 @@ def train_personalized_model(conn: sqlite3.Connection, persist: bool = True) -> 
             "title_vectorizer": fitted["title_vectorizer"],
             "numeric_names": fitted["numeric_names"],
             "visual_dims": fitted["visual_dims"],
+            "visual_mean": fitted["visual_mean"],
             "metadata_support": fitted["metadata_support"],
             "multi_interest_enabled": False,
         }
@@ -631,26 +716,44 @@ def _record_training_run(conn: sqlite3.Connection, artifact: dict) -> None:
 
 
 def load_personalized_model(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
-    signature = model_data_signature(conn)
-    cached = _MODEL_CACHE.get(signature)
-    if cached is not None:
-        return cached
-    if _is_file_database(conn) and MODEL_PATH.exists():
-        try:
-            modules = sklearn_modules()
-            artifact = modules["joblib"].load(MODEL_PATH)
-            if artifact.get("schema") == MODEL_SCHEMA and artifact.get("signature") == signature:
-                _MODEL_CACHE[signature] = artifact
-                return artifact
-        except Exception:
-            pass
-    if train_if_needed:
-        return train_personalized_model(conn)
-    return {"ready": False, "status": "missing", "signature": signature}
+    with _MODEL_LOCK:
+        examples = training_examples(conn)
+        signature = model_data_signature(conn, examples)
+        cached = _MODEL_CACHE.get(signature)
+        if cached is not None:
+            if _is_file_database(conn) and cached.get("ready"):
+                accepted, acceptance = evaluation_acceptance(int(cached.get("sample_count") or 0))
+                cached["accepted"] = accepted
+                cached["acceptance"] = acceptance
+            return cached
+        if _is_file_database(conn) and MODEL_PATH.exists():
+            try:
+                modules = sklearn_modules()
+                artifact = modules["joblib"].load(MODEL_PATH)
+                if artifact.get("schema") == MODEL_SCHEMA and artifact.get("signature") == signature:
+                    accepted, acceptance = evaluation_acceptance(int(artifact.get("sample_count") or 0))
+                    artifact["accepted"] = accepted
+                    artifact["acceptance"] = acceptance
+                    _MODEL_CACHE[signature] = artifact
+                    return artifact
+            except Exception:
+                pass
+        if train_if_needed:
+            return _train_personalized_model(
+                conn,
+                persist=True,
+                examples=examples,
+                signature=signature,
+            )
+        return {"ready": False, "status": "missing", "signature": signature}
 
 
-def score_personalized_galleries(conn: sqlite3.Connection, galleries: list[dict]) -> tuple[list[dict], dict]:
-    artifact = load_personalized_model(conn)
+def score_personalized_galleries(
+    conn: sqlite3.Connection,
+    galleries: list[dict],
+    artifact: dict | None = None,
+) -> tuple[list[dict], dict]:
+    artifact = load_personalized_model(conn) if artifact is None else artifact
     if not artifact.get("ready") or not galleries:
         return [], artifact
     modules = sklearn_modules()
@@ -678,6 +781,7 @@ def score_personalized_galleries(conn: sqlite3.Connection, galleries: list[dict]
                 "confidence": round(max(0.0, min(1.0, 1.0 - spread * 4.0)), 6),
                 "rank_score": round(probability, 6),
                 "model_version": artifact["model_version"],
+                "score_scale": artifact.get("score_scale", "probability"),
                 "reason_details": {"positive": positive, "negative": negative},
                 "text_visual_disagreement": round(_modality_disagreement(matrix[index], artifact, modules), 6),
             }
@@ -685,12 +789,32 @@ def score_personalized_galleries(conn: sqlite3.Connection, galleries: list[dict]
     return results, artifact
 
 
-def evaluation_acceptance() -> tuple[bool, dict]:
+def evaluation_acceptance(current_sample_count: int | None = None) -> tuple[bool, dict]:
     try:
         report = json.loads(EVALUATION_PATH.read_text(encoding="utf-8"))
         if report.get("model_schema") != MODEL_SCHEMA:
             return False, {"passed": False, "reason": "evaluation report targets a different model schema"}
-        acceptance = (report.get("summary") or {}).get("acceptance") or report.get("acceptance") or {}
+        if report.get("feature_schema") != FEATURE_SCHEMA:
+            return False, {"passed": False, "reason": "evaluation report targets a different feature schema"}
+        generated_at = str(report.get("generated_at") or "")
+        try:
+            generated = datetime.strptime(generated_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False, {"passed": False, "reason": "evaluation report has no valid generation time"}
+        age_days = (datetime.now(timezone.utc) - generated).total_seconds() / 86400.0
+        if age_days < -1 or age_days > 30:
+            return False, {"passed": False, "reason": "evaluation report is older than 30 days"}
+        evaluated_samples = int(report.get("sample_count") or 0)
+        minimum_samples = max(MIN_LABELED, int((current_sample_count or 0) * 0.5))
+        if evaluated_samples < minimum_samples:
+            return False, {
+                "passed": False,
+                "reason": "evaluation report covers too little of the current labeled data",
+                "evaluated_samples": evaluated_samples,
+                "minimum_samples": minimum_samples,
+            }
+        acceptance = dict((report.get("summary") or {}).get("acceptance") or report.get("acceptance") or {})
+        acceptance.update({"generated_at": generated_at, "sample_count": evaluated_samples})
         return bool(acceptance.get("passed")), acceptance
     except (OSError, json.JSONDecodeError):
         return False, {"passed": False, "reason": "no passing temporal evaluation report"}
@@ -741,13 +865,14 @@ def model_public_status(artifact: dict) -> dict:
             "ready", "status", "model_version", "trained_at", "sample_count", "positive_count",
             "negative_count", "selected_c", "validation", "multi_interest_enabled", "error",
             "accepted", "acceptance",
+            "score_scale", "calibration",
         )
         if key in artifact
     }
 
 
 def positive_query_tags(artifact: dict, limit: int = 12, min_support: int = 3) -> list[str]:
-    if not artifact.get("ready") or limit <= 0:
+    if not artifact.get("ready") or not artifact.get("accepted") or limit <= 0:
         return []
     names = list(artifact["dict_vectorizer"].get_feature_names_out())
     coefficients = artifact["classifier"].coef_[0]

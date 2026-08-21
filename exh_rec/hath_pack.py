@@ -13,7 +13,7 @@ from typing import Any
 PACK_LOG_LIMIT = 200
 PACK_LINE_LIMIT = 2000
 DEFAULT_REMOTE_HELPER = "/srv/hath-observer/hath_observer/archive.py"
-REMOTE_OPERATIONS = frozenset({"inspect", "plan", "run"})
+REMOTE_OPERATIONS = frozenset({"inspect", "plan", "run", "trash-plan", "trash-run"})
 
 
 class HathPackError(RuntimeError):
@@ -144,11 +144,22 @@ class HathPackRunner:
         return run_remote_json("inspect")
 
     def preview(self, request: dict[str, Any]) -> dict[str, Any]:
-        plan = run_remote_json("plan", request)
+        return self._preview("plan", "run", request)
+
+    def preview_trash(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._preview("trash-plan", "trash-run", request)
+
+    def _preview(
+        self, plan_operation: str, run_operation: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        plan = run_remote_json(plan_operation, request)
         encoded = json.dumps(plan, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         preview_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         with self._lock:
-            self._previews[preview_id] = dict(plan["request"])
+            self._previews[preview_id] = {
+                "operation": run_operation,
+                "request": dict(plan["request"]),
+            }
             while len(self._previews) > 10:
                 del self._previews[next(iter(self._previews))]
         return {**plan, "preview_id": preview_id}
@@ -158,21 +169,27 @@ class HathPackRunner:
         with self._lock:
             if self._state["state"] == "running":
                 raise HathPackConflict("An H@H archive job is already running")
-            request = self._previews.pop(key, None)
-            if request is None:
+            preview = self._previews.pop(key, None)
+            if preview is None:
                 raise HathPackConflict("Preview is missing or stale; generate a new dry run")
+            operation = str(preview["operation"])
+            request = dict(preview["request"])
             run_id = int(self._state["run_id"]) + 1
             self._state = {
                 **self._idle_state(),
                 "run_id": run_id,
                 "state": "running",
                 "stage": "starting",
-                "message": "Starting remote archive job",
+                "message": (
+                    "Starting remote trash cleanup"
+                    if operation == "trash-run"
+                    else "Starting remote archive job"
+                ),
                 "started_at": utc_timestamp(),
             }
         worker = threading.Thread(
             target=self._run,
-            args=(run_id, request),
+            args=(run_id, operation, request),
             name=f"hath-archive-{run_id}",
             daemon=True,
         )
@@ -226,11 +243,11 @@ class HathPackRunner:
                 }
             )
 
-    def _run(self, run_id: int, request: dict[str, Any]) -> None:
+    def _run(self, run_id: int, operation: str, request: dict[str, Any]) -> None:
         try:
             configuration = configured_or_raise()
             process = subprocess.Popen(
-                build_pack_ssh_command(configuration, "run"),
+                build_pack_ssh_command(configuration, operation),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

@@ -12,6 +12,7 @@ const previewPostedAfterEl = document.querySelector("#previewPostedAfter");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
 const requestIntervalEl = document.querySelector("#requestInterval");
 const banPauseEl = document.querySelector("#banPause");
+const hathDownloadSignalWeightEl = document.querySelector("#hathDownloadSignalWeight");
 const minutesEl = document.querySelector("#minutes");
 const networkProxyEl = document.querySelector("#networkProxy");
 const languageFilterEl = document.querySelector("#languageFilter");
@@ -66,6 +67,7 @@ const hathPackArchiveNameEl = document.querySelector("#hathPackArchiveName");
 const hathPackMegaAccountEl = document.querySelector("#hathPackMegaAccount");
 const hathPackMegaDestinationEl = document.querySelector("#hathPackMegaDestination");
 const hathPackUploadEl = document.querySelector("#hathPackUpload");
+const hathPackCleanupModeEl = document.querySelector("#hathPackCleanupMode");
 const hathPackTrashSourcesEl = document.querySelector("#hathPackTrashSources");
 const hathPackTrashArchiveEl = document.querySelector("#hathPackTrashArchive");
 const hathPackSelectionSummaryEl = document.querySelector("#hathPackSelectionSummary");
@@ -75,6 +77,13 @@ const hathPackSummaryEl = document.querySelector("#hathPackSummary");
 const hathPackBadgeEl = document.querySelector("#hathPackBadge");
 const hathPackTimingEl = document.querySelector("#hathPackTiming");
 const hathPackLogEl = document.querySelector("#hathPackLog");
+const hathTrashSummaryEl = document.querySelector("#hathTrashSummary");
+const hathTrashCandidatesEl = document.querySelector("#hathTrashCandidates");
+const hathTrashSelectAllBtn = document.querySelector("#hathTrashSelectAllBtn");
+const hathTrashSelectNoneBtn = document.querySelector("#hathTrashSelectNoneBtn");
+const hathTrashPreviewBtn = document.querySelector("#hathTrashPreviewBtn");
+const hathTrashDeleteBtn = document.querySelector("#hathTrashDeleteBtn");
+const hathTrashPlanEl = document.querySelector("#hathTrashPlan");
 const viewTitleEl = document.querySelector("#viewTitle");
 const viewSubtitleEl = document.querySelector("#viewSubtitle");
 const reviewQueueCountEl = document.querySelector("#reviewQueueCount");
@@ -92,6 +101,7 @@ let hathPackInventoryPromise = null;
 let hathPackPollTimer = null;
 let hathPackInventory = null;
 let hathPackPreview = null;
+let hathTrashPreview = null;
 let hathPackStatusPayload = null;
 let lastRenderedFetchId = null;
 let currentView = "review";
@@ -135,6 +145,7 @@ const staticTooltips = {
   sampleExtraPages: "Additional gallery sample pages to inspect for preview images on large galleries.",
   requestInterval: "Minimum delay in seconds between ExHentai-related network requests.",
   banPause: "Fallback pause in seconds after a request-rate ban when the ban page does not state an expiry.",
+  hathDownloadSignalWeight: "Learning weight for completed H@H downloads. Set to 0 to disable download-based positive signals.",
   minutes: "Background auto-refresh interval in minutes when Auto refresh is enabled.",
   networkProxy: "Optional HTTP, HTTPS, socks5, or socks5h proxy used for ExHentai and model downloads.",
   languageFilter: "Comma-separated languages allowed in recommendations, for example japanese,chinese.",
@@ -436,6 +447,7 @@ async function loadSettings() {
   sampleExtraPagesEl.value = settings.sample_extra_pages;
   requestIntervalEl.value = settings.request_interval_seconds;
   banPauseEl.value = settings.temporary_ban_pause_seconds;
+  hathDownloadSignalWeightEl.value = settings.hath_download_signal_weight ?? 1.25;
   minutesEl.value = settings.refresh_interval_minutes;
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
@@ -477,6 +489,7 @@ async function saveSettings() {
     sample_extra_pages: Number(sampleExtraPagesEl.value),
     request_interval_seconds: Number(requestIntervalEl.value),
     temporary_ban_pause_seconds: Number(banPauseEl.value),
+    hath_download_signal_weight: Number(hathDownloadSignalWeightEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
     network_proxy: networkProxyEl.value.trim(),
     recommend_language_filter: languageFilterEl.value.trim(),
@@ -747,6 +760,7 @@ function defaultHathArchiveName() {
 function renderHathPackInventory(payload) {
   const candidates = payload.candidates || [];
   const mega = payload.mega || {};
+  const trash = payload.trash || {};
   if (!hathPackArchiveNameEl.value.trim()) {
     hathPackArchiveNameEl.value = defaultHathArchiveName();
   }
@@ -756,7 +770,7 @@ function renderHathPackInventory(payload) {
     hathPackUploadEl.checked = false;
   }
   hathPackUploadEl.disabled = !mega.available;
-  hathPackSummaryEl.textContent = `${candidates.length} archive candidate${candidates.length === 1 ? "" : "s"} on ${payload.download_dir || "the H@H host"}`;
+  hathPackSummaryEl.textContent = `${candidates.length} archive candidate${candidates.length === 1 ? "" : "s"} on ${payload.download_dir || "the H@H host"} · trash ${formatHathBytes(trash.size_bytes || 0)}`;
   hathPackCandidatesEl.innerHTML = candidates.length
     ? `
       <div class="hath-pack-candidate hath-pack-candidate-header" aria-hidden="true">
@@ -774,8 +788,62 @@ function renderHathPackInventory(payload) {
       `).join("")}
     `
     : '<div class="hath-empty">No gallery directories or ZIP files are available.</div>';
+  renderHathTrashInventory(trash);
   invalidateHathPackPreview();
   updateHathPackSelection();
+}
+
+function renderHathTrashInventory(trash) {
+  const jobs = trash.jobs || [];
+  hathTrashCandidatesEl.innerHTML = jobs.length
+    ? `
+      <div class="hath-pack-candidate hath-pack-candidate-header hath-trash-candidate" aria-hidden="true">
+        <span></span><span>Archive job</span><span>Files</span><span>Size</span><span>Modified</span>
+      </div>
+      ${jobs.map((job) => `
+        <label class="hath-pack-candidate hath-trash-candidate">
+          <input type="checkbox" data-hath-trash-job value="${escapeAttr(job.name)}">
+          <span title="${escapeAttr(job.name)}">${escapeHtml(job.name)}</span>
+          <span>${escapeHtml(Number(job.file_count || 0).toLocaleString())}</span>
+          <span>${escapeHtml(formatHathBytes(job.size_bytes || 0))}</span>
+          <span title="${escapeAttr(formatHathDate(job.modified_at))}">${escapeHtml(relativeHathTime(job.modified_at))}</span>
+        </label>
+      `).join("")}
+    `
+    : '<div class="hath-empty">Recoverable trash is empty.</div>';
+  invalidateHathTrashPreview();
+  updateHathTrashSelection();
+}
+
+function selectedHathTrashNames() {
+  return [...hathTrashCandidatesEl.querySelectorAll("input[data-hath-trash-job]:checked")]
+    .map((input) => input.value);
+}
+
+function updateHathTrashSelection() {
+  const selectedNames = new Set(selectedHathTrashNames());
+  const trash = hathPackInventory?.trash || {};
+  const jobs = trash.jobs || [];
+  const selected = jobs.filter((job) => selectedNames.has(job.name));
+  const selectedBytes = selected.reduce((sum, job) => sum + Number(job.size_bytes || 0), 0);
+  hathTrashSummaryEl.textContent = selected.length
+    ? `${selected.length} selected · ${formatHathBytes(selectedBytes)}`
+    : `${jobs.length} job${jobs.length === 1 ? "" : "s"} · ${formatHathBytes(trash.size_bytes || 0)} · ${Number(trash.file_count || 0).toLocaleString()} files`;
+  updateHathTrashControls();
+}
+
+function updateHathTrashControls() {
+  const running = hathPackStatusPayload?.state === "running";
+  const configured = hathPackStatusPayload?.configured === true;
+  hathTrashPreviewBtn.disabled = running || !configured || selectedHathTrashNames().length === 0;
+  hathTrashDeleteBtn.disabled = running || !configured || !hathTrashPreview;
+}
+
+function invalidateHathTrashPreview() {
+  hathTrashPreview = null;
+  hathTrashPlanEl.classList.add("hidden");
+  hathTrashPlanEl.innerHTML = "";
+  updateHathTrashControls();
 }
 
 function selectedHathPackNames() {
@@ -800,6 +868,7 @@ function updateHathPackControls() {
   hathPackBtn.disabled = running || !configured || !hathPackPreview;
   hathPackMegaDestinationEl.disabled = !hathPackUploadEl.checked;
   hathPackTrashArchiveEl.disabled = !hathPackUploadEl.checked;
+  updateHathTrashControls();
 }
 
 function invalidateHathPackPreview() {
@@ -817,6 +886,7 @@ function hathPackRequest() {
     mega_destination: hathPackMegaDestinationEl.value.trim(),
     trash_sources: hathPackTrashSourcesEl.checked,
     trash_archive_after_upload: hathPackTrashArchiveEl.checked,
+    cleanup_mode: hathPackCleanupModeEl.value,
   };
 }
 
@@ -849,7 +919,49 @@ function renderHathPackPlan(plan) {
   `;
 }
 
+async function previewHathTrash() {
+  invalidateHathTrashPreview();
+  hathTrashPreviewBtn.disabled = true;
+  setStatus("Generating archive trash deletion dry run");
+  const payload = await api("/api/integrations/hath/trash/preview", {
+    method: "POST",
+    body: JSON.stringify({ selected: selectedHathTrashNames() }),
+  });
+  hathTrashPreview = payload;
+  hathTrashPlanEl.classList.remove("hidden");
+  hathTrashPlanEl.innerHTML = `
+    <div class="hath-pack-plan-summary">
+      <span class="hath-badge hath-tone-danger">Permanent</span>
+      <strong>${escapeHtml(Number(payload.selected_count || 0).toLocaleString())} trash jobs</strong>
+      <span>${escapeHtml(Number(payload.input_files || 0).toLocaleString())} files</span>
+      <span>${escapeHtml(formatHathBytes(payload.input_bytes || 0))} to free</span>
+    </div>
+    <ol>${(payload.actions || []).map((action) => `<li>${escapeHtml(action.message)}</li>`).join("")}</ol>
+  `;
+  updateHathTrashControls();
+  setStatus(`Trash dry run ready for ${payload.selected_count || 0} jobs`);
+}
+
+async function startHathTrashDelete() {
+  if (!hathTrashPreview) return;
+  if (!confirm(
+    `Permanently delete ${hathTrashPreview.selected_count || 0} trash jobs?\n\nFiles: ${Number(hathTrashPreview.input_files || 0).toLocaleString()}\nSpace to free: ${formatHathBytes(hathTrashPreview.input_bytes || 0)}\n\nThis cannot be undone.`
+  )) {
+    return;
+  }
+  hathTrashDeleteBtn.disabled = true;
+  setStatus("Starting permanent archive trash deletion");
+  const payload = await api("/api/integrations/hath/trash/start", {
+    method: "POST",
+    body: JSON.stringify({ preview_id: hathTrashPreview.preview_id }),
+  });
+  hathTrashPreview = null;
+  renderHathPackStatus(payload);
+  setStatus("Archive trash deletion started");
+}
+
 function renderHathPackStatus(payload) {
+  const previousState = hathPackStatusPayload?.state;
   hathPackStatusPayload = payload;
   const state = String(payload.state || "idle");
   const states = {
@@ -895,6 +1007,9 @@ function renderHathPackStatus(payload) {
       loadHathPackStatus().catch((error) => setStatus(error.message, true));
     }, 2000);
   }
+  if (previousState === "running" && state !== "running") {
+    loadHathPackInventory().catch((error) => setStatus(error.message, true));
+  }
   updateHathPackControls();
 }
 
@@ -904,9 +1019,13 @@ async function startHathPack() {
   const cleanup = [];
   if (request.trash_sources) cleanup.push("selected sources");
   if (request.trash_archive_after_upload) cleanup.push("the local archive");
+  const permanentCleanup = cleanup.length && request.cleanup_mode === "delete";
   if (!confirm(
-    `Run the previewed archive plan?\n\nArchive: ${request.archive_name}\nSources: ${hathPackPreview.selected_count}\nMEGA: ${request.upload ? `${hathPackMegaAccountEl.textContent} · ${request.mega_destination}` : "No upload"}`
-    + (cleanup.length ? `\nCleanup: move ${cleanup.join(" and ")} to recoverable trash` : "")
+    `Run the previewed archive plan?\n\nArchive: ${request.archive_name}\nSources: ${hathPackPreview.selected_count}\nMEGA: ${request.upload ? `${hathPackMegaAccountEl.textContent} · ${hathPackPreview.mega_upload_path || request.mega_destination}` : "No upload"}`
+    + (cleanup.length
+      ? `\nCleanup: ${permanentCleanup ? "PERMANENTLY DELETE" : "move to recoverable trash"} ${cleanup.join(" and ")}`
+      : "")
+    + (permanentCleanup ? "\n\nThis cleanup cannot be undone." : "")
   )) {
     return;
   }
@@ -2111,7 +2230,7 @@ function renderGalleryCards(items, append = false) {
       </div>
       <div class="body">
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
-        <div class="meta">${escapeHtml(item.category || "Unknown")} · ${Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}</div>
+        <div class="meta">${escapeHtml(item.category || "Unknown")} · ${item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}</div>
         ${Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
@@ -2594,6 +2713,34 @@ hathPackPreviewBtn.addEventListener("click", () => previewHathPack().catch((erro
   updateHathPackControls();
 }));
 hathPackRefreshBtn.addEventListener("click", () => loadHathPackInventory().catch((error) => setStatus(error.message, true)));
+hathTrashPreviewBtn.addEventListener("click", () => previewHathTrash().catch((error) => {
+  setStatus(error.message, true);
+  updateHathTrashControls();
+}));
+hathTrashDeleteBtn.addEventListener("click", () => startHathTrashDelete().catch((error) => {
+  setStatus(error.message, true);
+  updateHathTrashControls();
+  loadHathPackStatus().catch(() => {});
+}));
+hathTrashSelectAllBtn.addEventListener("click", () => {
+  for (const input of hathTrashCandidatesEl.querySelectorAll("input[data-hath-trash-job]")) {
+    input.checked = true;
+  }
+  invalidateHathTrashPreview();
+  updateHathTrashSelection();
+});
+hathTrashSelectNoneBtn.addEventListener("click", () => {
+  for (const input of hathTrashCandidatesEl.querySelectorAll("input[data-hath-trash-job]")) {
+    input.checked = false;
+  }
+  invalidateHathTrashPreview();
+  updateHathTrashSelection();
+});
+hathTrashCandidatesEl.addEventListener("change", (event) => {
+  if (!event.target.matches("input[data-hath-trash-job]")) return;
+  invalidateHathTrashPreview();
+  updateHathTrashSelection();
+});
 hathPackSelectAllBtn.addEventListener("click", () => {
   for (const input of hathPackCandidatesEl.querySelectorAll("input[data-hath-pack-source]:not(:disabled)")) {
     input.checked = true;
@@ -2617,6 +2764,7 @@ for (const element of [
   hathPackArchiveNameEl,
   hathPackMegaDestinationEl,
   hathPackUploadEl,
+  hathPackCleanupModeEl,
   hathPackTrashSourcesEl,
   hathPackTrashArchiveEl,
 ]) {

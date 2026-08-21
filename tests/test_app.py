@@ -2330,6 +2330,7 @@ class AppTest(unittest.TestCase):
                         "recommend_model_mode": "visual",
                         "preview_freshness_weight": "14.5",
                         "preview_posted_after": "2026-06-01",
+                        "hath_download_signal_weight": "0.5",
                         "review_require_bootstrap_match": False,
                         "visual_encoder": "simple",
                         "dinov2_device": "CUDA:0",
@@ -2349,6 +2350,7 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["recommend_model_mode"], "visual")
                 self.assertEqual(settings["preview_freshness_weight"], 14.5)
                 self.assertEqual(settings["preview_posted_after"], "2026-06-01")
+                self.assertEqual(settings["hath_download_signal_weight"], 0.5)
                 self.assertFalse(settings["review_require_bootstrap_match"])
                 self.assertEqual(settings["visual_encoder"], "simple")
                 self.assertEqual(settings["visual"]["default_encoder"], "simple")
@@ -2467,6 +2469,7 @@ class AppTest(unittest.TestCase):
                         "recommend_candidate_limit": "bad",
                         "preview_freshness_weight": "bad",
                         "preview_posted_after": "not-a-date",
+                        "hath_download_signal_weight": "bad",
                     }
                 )
 
@@ -2481,6 +2484,7 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(recommend_candidate_limit(conn), 2000)
                     self.assertEqual(db.get_setting(conn, "preview_freshness_weight", ""), "8.0")
                     self.assertEqual(db.get_setting(conn, "preview_posted_after", "missing"), "")
+                    self.assertEqual(db.get_setting(conn, "hath_download_signal_weight", ""), "1.25")
 
     def test_get_settings_defaults_corrupt_numeric_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2498,6 +2502,7 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "recommend_candidate_limit", "bad")
                     db.set_setting(conn, "preview_freshness_weight", "bad")
                     db.set_setting(conn, "preview_posted_after", "not-a-date")
+                    db.set_setting(conn, "hath_download_signal_weight", "bad")
 
                 settings = get_settings()
 
@@ -2511,6 +2516,7 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)
                 self.assertEqual(settings["preview_freshness_weight"], 8.0)
                 self.assertEqual(settings["preview_posted_after"], "")
+                self.assertEqual(settings["hath_download_signal_weight"], 1.25)
 
     def test_get_settings_reports_missing_common_cookie_keys(self):
         with tempfile.TemporaryDirectory() as tmpdir:

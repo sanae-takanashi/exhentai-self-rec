@@ -100,6 +100,25 @@ CREATE TABLE IF NOT EXISTS gallery_visual_images (
     PRIMARY KEY(gallery_url, image_key, embedding_version)
 );
 
+CREATE TABLE IF NOT EXISTS gallery_feature_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source TEXT NOT NULL DEFAULT 'metadata',
+    title TEXT NOT NULL,
+    title_jpn TEXT,
+    category TEXT,
+    uploader TEXT,
+    rating REAL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    tag_weights_json TEXT NOT NULL DEFAULT '{}',
+    page_count INTEGER,
+    detail_fetched_at TEXT,
+    visual_embedding_json TEXT,
+    visual_embedding_version TEXT,
+    visual_embedding_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS gallery_marks (
     gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK(kind IN ('favorite', 'ban')),
@@ -112,6 +131,18 @@ CREATE TABLE IF NOT EXISTS gallery_classification_overrides (
     gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
     classification TEXT NOT NULL CHECK(classification IN ('review', 'updates')),
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gallery_classification_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    sampling_strategy TEXT NOT NULL CHECK(sampling_strategy IN ('random', 'uncertainty')),
+    sampling_frame TEXT NOT NULL DEFAULT 'full-library',
+    selection_probability REAL NOT NULL,
+    model_probability REAL,
+    classification TEXT CHECK(classification IN ('review', 'updates')),
+    sampled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    labeled_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS hath_clients (
@@ -193,11 +224,18 @@ CREATE TABLE IF NOT EXISTS feature_weights (
 
 CREATE INDEX IF NOT EXISTS idx_galleries_last_seen ON galleries(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_feedback_gallery ON feedback(gallery_url, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_gallery_id ON feedback(gallery_url, id DESC);
 CREATE INDEX IF NOT EXISTS idx_impressions_created ON recommendation_impressions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_impressions_gallery ON recommendation_impressions(gallery_url, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_training_created ON model_training_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gallery_marks_kind ON gallery_marks(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gallery_snapshots_lookup
+    ON gallery_feature_snapshots(gallery_url, captured_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_classification_overrides_kind ON gallery_classification_overrides(classification, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_classification_samples_open
+    ON gallery_classification_samples(classification, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_classification_samples_gallery
+    ON gallery_classification_samples(gallery_url, sampled_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hath_downloads_status ON hath_downloads(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hath_downloads_gallery ON hath_downloads(gallery_url, status);
 CREATE INDEX IF NOT EXISTS idx_hath_events_client ON hath_events(client_id, id DESC);
@@ -230,6 +268,7 @@ def connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -254,6 +293,12 @@ def init_db() -> None:
         ensure_column(conn, "galleries", "visual_embedding_json", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_version", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_at", "TEXT")
+        ensure_column(
+            conn,
+            "gallery_classification_samples",
+            "sampling_frame",
+            "TEXT NOT NULL DEFAULT 'legacy-unknown'",
+        )
         ensure_column(conn, "fetch_runs", "enriched_count", "INTEGER NOT NULL DEFAULT 0")
         defaults = {
             "auto_refresh": "1",
@@ -289,6 +334,23 @@ def init_db() -> None:
             )
             WHERE gallery_url IS NULL
               AND EXISTS (SELECT 1 FROM galleries g WHERE g.gid = hath_downloads.gid)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO gallery_feature_snapshots(
+                gallery_url, captured_at, source, title, title_jpn, category, uploader,
+                rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
+                visual_embedding_json, visual_embedding_version, visual_embedding_at
+            )
+            SELECT g.url, CURRENT_TIMESTAMP, 'migration-current', g.title, g.title_jpn,
+                   g.category, g.uploader, g.rating, g.tags_json, g.tag_weights_json,
+                   g.page_count, g.detail_fetched_at, g.visual_embedding_json,
+                   g.visual_embedding_version, g.visual_embedding_at
+            FROM galleries g
+            WHERE NOT EXISTS (
+                SELECT 1 FROM gallery_feature_snapshots s WHERE s.gallery_url = g.url
+            )
             """
         )
 
@@ -333,3 +395,50 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         except json.JSONDecodeError:
             data["tag_weights"] = {}
     return data
+
+
+def snapshot_gallery_features(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    source: str,
+    captured_at: str | None = None,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT title, title_jpn, category, uploader, rating, tags_json, tag_weights_json,
+               page_count, detail_fetched_at, visual_embedding_json,
+               visual_embedding_version, visual_embedding_at
+        FROM galleries
+        WHERE url = ?
+        """,
+        (gallery_url,),
+    ).fetchone()
+    if row is None:
+        return None
+    cursor = conn.execute(
+        """
+        INSERT INTO gallery_feature_snapshots(
+            gallery_url, captured_at, source, title, title_jpn, category, uploader,
+            rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
+            visual_embedding_json, visual_embedding_version, visual_embedding_at
+        ) VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            gallery_url,
+            captured_at,
+            str(source or "metadata")[:40],
+            row["title"],
+            row["title_jpn"],
+            row["category"],
+            row["uploader"],
+            row["rating"],
+            row["tags_json"],
+            row["tag_weights_json"],
+            row["page_count"],
+            row["detail_fetched_at"],
+            row["visual_embedding_json"],
+            row["visual_embedding_version"],
+            row["visual_embedding_at"],
+        ),
+    )
+    return int(cursor.lastrowid)

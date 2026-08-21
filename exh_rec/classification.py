@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sqlite3
 import tempfile
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-CLASSIFIER_SCHEMA = "continuing-classifier-v1"
+CLASSIFIER_SCHEMA = "continuing-classifier-v2"
 MIN_EXAMPLES = 20
 MIN_CLASS_EXAMPLES = 5
 MIN_BALANCED_ACCURACY = 0.65
@@ -52,14 +53,39 @@ def _modules() -> dict[str, Any]:
 def _signature(conn: sqlite3.Connection) -> str:
     rows = conn.execute(
         """
-        SELECT o.gallery_url, o.classification, o.updated_at, g.title, g.title_jpn,
+        SELECT labels.gallery_url, labels.classification, labels.updated_at, g.title, g.title_jpn,
                g.category, g.page_count, g.parent_url
-        FROM gallery_classification_overrides o
-        JOIN galleries g ON g.url = o.gallery_url
-        ORDER BY o.gallery_url
+        FROM (
+            SELECT gallery_url, classification, updated_at
+            FROM gallery_classification_overrides
+            UNION ALL
+            SELECT s.gallery_url, s.classification, s.labeled_at AS updated_at
+            FROM gallery_classification_samples s
+            WHERE s.sampling_strategy = 'uncertainty' AND s.classification IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM gallery_classification_overrides o WHERE o.gallery_url = s.gallery_url
+              )
+        ) labels
+        JOIN galleries g ON g.url = labels.gallery_url
+        ORDER BY labels.gallery_url
         """
     ).fetchall()
-    payload = json.dumps([list(row) for row in rows], ensure_ascii=True, separators=(",", ":"))
+    evaluation_rows = conn.execute(
+        """
+        SELECT gallery_url, sampling_strategy, sampling_frame, selection_probability, classification, labeled_at
+        FROM gallery_classification_samples
+        WHERE classification IS NOT NULL
+        ORDER BY id
+        """
+    ).fetchall()
+    payload = json.dumps(
+        {
+            "training": [list(row) for row in rows],
+            "sampled": [list(row) for row in evaluation_rows],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -68,10 +94,20 @@ def _examples(conn: sqlite3.Connection) -> list[dict]:
         dict(row)
         for row in conn.execute(
             """
-            SELECT g.*, o.classification
-            FROM gallery_classification_overrides o
-            JOIN galleries g ON g.url = o.gallery_url
-            ORDER BY o.updated_at, o.gallery_url
+            SELECT g.*, labels.classification
+            FROM (
+                SELECT gallery_url, classification, updated_at
+                FROM gallery_classification_overrides
+                UNION ALL
+                SELECT s.gallery_url, s.classification, s.labeled_at AS updated_at
+                FROM gallery_classification_samples s
+                WHERE s.sampling_strategy = 'uncertainty' AND s.classification IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM gallery_classification_overrides o WHERE o.gallery_url = s.gallery_url
+                  )
+            ) labels
+            JOIN galleries g ON g.url = labels.gallery_url
+            ORDER BY labels.updated_at, labels.gallery_url
             """
         )
     ]
@@ -148,24 +184,34 @@ def train_continuing_classifier(conn: sqlite3.Connection, persist: bool = True) 
         return status
     try:
         modules = _modules()
-        matrix, vectorizers = _fit_matrix(items, modules)
         labels = modules["np"].asarray([1 if item["classification"] == "updates" else 0 for item in items])
         folds = min(4, updates, reviews)
         validation = []
         splitter = modules["StratifiedKFold"](n_splits=folds, shuffle=True, random_state=20260812)
-        for train_index, test_index in splitter.split(matrix, labels):
+        indices = modules["np"].arange(len(items))
+        for train_index, test_index in splitter.split(indices, labels):
+            train_items = [items[int(index)] for index in train_index]
+            test_items = [items[int(index)] for index in test_index]
+            train_matrix, fold_vectorizers = _fit_matrix(train_items, modules)
+            test_matrix = _transform(test_items, fold_vectorizers, modules)
             model = modules["LogisticRegression"](
                 C=0.5, class_weight="balanced", solver="liblinear", max_iter=400, random_state=20260812
             )
-            model.fit(matrix[train_index], labels[train_index])
-            predicted = model.predict(matrix[test_index])
+            model.fit(train_matrix, labels[train_index])
+            predicted = model.predict(test_matrix)
             validation.append(float(modules["balanced_accuracy_score"](labels[test_index], predicted)))
         mean_accuracy = sum(validation) / len(validation)
+        matrix, vectorizers = _fit_matrix(items, modules)
         model = modules["LogisticRegression"](
             C=0.5, class_weight="balanced", solver="liblinear", max_iter=400, random_state=20260812
         )
         model.fit(matrix, labels)
-        accepted = mean_accuracy >= MIN_BALANCED_ACCURACY
+        unbiased = _unbiased_evaluation(conn, model, vectorizers, modules)
+        accepted = (
+            mean_accuracy >= MIN_BALANCED_ACCURACY
+            and unbiased.get("ready", False)
+            and float(unbiased.get("balanced_accuracy") or 0.0) >= MIN_BALANCED_ACCURACY
+        )
         artifact = {
             **base,
             **vectorizers,
@@ -174,6 +220,7 @@ def train_continuing_classifier(conn: sqlite3.Connection, persist: bool = True) 
             "accepted": accepted,
             "status": "ready" if accepted else "shadow",
             "balanced_accuracy": round(mean_accuracy, 6),
+            "unbiased_evaluation": unbiased,
             "trained_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         }
         _CACHE.clear()
@@ -247,6 +294,141 @@ def public_classifier_status(artifact: dict) -> dict:
         for key in (
             "ready", "accepted", "status", "sample_count", "updates_count", "review_count",
             "balanced_accuracy", "trained_at", "error",
+            "unbiased_evaluation",
         )
         if key in artifact
+    }
+
+
+def sample_continuing_classifier_candidates(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    random_fraction: float = 0.30,
+    seed: int | None = None,
+) -> list[dict]:
+    limit = max(1, min(200, int(limit)))
+    random_fraction = max(0.1, min(0.9, float(random_fraction)))
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT g.*
+            FROM galleries g
+            WHERE NOT EXISTS (
+                SELECT 1 FROM gallery_classification_overrides o WHERE o.gallery_url = g.url
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM gallery_classification_samples s WHERE s.gallery_url = g.url
+              )
+            ORDER BY g.last_seen_at DESC
+            """
+        )
+    ]
+    if not rows:
+        return []
+    artifact = load_continuing_classifier(conn)
+    probabilities = [0.5] * len(rows)
+    if artifact.get("ready"):
+        modules = _modules()
+        probabilities = [float(value) for value in artifact["model"].predict_proba(
+            _transform(rows, artifact, modules)
+        )[:, 1]]
+    random_count = min(len(rows), max(1, round(limit * random_fraction)))
+    rng = random.Random(seed if seed is not None else int(time.time() // 86400))
+    random_indices = set(rng.sample(range(len(rows)), random_count))
+    remaining = [index for index in range(len(rows)) if index not in random_indices]
+    uncertainty_count = min(limit - random_count, len(remaining))
+    uncertainty_indices = sorted(remaining, key=lambda index: abs(probabilities[index] - 0.5))[:uncertainty_count]
+    selected = [
+        (index, "random", random_count / len(rows)) for index in sorted(random_indices)
+    ] + [
+        (index, "uncertainty", uncertainty_count / max(1, len(remaining)))
+        for index in uncertainty_indices
+    ]
+    result = []
+    for index, strategy, selection_probability in selected:
+        cursor = conn.execute(
+            """
+            INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, sampling_frame,
+                selection_probability, model_probability
+            ) VALUES (?, ?, 'full-library', ?, ?)
+            """,
+            (rows[index]["url"], strategy, selection_probability, probabilities[index]),
+        )
+        result.append(
+            {
+                "id": int(cursor.lastrowid),
+                "gallery_url": rows[index]["url"],
+                "title": rows[index].get("title"),
+                "sampling_strategy": strategy,
+                "sampling_frame": "full-library",
+                "selection_probability": round(selection_probability, 8),
+                "model_probability": round(probabilities[index], 6),
+            }
+        )
+    return result
+
+
+def label_continuing_classifier_sample(
+    conn: sqlite3.Connection,
+    sample_id: int,
+    classification: str,
+) -> dict:
+    classification = str(classification or "").strip().lower()
+    if classification not in {"review", "updates"}:
+        raise ValueError("classification must be review or updates")
+    cursor = conn.execute(
+        """
+        UPDATE gallery_classification_samples
+        SET classification = ?, labeled_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND classification IS NULL
+        """,
+        (classification, int(sample_id)),
+    )
+    if not cursor.rowcount:
+        raise ValueError("classification sample not found or already labeled")
+    row = conn.execute(
+        "SELECT * FROM gallery_classification_samples WHERE id = ?",
+        (int(sample_id),),
+    ).fetchone()
+    train_continuing_classifier(conn)
+    return dict(row)
+
+
+def _unbiased_evaluation(conn, model, vectorizers: dict, modules: dict[str, Any]) -> dict:
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT g.*, s.classification, s.selection_probability
+            FROM gallery_classification_samples s
+            JOIN galleries g ON g.url = s.gallery_url
+            WHERE s.sampling_strategy = 'random'
+              AND s.sampling_frame = 'full-library'
+              AND s.classification IS NOT NULL
+            ORDER BY s.labeled_at, s.id
+            """
+        )
+    ]
+    updates = sum(row["classification"] == "updates" for row in rows)
+    reviews = len(rows) - updates
+    base = {"sample_count": len(rows), "updates_count": updates, "review_count": reviews}
+    if len(rows) < MIN_EXAMPLES or min(updates, reviews) < MIN_CLASS_EXAMPLES:
+        return {**base, "ready": False, "status": "insufficient-data"}
+    labels = modules["np"].asarray([1 if row["classification"] == "updates" else 0 for row in rows])
+    predicted = model.predict(_transform(rows, vectorizers, modules))
+    weights = modules["np"].asarray([
+        1.0 / max(1e-9, float(row["selection_probability"])) for row in rows
+    ])
+    class_scores = []
+    for value in (0, 1):
+        mask = labels == value
+        class_scores.append(float(weights[mask & (predicted == labels)].sum() / weights[mask].sum()))
+    return {
+        **base,
+        "ready": True,
+        "status": "ready",
+        "balanced_accuracy": round(sum(class_scores) / 2.0, 6),
+        "selection": "inverse-probability-weighted random exploration holdout",
     }
