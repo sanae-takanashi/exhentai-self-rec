@@ -74,7 +74,7 @@
 
 served NDCG@20 相对最佳 baseline 的 95% 差值区间为 `[0.192446, 0.417427]`，P@10 差值区间为 `[0.120118, 0.519882]`。除严格快照覆盖外其余 gate 均通过。因此结论是：个性化模型非常值得保留，但不能据此替换 legacy fallback；待未来严格快照覆盖达到 80% 且至少 3 折后再自动裁定。
 
-当前 artifact 为 `personalized-content-v4-b475265303785041`，`ready: true`、独立 calibration 207 条、`accepted: false`。continuing classifier 的 55 条旧 override 全部是 `updates`，没有 `review`，目前保持 `insufficient-data`。数据库中有 60 条待标注样本：早期 30 条已标记为 `legacy-unknown`、不进入无偏评估；新的 `full-library` 30 条包含 9 条随机 holdout 与 21 条主动样本。
+当前 artifact 为 `personalized-content-v4-03347a2789f184bd`，`ready: true`、独立 calibration 207 条、`accepted: false`。签名变化来自 embedding digest 表示升级；continuing classifier 的 55 条旧 override 全部是 `updates`，没有 `review`，目前保持 `insufficient-data`。数据库中有 60 条待标注样本：早期 30 条已标记为 `legacy-unknown`、不进入无偏评估；新的 `full-library` 30 条包含 9 条随机 holdout 与 21 条主动样本。
 
 ## 六项建议完成情况
 
@@ -82,15 +82,29 @@ served NDCG@20 相对最佳 baseline 的 95% 差值区间为 `[0.192446, 0.41742
 2. **评估重构：完成。** 非重叠窗口、95% CI、四类 baseline、严格覆盖 gate 均已落地。
 3. **独立 calibration：完成。** 超参数选择与校准 holdout 分离。
 4. **legacy / 视觉 / block 决策：完成。** 保留 legacy fallback；采纳 personalized 视觉中心化；否决统一 block 平衡。证据保存在 `data/recommendation-feature-ablation.json`。
-5. **classifier 主动标注：完成基础设施。** 已建立全库 sampling frame 的真实待标注集；随机 holdout 未满足数量前不允许 classifier 自动隐藏项目。生成与标注命令分别为 `python scripts/classification_sampling.py --sample 30` 和 `python scripts/classification_sampling.py --label <id> --classification review|updates`。
+5. **classifier 主动标注：完成基础设施与 UI。** 已建立全库 sampling frame 的真实待标注集；随机 holdout 未满足数量前不允许 classifier 自动隐藏项目。主界面的 `Classifier` 页签可查看封面、样张和原站链接，并直接标注 `Review` / `Updates`；命令行仍可使用 `python scripts/classification_sampling.py --sample 30` 生成样本，或使用 `python scripts/classification_sampling.py --label <id> --classification review|updates` 写入标签。
 6. **热路径：完成。** 缓存实测：tag corpus 197.1ms -> 24.7ms，series 361.9ms -> 25.6ms，related index 533.7ms -> 26.1ms，queue counts 2175.3ms -> 0.8ms。
 
 后续不再是代码欠账，而是数据积累：继续正常反馈以形成严格快照窗口，并人工标注 `gallery_classification_samples`，直到随机 holdout 满足类别与数量门槛。
 
+## `ff704b3` 后续评论复核
+
+针对修复提交 `ff704b3` 的三条新增评论，复核结论如下。
+
+| 评论 | 裁定 | 处理 |
+| --- | --- | --- |
+| feature snapshot 会无限写入重复行 | 成立，属于真实的潜在增长缺陷 | `snapshot_gallery_features` 现在与目标时间点之前的最近快照比较；所有特征完全相同时跳过写入，特征变化时保留新快照。显式导入较早时间点时只与该时间点之前的数据比较，避免被未来的相同状态错误去重。真实库重复调用验证为 8472 -> 8472。 |
+| personalized signature 随标签数线性放大 | 成立，但“只哈希 embedding version/length”不安全 | 新增并回填 `visual_embedding_digest`，签名只序列化 SHA-256 digest、JSON 长度和版本，不再序列化完整向量。相同版本、相同长度但内容不同的向量仍会改变签名。训练样本的 feature snapshot 查找同时由每标签一次查询改为分块 CTE 批量查询，消除更主要的 N+1 成本。 |
+| visual-only 仍走 additive greedy diversity | 成立，低优先级但与 F1 同类 | visual-only 项显式携带 `score_scale: similarity`，与 probability 一起走 near-score-window diversifier；相似度原始 score 不再被 `0.45` 累加惩罚直接改写。 |
+
+真实库有 1033 个训练样本、约 3.85 MB embedding JSON。修改前 `training_examples()` 为 377.19 ms、签名为 29.54 ms；修改后连续五次分别为 106.29-113.21 ms 和 17.32-20.78 ms，约提升 3.3x 和 1.4x-1.7x。新签名 `03347a2789f184bd` 连续五次一致；签名值变化是表示方式升级的预期结果，不代表训练数据变化。
+
+评论中的 benchmark caveat 成立：`data/recommendation-evaluation*.json` 和 feature ablation JSON 位于 gitignored `data/`，本机测量及备份仍在，但仅凭 Git 仓库无法独立复现报告中的具体数值。因此文档将这些数字继续标注为本地实测证据，而不是随源码发布的可复现实验制品。
+
 ## 验证
 
-- 模型、排序、评估、分类器和 API 专项测试：237 个通过。
-- 全量 Python 测试：344 个运行，340 个通过、1 个跳过、3 个失败。
+- 本次模型和排序专项测试：119 个通过；新增 6 个回归用例覆盖快照去重、历史回填、签名内容敏感性和 visual-only diversity。
+- 全量 Python 测试：352 个运行，348 个通过、1 个跳过、3 个失败。
 - 3 个失败均来自本轮开始前已有未提交改动中的 H@H archive 测试，原因是 Windows 执行时生成 `\\` 路径，而测试固定期望 `/`；本轮未修改或回退该模块。
 - `node.exe --check static/app.js` 通过。
 - 严格报告、诊断报告和 feature ablation 均成功生成并通过 JSON 重解析。

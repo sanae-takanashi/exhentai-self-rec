@@ -44,6 +44,11 @@ from .net import (
 )
 from .hath import HathPayloadError, hath_status, ingest_event_batch
 from .hath_pack import HATH_PACK_RUNNER, HathPackConflict, HathPackError
+from .classification import (
+    label_continuing_classifier_sample,
+    load_continuing_classifier,
+    public_classifier_status,
+)
 from .personalized import hath_download_signal_weight
 from .recommender import (
     clear_feedback,
@@ -261,6 +266,20 @@ class Handler(BaseHTTPRequestHandler):
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
                     self.send_json(continuing_update_payload(conn, limit=limit, offset=offset, filter_text=filter_text))
+            elif path == "/api/classification-samples":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                limit = query_int(query, "limit", default=40, lower=1, upper=100)
+                offset = query_int(query, "offset", default=0, lower=0, upper=10000)
+                filter_text = query.get("filter", query.get("filter_text", [""]))[0]
+                with db.connect() as conn:
+                    self.send_json(
+                        classification_sample_payload(
+                            conn,
+                            limit=limit,
+                            offset=offset,
+                            filter_text=filter_text,
+                        )
+                    )
             elif path == "/api/marks":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
@@ -397,6 +416,27 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
                 self.send_json({"ok": True, "classification": classification, "review": review, "updates": updates})
+            elif path == "/api/classification-samples/label":
+                payload = self.read_json()
+                try:
+                    sample_id = int(payload.get("sample_id"))
+                except (TypeError, ValueError) as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "sample_id must be an integer") from exc
+                try:
+                    with db.connect() as conn:
+                        sample = label_continuing_classifier_sample(
+                            conn,
+                            sample_id,
+                            str(payload.get("classification") or ""),
+                        )
+                        page = classification_sample_payload(
+                            conn,
+                            limit=bounded_int(payload.get("limit"), default=40, lower=1, upper=100),
+                            filter_text=payload.get("filter_text"),
+                        )
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json({"ok": True, "sample": sample, "page": page})
             elif path == "/api/feedback":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -3159,6 +3199,94 @@ def continuing_update_payload(
     return {**page, "last_fetch": last_fetch_run(conn)}
 
 
+def classification_sample_payload(
+    conn,
+    limit: int = 40,
+    offset: int = 0,
+    filter_text: str | None = None,
+) -> dict:
+    rows = conn.execute(
+        """
+        SELECT s.id AS classification_sample_id, s.sampling_strategy,
+               s.sampling_frame, s.sampled_at, g.*
+        FROM gallery_classification_samples s
+        JOIN galleries g ON g.url = s.gallery_url
+        WHERE s.sampling_frame = 'full-library'
+          AND s.classification IS NULL
+        ORDER BY s.sampled_at, s.id
+        """
+    ).fetchall()
+    items = [gallery_db_row_payload(conn, row) for row in rows]
+    normalized_filter = str(filter_text or "").strip().lower()
+    if normalized_filter:
+        items = [item for item in items if gallery_matches_filter(item, normalized_filter)]
+    total = len(items)
+    offset = max(0, int(offset))
+    limit = max(1, int(limit))
+    page_items = items[offset : offset + limit]
+    counts = {
+        "pending": int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM gallery_classification_samples
+                WHERE sampling_frame = 'full-library' AND classification IS NULL
+                """
+            ).fetchone()[0]
+        ),
+        "labeled": int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM gallery_classification_samples
+                WHERE sampling_frame = 'full-library' AND classification IS NOT NULL
+                """
+            ).fetchone()[0]
+        ),
+        "random_labeled": int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM gallery_classification_samples
+                WHERE sampling_frame = 'full-library'
+                  AND sampling_strategy = 'random'
+                  AND classification IS NOT NULL
+                """
+            ).fetchone()[0]
+        ),
+        "random_review": int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM gallery_classification_samples
+                WHERE sampling_frame = 'full-library'
+                  AND sampling_strategy = 'random'
+                  AND classification = 'review'
+                """
+            ).fetchone()[0]
+        ),
+        "random_updates": int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM gallery_classification_samples
+                WHERE sampling_frame = 'full-library'
+                  AND sampling_strategy = 'random'
+                  AND classification = 'updates'
+                """
+            ).fetchone()[0]
+        ),
+    }
+    return {
+        "items": page_items,
+        "total": total,
+        "next_offset": offset + len(page_items),
+        "has_more": offset + len(page_items) < total,
+        "counts": counts,
+        "classifier": public_classifier_status(load_continuing_classifier(conn)),
+    }
+
+
 def queue_counts_payload(conn) -> dict[str, int]:
     database_row = next((row for row in conn.execute("PRAGMA database_list") if row[1] == "main"), None)
     database_key = str(database_row[2] or "") if database_row else ""
@@ -3171,6 +3299,8 @@ def queue_counts_payload(conn) -> dict[str, int]:
             (SELECT COALESCE(MAX(id), 0) FROM feedback) AS feedback_version,
             (SELECT COALESCE(MAX(updated_at), '') FROM gallery_marks) AS mark_version,
             (SELECT COALESCE(MAX(updated_at), '') FROM gallery_classification_overrides) AS classification_version,
+            (SELECT COUNT(*) FROM gallery_classification_samples
+             WHERE sampling_frame = 'full-library' AND classification IS NULL) AS classifier_pending,
             (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, '|'), '') FROM settings
              WHERE key IN ('recommend_candidate_limit', 'recommend_language_filter',
                            'recommend_model_mode', 'review_require_bootstrap_match')) AS settings_version
@@ -3203,6 +3333,7 @@ def queue_counts_payload(conn) -> dict[str, int]:
         "review": int(review["total"]),
         "short_repeats": int(short_repeats["total"]),
         "continuing_updates": int(update_page["total"]),
+        "classification_samples": int(fingerprint_row[5]),
     }
     with QUEUE_COUNTS_CACHE_LOCK:
         QUEUE_COUNTS_CACHE[database_key] = (fingerprint, time.monotonic(), result)

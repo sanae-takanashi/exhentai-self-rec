@@ -35,6 +35,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - Optional negative-feedback reasons include visual style, content, creator, quality, gallery size, and too few relevant images. Reasons remain diagnostic metadata and do not alter feature values; duplicate/update feedback is excluded from preference training.
 - Recommendation impressions are stored locally for diagnostics and are never treated as negative feedback.
 - Review and Updates cards can override a mistaken continuing-gallery classification, with `Use Auto` available to remove the override. Manual labels take effect immediately, survive preference export/import, and train a separate lightweight classifier after at least 20 labels with 5 examples in each class; learned predictions require cross-validated balanced accuracy of 0.65 and 80% per-item confidence.
+- The Classifier view presents pending full-library random and active-learning samples as gallery cards, with one-click Review/Updates labels, live holdout counts, and classifier readiness status. Model probabilities are intentionally hidden during labeling.
 - Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
 - Fetch-plan preview showing recent, bootstrap, learned, or manual queries before a refresh.
 - Fetch status history so you can see recent refreshes, queries, counts, and errors.

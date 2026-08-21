@@ -180,6 +180,44 @@ class PersonalizedTest(unittest.TestCase):
 
         self.assertEqual(model_data_signature(self.conn), before)
 
+    def test_model_signature_detects_same_length_embedding_content_change(self):
+        base = {
+            "url": "https://exhentai.org/g/signature/a/",
+            "label": 1,
+            "sample_weight": 1.0,
+            "visual_embedding_version": "visual-v1",
+        }
+
+        first = model_data_signature(self.conn, [{**base, "visual_embedding_json": "[1,2]"}])
+        second = model_data_signature(self.conn, [{**base, "visual_embedding_json": "[2,1]"}])
+
+        self.assertNotEqual(first, second)
+
+    def test_model_signature_payload_excludes_raw_embedding_json(self):
+        raw_embedding = "[0.123456,0.654321]"
+        original_dumps = json.dumps
+        captured = {}
+
+        def capture_payload(value, *args, **kwargs):
+            captured["value"] = value
+            return original_dumps(value, *args, **kwargs)
+
+        with patch("exh_rec.personalized.json.dumps", side_effect=capture_payload):
+            model_data_signature(
+                self.conn,
+                [{
+                    "url": "https://exhentai.org/g/signature/b/",
+                    "label": 1,
+                    "sample_weight": 1.0,
+                    "visual_embedding_json": raw_embedding,
+                    "visual_embedding_version": "visual-v1",
+                }],
+            )
+
+        encoded_payload = original_dumps(captured["value"], sort_keys=True)
+        self.assertNotIn(raw_embedding, encoded_payload)
+        self.assertIn("visual_embedding_digest", encoded_payload)
+
     def test_evaluation_acceptance_rejects_stale_feature_schema(self):
         report = {
             "model_schema": MODEL_SCHEMA,
@@ -249,6 +287,19 @@ class PersonalizedTest(unittest.TestCase):
 
         self.assertEqual([item["url"] for item in result[:2]], ["a", "c"])
         self.assertTrue(all(float(item["score"]) >= 0 for item in result))
+
+    def test_similarity_dispatch_preserves_cosine_scores(self):
+        items = [
+            {"url": "a", "score": 0.90, "score_scale": "similarity", "tags": ["artist:same"], "reasons": []},
+            {"url": "b", "score": 0.84, "score_scale": "similarity", "tags": ["artist:same"], "reasons": []},
+            {"url": "c", "score": 0.83, "score_scale": "similarity", "tags": ["artist:other"], "reasons": []},
+        ]
+
+        result = diversify_ranked_galleries(items)
+
+        self.assertEqual([item["url"] for item in result[:2]], ["a", "c"])
+        self.assertEqual({item["url"]: item["score"] for item in result}, {"a": 0.90, "b": 0.84, "c": 0.83})
+        self.assertNotIn("diversity -0.45", " ".join(reason for item in result for reason in item.get("reasons", [])))
 
     def test_probability_exploration_uses_relative_score_floor(self):
         items = [

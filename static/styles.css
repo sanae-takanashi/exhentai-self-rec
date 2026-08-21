@@ -277,6 +277,39 @@ button.danger:hover {
   max-width: 360px;
 }
 
+.classifier-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  border-block: 1px solid var(--line);
+  padding: 12px 0;
+}
+
+.classifier-summary.hidden {
+  display: none;
+}
+
+.classifier-summary > div {
+  display: grid;
+  gap: 4px;
+}
+
+.classifier-summary span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.classifier-legend {
+  grid-template-columns: repeat(2, minmax(0, auto));
+  align-items: center;
+  column-gap: 16px;
+}
+
+.classifier-legend strong {
+  color: var(--text);
+}
+
 .parent-progress {
   display: grid;
   gap: 10px;
@@ -1137,6 +1170,25 @@ button.danger:hover {
   gap: 8px;
 }
 
+.classifier-actions {
+  margin-top: auto;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.classifier-actions .classifier-review {
+  border-color: var(--warn);
+}
+
+.classifier-actions .classifier-updates {
+  border-color: var(--accent);
+  background: #163c32;
+}
+
+.classifier-sample-kind {
+  color: var(--text);
+  font-weight: 600;
+}
+
 .votes button,
 .scorebar button {
   flex: 1;
@@ -1271,6 +1323,14 @@ dd {
   .view-tabs {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .classifier-summary {
+    display: grid;
+  }
+
+  .classifier-legend {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .hath-summary {

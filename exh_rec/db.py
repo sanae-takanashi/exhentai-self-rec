@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS galleries (
     samples_json TEXT NOT NULL DEFAULT '[]',
     samples_fetched_at TEXT,
     visual_embedding_json TEXT,
+    visual_embedding_digest TEXT,
     visual_embedding_version TEXT,
     visual_embedding_at TEXT,
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS gallery_feature_snapshots (
     page_count INTEGER,
     detail_fetched_at TEXT,
     visual_embedding_json TEXT,
+    visual_embedding_digest TEXT,
     visual_embedding_version TEXT,
     visual_embedding_at TEXT
 );
@@ -291,8 +294,10 @@ def init_db() -> None:
         ensure_column(conn, "galleries", "samples_json", "TEXT NOT NULL DEFAULT '[]'")
         ensure_column(conn, "galleries", "samples_fetched_at", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_json", "TEXT")
+        ensure_column(conn, "galleries", "visual_embedding_digest", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_version", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_at", "TEXT")
+        ensure_column(conn, "gallery_feature_snapshots", "visual_embedding_digest", "TEXT")
         ensure_column(
             conn,
             "gallery_classification_samples",
@@ -323,6 +328,7 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                 (key, value),
             )
+        backfill_visual_embedding_digests(conn)
         conn.execute(
             """
             UPDATE hath_downloads
@@ -341,11 +347,13 @@ def init_db() -> None:
             INSERT INTO gallery_feature_snapshots(
                 gallery_url, captured_at, source, title, title_jpn, category, uploader,
                 rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
-                visual_embedding_json, visual_embedding_version, visual_embedding_at
+                visual_embedding_json, visual_embedding_digest,
+                visual_embedding_version, visual_embedding_at
             )
             SELECT g.url, CURRENT_TIMESTAMP, 'migration-current', g.title, g.title_jpn,
                    g.category, g.uploader, g.rating, g.tags_json, g.tag_weights_json,
                    g.page_count, g.detail_fetched_at, g.visual_embedding_json,
+                   g.visual_embedding_digest,
                    g.visual_embedding_version, g.visual_embedding_at
             FROM galleries g
             WHERE NOT EXISTS (
@@ -359,6 +367,29 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def visual_embedding_digest(raw: object) -> str | None:
+    if raw is None:
+        return None
+    encoded = str(raw).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def backfill_visual_embedding_digests(conn: sqlite3.Connection) -> None:
+    for table, key in (("galleries", "url"), ("gallery_feature_snapshots", "id")):
+        rows = conn.execute(
+            f"""
+            SELECT {key}, visual_embedding_json
+            FROM {table}
+            WHERE visual_embedding_json IS NOT NULL
+              AND visual_embedding_digest IS NULL
+            """
+        ).fetchall()
+        conn.executemany(
+            f"UPDATE {table} SET visual_embedding_digest = ? WHERE {key} = ?",
+            [(visual_embedding_digest(row["visual_embedding_json"]), row[key]) for row in rows],
+        )
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -406,7 +437,7 @@ def snapshot_gallery_features(
     row = conn.execute(
         """
         SELECT title, title_jpn, category, uploader, rating, tags_json, tag_weights_json,
-               page_count, detail_fetched_at, visual_embedding_json,
+               page_count, detail_fetched_at, visual_embedding_json, visual_embedding_digest,
                visual_embedding_version, visual_embedding_at
         FROM galleries
         WHERE url = ?
@@ -415,13 +446,32 @@ def snapshot_gallery_features(
     ).fetchone()
     if row is None:
         return None
+    previous = conn.execute(
+        """
+        SELECT title, title_jpn, category, uploader, rating, tags_json, tag_weights_json,
+               page_count, detail_fetched_at, visual_embedding_json, visual_embedding_digest,
+               visual_embedding_version, visual_embedding_at
+        FROM gallery_feature_snapshots
+        WHERE gallery_url = ?
+          AND (? IS NULL OR (
+              julianday(captured_at) IS NOT NULL
+              AND julianday(captured_at) <= julianday(?)
+          ))
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+        """,
+        (gallery_url, captured_at, captured_at),
+    ).fetchone()
+    if previous is not None and tuple(previous) == tuple(row):
+        return None
     cursor = conn.execute(
         """
         INSERT INTO gallery_feature_snapshots(
             gallery_url, captured_at, source, title, title_jpn, category, uploader,
             rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
-            visual_embedding_json, visual_embedding_version, visual_embedding_at
-        ) VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            visual_embedding_json, visual_embedding_digest,
+            visual_embedding_version, visual_embedding_at
+        ) VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             gallery_url,
@@ -437,6 +487,7 @@ def snapshot_gallery_features(
             row["page_count"],
             row["detail_fetched_at"],
             row["visual_embedding_json"],
+            row["visual_embedding_digest"],
             row["visual_embedding_version"],
             row["visual_embedding_at"],
         ),

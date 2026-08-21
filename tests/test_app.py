@@ -25,6 +25,7 @@ from exh_rec.app import (
     cached_thumbnail,
     cached_gallery_sample,
     check_saved_access,
+    classification_sample_payload,
     collect_gallery_samples,
     compact_continuing_parent_chain,
     configured_dinov2_device,
@@ -1419,7 +1420,10 @@ class AppTest(unittest.TestCase):
 
         counts = queue_counts_payload(conn)
 
-        self.assertEqual(counts, {"review": 1, "short_repeats": 1, "continuing_updates": 0})
+        self.assertEqual(
+            counts,
+            {"review": 1, "short_repeats": 1, "continuing_updates": 0, "classification_samples": 0},
+        )
         conn.close()
 
     def test_queue_counts_endpoint_returns_payload(self):
@@ -1439,6 +1443,98 @@ class AppTest(unittest.TestCase):
             handler.do_GET()
 
         self.assertEqual(sent, [({"review": 7, "short_repeats": 3, "continuing_updates": 2}, HTTPStatus.OK)])
+        conn.close()
+
+    def test_classification_sample_payload_only_returns_pending_full_library_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        galleries = [
+            Gallery(
+                url=f"https://exhentai.org/g/{15000 + index}/a/",
+                gid=str(15000 + index),
+                token="a",
+                title=title,
+            )
+            for index, title in enumerate(("Pending Full Sample", "Legacy Sample", "Labeled Holdout"))
+        ]
+        store_galleries(conn, galleries)
+        pending_cursor = conn.execute(
+            """
+            INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, sampling_frame, selection_probability
+            ) VALUES (?, 'uncertainty', 'full-library', 0.2)
+            """,
+            (galleries[0].url,),
+        )
+        conn.execute(
+            """
+            INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, sampling_frame, selection_probability
+            ) VALUES (?, 'random', 'legacy-unknown', 0.2)
+            """,
+            (galleries[1].url,),
+        )
+        conn.execute(
+            """
+            INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, sampling_frame, selection_probability,
+                classification, labeled_at
+            ) VALUES (?, 'random', 'full-library', 0.2, 'review', CURRENT_TIMESTAMP)
+            """,
+            (galleries[2].url,),
+        )
+
+        payload = classification_sample_payload(conn)
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["classification_sample_id"], pending_cursor.lastrowid)
+        self.assertEqual(payload["items"][0]["title"], "Pending Full Sample")
+        self.assertEqual(payload["counts"]["pending"], 1)
+        self.assertEqual(payload["counts"]["labeled"], 1)
+        self.assertEqual(payload["counts"]["random_labeled"], 1)
+        self.assertEqual(payload["counts"]["random_review"], 1)
+        self.assertEqual(payload["counts"]["random_updates"], 0)
+        self.assertEqual(payload["classifier"]["status"], "insufficient-data")
+        conn.close()
+
+    def test_classification_sample_label_endpoint_updates_and_returns_queue(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery = Gallery(
+            url="https://exhentai.org/g/15010/a/",
+            gid="15010",
+            token="a",
+            title="Classifier Endpoint Sample",
+        )
+        store_galleries(conn, [gallery])
+        cursor = conn.execute(
+            """
+            INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, sampling_frame, selection_probability
+            ) VALUES (?, 'uncertainty', 'full-library', 0.2)
+            """,
+            (gallery.url,),
+        )
+        sent = []
+        handler = Handler.__new__(Handler)
+        handler.path = "/api/classification-samples/label"
+        handler.read_json = lambda: {
+            "sample_id": cursor.lastrowid,
+            "classification": "review",
+            "limit": 40,
+        }
+        handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+        handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        with patch("exh_rec.app.db.connect", return_value=conn):
+            handler.do_POST()
+
+        self.assertEqual(sent[0][1], HTTPStatus.OK)
+        self.assertEqual(sent[0][0]["sample"]["classification"], "review")
+        self.assertEqual(sent[0][0]["page"]["counts"]["pending"], 0)
+        self.assertEqual(sent[0][0]["page"]["items"], [])
         conn.close()
 
     def test_marked_gallery_payload_returns_bookmark_cards(self):

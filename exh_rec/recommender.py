@@ -11,7 +11,7 @@ import time
 import urllib.parse
 from dataclasses import asdict
 
-from .db import snapshot_gallery_features
+from .db import snapshot_gallery_features, visual_embedding_digest
 from .exhentai import Gallery
 from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
 from .personalized import (
@@ -349,6 +349,7 @@ def store_visual_embedding(
     version: str = VISUAL_EMBEDDING_VERSION,
 ) -> None:
     normalized = normalize_visual_embedding(embedding)
+    serialized = json.dumps(normalized, ensure_ascii=True)
     exists = conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
     if not exists:
         raise ValueError("Gallery not found")
@@ -356,11 +357,12 @@ def store_visual_embedding(
         """
         UPDATE galleries
         SET visual_embedding_json = ?,
+            visual_embedding_digest = ?,
             visual_embedding_version = ?,
             visual_embedding_at = CURRENT_TIMESTAMP
         WHERE url = ?
         """,
-        (json.dumps(normalized, ensure_ascii=True), version, gallery_url),
+        (serialized, visual_embedding_digest(serialized), version, gallery_url),
     )
     snapshot_gallery_features(conn, gallery_url, "visual")
 
@@ -1503,6 +1505,8 @@ def recommend_page(
                 else:
                     reasons.append(freshness_reason)
         gallery["score"] = round(score, 3)
+        if model_mode == MODEL_MODE_VISUAL:
+            gallery["score_scale"] = "similarity"
         gallery["reasons"] = reasons[:5]
         if personalized_gallery is not None:
             personalized_inputs.append(personalized_gallery)
@@ -2847,7 +2851,7 @@ def marked_gallery_page(
 def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if len(scored) <= 2:
         return scored
-    if all(item.get("score_scale") == "probability" for item in scored):
+    if all(item.get("score_scale") in {"probability", "similarity"} for item in scored):
         return diversify_probability_ranked_galleries(scored)
     remaining = list(scored)
     selected: list[dict] = []
@@ -2879,17 +2883,16 @@ def diversify_probability_ranked_galleries(scored: list[dict], probability_windo
     selected: list[dict] = []
     seen: dict[str, int] = {}
     while remaining:
-        highest = max(float(item.get("rank_score", item.get("like_probability") or 0.0)) for item in remaining)
+        highest = max(diversity_rank_score(item) for item in remaining)
         eligible = [
             (index, item)
             for index, item in enumerate(remaining)
-            if float(item.get("rank_score", item.get("like_probability") or 0.0)) >= highest - probability_window
+            if diversity_rank_score(item) >= highest - probability_window
         ]
         best_index, best_item = max(
             eligible,
             key=lambda pair: (
-                float(pair[1].get("rank_score", pair[1].get("like_probability") or 0.0))
-                - diversity_penalty(pair[1], seen) * 0.03,
+                diversity_rank_score(pair[1]) - diversity_penalty(pair[1], seen) * 0.03,
                 float(pair[1].get("confidence") or 0.0),
                 -pair[0],
             ),
@@ -2903,6 +2906,14 @@ def diversify_probability_ranked_galleries(scored: list[dict], probability_windo
         for key in diversity_keys(item):
             seen[key] = seen.get(key, 0) + 1
     return selected
+
+
+def diversity_rank_score(item: dict) -> float:
+    if item.get("rank_score") is not None:
+        return float(item["rank_score"])
+    if item.get("like_probability") is not None:
+        return float(item["like_probability"])
+    return float(item.get("score") or 0.0)
 
 
 def diversity_penalty(item: dict, seen: dict[str, int]) -> float:

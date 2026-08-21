@@ -345,6 +345,61 @@ class RecommenderTest(unittest.TestCase):
         row = self.conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
         self.assertIsNotNone(row["detail_fetched_at"])
 
+    def test_store_galleries_skips_identical_feature_snapshots(self):
+        gallery_url = "https://exhentai.org/g/4snapshot/a/"
+        gallery = Gallery(url=gallery_url, gid="4snapshot", token="a", title="Stable")
+
+        store_galleries(self.conn, [gallery])
+        store_galleries(self.conn, [gallery])
+
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM gallery_feature_snapshots WHERE gallery_url = ?",
+            (gallery_url,),
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_store_galleries_snapshots_changed_features(self):
+        gallery_url = "https://exhentai.org/g/4snapshot/b/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4snapshot", token="b", title="Before")],
+        )
+
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4snapshot", token="b", title="After")],
+        )
+
+        titles = [
+            row["title"]
+            for row in self.conn.execute(
+                "SELECT title FROM gallery_feature_snapshots WHERE gallery_url = ? ORDER BY id",
+                (gallery_url,),
+            )
+        ]
+        self.assertEqual(titles, ["Before", "After"])
+
+    def test_backdated_snapshot_is_not_deduplicated_against_future_state(self):
+        gallery_url = "https://exhentai.org/g/4snapshot/c/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="4snapshot", token="c", title="Same State")],
+        )
+
+        snapshot_id = db.snapshot_gallery_features(
+            self.conn,
+            gallery_url,
+            "historical-import",
+            "2020-01-01 00:00:00",
+        )
+
+        self.assertIsNotNone(snapshot_id)
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM gallery_feature_snapshots WHERE gallery_url = ?",
+            (gallery_url,),
+        ).fetchone()[0]
+        self.assertEqual(count, 2)
+
     def test_metadata_only_parent_stays_out_of_review_until_normally_fetched(self):
         child_url = "https://exhentai.org/g/4100/a/"
         parent_url = "https://exhentai.org/g/4099/b/"
@@ -693,6 +748,7 @@ class RecommenderTest(unittest.TestCase):
 
         self.assertEqual(hybrid_top["url"], tag_url)
         self.assertEqual(visual_top["url"], visual_url)
+        self.assertEqual(visual_top["score_scale"], "similarity")
         self.assertTrue(visual_top["reasons"][0].startswith("visual only"))
         self.assertNotIn("previous upvote", " ".join(" ".join(item["reasons"]) for item in visual_with_rated))
         self.assertEqual(normalize_model_mode("bad"), "hybrid")

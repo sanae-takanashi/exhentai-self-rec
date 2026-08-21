@@ -98,13 +98,22 @@ def model_data_signature(conn: sqlite3.Connection, examples: list[dict] | None =
     keys = (
         "url", "label", "sample_weight", "label_source", "feedback_at", "title", "title_jpn",
         "category", "uploader", "rating", "page_count", "tags", "tag_weights", "detail_fetched_at",
-        "visual_embedding_json", "visual_embedding_version", "visual_image_count",
+        "visual_embedding_digest", "visual_embedding_length", "visual_embedding_version", "visual_image_count",
         "visual_image_cohesion", "visual_image_min_similarity",
         "feature_snapshot_id", "feature_snapshot_at",
     )
+    compact_examples = []
+    for item in examples:
+        raw_embedding = str(item.get("visual_embedding_json") or "")
+        compact = {key: item.get(key) for key in keys}
+        compact["visual_embedding_digest"] = item.get("visual_embedding_digest") or (
+            hashlib.sha256(raw_embedding.encode("utf-8")).hexdigest() if raw_embedding else None
+        )
+        compact["visual_embedding_length"] = len(raw_embedding)
+        compact_examples.append(compact)
     payload = {
         "feature_schema": FEATURE_SCHEMA,
-        "examples": [{key: item.get(key) for key in keys} for item in examples],
+        "examples": compact_examples,
     }
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
@@ -137,7 +146,8 @@ def gallery_feature_snapshot(
         SELECT id AS feature_snapshot_id, captured_at AS feature_snapshot_at,
                title, title_jpn, category, uploader, rating, tags_json,
                tag_weights_json, page_count, detail_fetched_at,
-               visual_embedding_json, visual_embedding_version, visual_embedding_at
+               visual_embedding_json, visual_embedding_digest,
+               visual_embedding_version, visual_embedding_at
         FROM gallery_feature_snapshots
         WHERE gallery_url = ?
           AND julianday(captured_at) IS NOT NULL
@@ -150,13 +160,57 @@ def gallery_feature_snapshot(
     return dict(row) if row else None
 
 
+def gallery_feature_snapshot_map(
+    conn: sqlite3.Connection,
+    targets: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict]:
+    unique_targets = list(dict.fromkeys((str(url), str(at)) for url, at in targets if url and at))
+    snapshots: dict[tuple[str, str], dict] = {}
+    for offset in range(0, len(unique_targets), 250):
+        chunk = unique_targets[offset : offset + 250]
+        values = ",".join("(?, ?, ?)" for _ in chunk)
+        params: list[object] = []
+        for index, (gallery_url, at) in enumerate(chunk):
+            params.extend((index, gallery_url, at))
+        rows = conn.execute(
+            f"""
+            WITH targets(target_index, gallery_url, target_at) AS (VALUES {values})
+            SELECT t.target_index,
+                   s.id AS feature_snapshot_id, s.captured_at AS feature_snapshot_at,
+                   s.title, s.title_jpn, s.category, s.uploader, s.rating, s.tags_json,
+                   s.tag_weights_json, s.page_count, s.detail_fetched_at,
+                   s.visual_embedding_json, s.visual_embedding_digest,
+                   s.visual_embedding_version, s.visual_embedding_at
+            FROM targets t
+            JOIN gallery_feature_snapshots s ON s.id = (
+                SELECT candidate.id
+                FROM gallery_feature_snapshots candidate
+                WHERE candidate.gallery_url = t.gallery_url
+                  AND julianday(candidate.captured_at) IS NOT NULL
+                  AND julianday(candidate.captured_at) <= julianday(t.target_at)
+                ORDER BY candidate.captured_at DESC, candidate.id DESC
+                LIMIT 1
+            )
+            """,
+            params,
+        ).fetchall()
+        for row in rows:
+            key = chunk[int(row["target_index"])]
+            snapshot = dict(row)
+            snapshot.pop("target_index", None)
+            snapshots[key] = snapshot
+    return snapshots
+
+
 def _apply_feature_snapshot(
     conn: sqlite3.Connection,
     item: dict,
     at: str,
     strict: bool,
+    snapshots: dict[tuple[str, str], dict] | None = None,
 ) -> dict | None:
-    snapshot = gallery_feature_snapshot(conn, str(item.get("url") or ""), at)
+    key = (str(item.get("url") or ""), str(at or ""))
+    snapshot = snapshots.get(key) if snapshots is not None else gallery_feature_snapshot(conn, *key)
     if snapshot is None:
         return None if strict else item
     item.pop("tags", None)
@@ -232,27 +286,8 @@ def training_examples(conn: sqlite3.Connection, strict_temporal: bool = False) -
           ON latest.id = f.id
         """
     ).fetchall()
-    examples: dict[str, dict] = {}
-    for row in feedback:
-        item = _decoded_gallery(row)
-        item = _apply_feature_snapshot(
-            conn,
-            item,
-            str(item.get("feedback_at") or ""),
-            strict_temporal,
-        )
-        if item is None:
-            continue
-        if item.get("reason_code") == "duplicate_update":
-            continue
-        vote = float(item.get("vote") or 0)
-        if vote == 0:
-            continue
-        item["label"] = 1 if vote > 0 else 0
-        item["sample_weight"] = max(0.75, min(2.0, abs(vote)))
-        item["label_source"] = "score" if item.get("score") is not None else "vote"
-        examples[item["url"]] = item
     download_weight = hath_download_signal_weight(conn)
+    downloads = []
     if download_weight > 0:
         downloads = conn.execute(
             """
@@ -266,20 +301,6 @@ def training_examples(conn: sqlite3.Connection, strict_temporal: bool = False) -
             GROUP BY d.gallery_url
             """
         ).fetchall()
-        for row in downloads:
-            item = _decoded_gallery(row)
-            item = _apply_feature_snapshot(
-                conn,
-                item,
-                str(item.get("feedback_at") or ""),
-                strict_temporal,
-            )
-            if item is None:
-                continue
-            item["label"] = 1
-            item["sample_weight"] = download_weight
-            item["label_source"] = "hath-download"
-            examples[item["url"]] = item
     marks = conn.execute(
         """
         SELECT g.*, NULL AS feedback_id, NULL AS vote, NULL AS score, NULL AS reason_code,
@@ -287,6 +308,50 @@ def training_examples(conn: sqlite3.Connection, strict_temporal: bool = False) -
         FROM gallery_marks m JOIN galleries g ON g.url = m.gallery_url
         """
     ).fetchall()
+    snapshots = gallery_feature_snapshot_map(
+        conn,
+        [
+            (str(row["url"] or ""), str(row["feedback_at"] or ""))
+            for row in [*feedback, *downloads, *marks]
+        ],
+    )
+    examples: dict[str, dict] = {}
+    for row in feedback:
+        item = _decoded_gallery(row)
+        item = _apply_feature_snapshot(
+            conn,
+            item,
+            str(item.get("feedback_at") or ""),
+            strict_temporal,
+            snapshots,
+        )
+        if item is None:
+            continue
+        if item.get("reason_code") == "duplicate_update":
+            continue
+        vote = float(item.get("vote") or 0)
+        if vote == 0:
+            continue
+        item["label"] = 1 if vote > 0 else 0
+        item["sample_weight"] = max(0.75, min(2.0, abs(vote)))
+        item["label_source"] = "score" if item.get("score") is not None else "vote"
+        examples[item["url"]] = item
+    if download_weight > 0:
+        for row in downloads:
+            item = _decoded_gallery(row)
+            item = _apply_feature_snapshot(
+                conn,
+                item,
+                str(item.get("feedback_at") or ""),
+                strict_temporal,
+                snapshots,
+            )
+            if item is None:
+                continue
+            item["label"] = 1
+            item["sample_weight"] = download_weight
+            item["label_source"] = "hath-download"
+            examples[item["url"]] = item
     for row in marks:
         item = _decoded_gallery(row)
         item = _apply_feature_snapshot(
@@ -294,6 +359,7 @@ def training_examples(conn: sqlite3.Connection, strict_temporal: bool = False) -
             item,
             str(item.get("feedback_at") or ""),
             strict_temporal,
+            snapshots,
         )
         if item is None:
             continue

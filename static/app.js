@@ -23,6 +23,7 @@ const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
+const searchFetchBtn = document.querySelector("#searchFetchBtn");
 const localFilterEl = document.querySelector("#localFilter");
 const defaultLocalFilterPlaceholder = localFilterEl.placeholder;
 const backfillReviewParentsBtn = document.querySelector("#backfillReviewParentsBtn");
@@ -35,6 +36,9 @@ const parentProgressSummaryEl = document.querySelector("#parentProgressSummary")
 const parentProgressCountsEl = document.querySelector("#parentProgressCounts");
 const parentProgressBarEl = document.querySelector("#parentProgressBar");
 const parentProgressLogEl = document.querySelector("#parentProgressLog");
+const classifierSummaryEl = document.querySelector("#classifierSummary");
+const classifierSummaryStatusEl = document.querySelector("#classifierSummaryStatus");
+const classifierSummaryCountsEl = document.querySelector("#classifierSummaryCounts");
 const importFileEl = document.querySelector("#importFile");
 const replaceImportEl = document.querySelector("#replaceImport");
 const loadMoreBtn = document.querySelector("#loadMoreBtn");
@@ -88,6 +92,7 @@ const viewTitleEl = document.querySelector("#viewTitle");
 const viewSubtitleEl = document.querySelector("#viewSubtitle");
 const reviewQueueCountEl = document.querySelector("#reviewQueueCount");
 const continuingUpdatesQueueCountEl = document.querySelector("#continuingUpdatesQueueCount");
+const classifierQueueCountEl = document.querySelector("#classifierQueueCount");
 const shortRepeatsQueueCountEl = document.querySelector("#shortRepeatsQueueCount");
 const viewTabs = [...document.querySelectorAll("[data-view]")];
 let nextRecommendationOffset = 0;
@@ -108,6 +113,7 @@ let currentView = "review";
 let reviewExploreSeed = "";
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
+const pendingClassificationSampleIds = new Set();
 let renderedGalleryUrls = [];
 let renderedGalleryItems = [];
 let parentProgressVisible = false;
@@ -163,6 +169,7 @@ const staticTooltips = {
   reviewTab: "Show unrated recommendations to review and train the model.",
   discoveryTab: "Explore uncertain, under-estimated, and less-covered interests without diluting Review.",
   continuingUpdatesTab: "Show the latest version of galleries detected as cumulative Pixiv, Fanbox, Patreon, archive, or ongoing series.",
+  classifierTab: "Label sampled galleries as normal Review items or continuing Updates.",
   shortRepeatsTab: "Show short new galleries that resemble older rated source-prefix galleries, with old reactions shown for reference.",
   historyTab: "Show galleries you already rated, skipped, or voted on.",
   favoriteTab: "Show favorite bookmarked galleries, which act as strong positive signals.",
@@ -549,6 +556,14 @@ function viewCopy(view) {
       loaded: "continuing gallery series loaded",
     };
   }
+  if (view === "classifier") {
+    return {
+      title: "Classifier Labels",
+      subtitle: "Decide whether each sampled gallery is a normal Review item or a cumulative continuing Update.",
+      empty: "All current classifier samples are labeled.",
+      loaded: "classifier samples loaded",
+    };
+  }
   if (view === "short-repeats") {
     return {
       title: "Short Repeat Queue",
@@ -609,6 +624,7 @@ function renderQueueCount(element, value, label) {
 function renderQueueCounts(payload) {
   renderQueueCount(reviewQueueCountEl, payload.review, "galleries");
   renderQueueCount(continuingUpdatesQueueCountEl, payload.continuing_updates, "continuing series");
+  renderQueueCount(classifierQueueCountEl, payload.classification_samples, "classifier samples");
   renderQueueCount(shortRepeatsQueueCountEl, payload.short_repeats, "short repeats");
 }
 
@@ -648,6 +664,8 @@ function updateCurrentQueueCount(payload) {
     renderQueueCount(reviewQueueCountEl, payload.total, "galleries");
   } else if (currentView === "short-repeats") {
     renderQueueCount(shortRepeatsQueueCountEl, payload.total, "short repeats");
+  } else if (currentView === "classifier") {
+    renderQueueCount(classifierQueueCountEl, payload.counts?.pending, "classifier samples");
   }
 }
 
@@ -666,11 +684,19 @@ function setActiveView(view) {
   hathViewEl.classList.toggle("hidden", !hathView);
   const historyView = view === "history";
   const reviewView = view === "review";
+  const classifierView = view === "classifier";
   backfillReviewParentsBtn.classList.toggle("hidden", !reviewView);
   historySearchBtn.classList.toggle("hidden", !historyView);
   backfillHistoryParentsBtn.classList.toggle("hidden", !historyView);
   recalcShortRepeatsBtn.classList.toggle("hidden", view !== "short-repeats");
-  localFilterEl.placeholder = historyView ? "Search voted history by title, alt title, tag, category, uploader" : defaultLocalFilterPlaceholder;
+  queryEl.classList.toggle("hidden", classifierView);
+  searchFetchBtn.classList.toggle("hidden", classifierView);
+  classifierSummaryEl.classList.toggle("hidden", !classifierView);
+  localFilterEl.placeholder = historyView
+    ? "Search voted history by title, alt title, tag, category, uploader"
+    : classifierView
+      ? "Filter classifier samples by title, tag, category, uploader"
+      : defaultLocalFilterPlaceholder;
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
@@ -682,6 +708,9 @@ async function loadCurrentPage(offset = 0, append = false) {
   }
   if (currentView === "continuing-updates") {
     return loadContinuingUpdates(offset, append);
+  }
+  if (currentView === "classifier") {
+    return loadClassificationSamples(offset, append);
   }
   if (currentView === "short-repeats") {
     return loadShortRepeats(offset, append);
@@ -1939,6 +1968,83 @@ async function loadContinuingUpdates(offset = 0, append = false) {
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
 
+function renderClassifierSummary(payload) {
+  const counts = payload.counts || {};
+  const classifier = payload.classifier || {};
+  const status = classifier.accepted
+    ? "Active"
+    : classifier.ready
+      ? "Shadow"
+      : "Waiting for labels";
+  classifierSummaryStatusEl.textContent = `${status} · ${Number(counts.pending || 0)} pending`;
+  const trainingReviews = Number(classifier.review_count || 0);
+  const trainingUpdates = Number(classifier.updates_count || 0);
+  const holdoutTotal = Number(counts.random_labeled || 0);
+  const holdoutReviews = Number(counts.random_review || 0);
+  const holdoutUpdates = Number(counts.random_updates || 0);
+  classifierSummaryCountsEl.textContent = `Training: ${trainingReviews} Review / ${trainingUpdates} Updates · Random holdout: ${holdoutTotal}/20 (${holdoutReviews} Review / ${holdoutUpdates} Updates)`;
+}
+
+async function loadClassificationSamples(offset = 0, append = false) {
+  const localFilter = localFilterEl.value.trim();
+  const payload = await api(
+    `/api/classification-samples?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+  );
+  applyGalleryPage(payload, append);
+  renderClassifierSummary(payload);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+}
+
+async function labelClassificationSample(sampleId, classification) {
+  const normalizedSampleId = Number(sampleId);
+  if (!Number.isInteger(normalizedSampleId) || pendingClassificationSampleIds.has(normalizedSampleId)) {
+    return;
+  }
+  pendingClassificationSampleIds.add(normalizedSampleId);
+  for (const button of recommendationsEl.querySelectorAll("button[data-sample-id]")) {
+    if (Number(button.dataset.sampleId) === normalizedSampleId) {
+      button.disabled = true;
+    }
+  }
+  const label = classification === "updates" ? "Updates" : "Review";
+  setStatus(`Saving sample #${normalizedSampleId} as ${label}`);
+  try {
+    const payload = await api("/api/classification-samples/label", {
+      method: "POST",
+      body: JSON.stringify({
+        sample_id: normalizedSampleId,
+        classification,
+        limit: recommendationLimit,
+        filter_text: localFilterEl.value.trim(),
+      }),
+    });
+    applyGalleryPage(payload.page);
+    renderClassifierSummary(payload.page);
+    refreshQueueCounts();
+    setStatus(`Sample #${normalizedSampleId} labeled ${label}; ${Number(payload.page.counts?.pending || 0)} remaining`);
+  } finally {
+    pendingClassificationSampleIds.delete(normalizedSampleId);
+    for (const button of recommendationsEl.querySelectorAll("button[data-sample-id]")) {
+      if (Number(button.dataset.sampleId) === normalizedSampleId) {
+        button.disabled = false;
+      }
+    }
+  }
+}
+
+function deferClassificationSample(sampleId) {
+  const index = renderedGalleryItems.findIndex(
+    (item) => Number(item.classification_sample_id) === Number(sampleId)
+  );
+  if (index < 0) {
+    return;
+  }
+  const [item] = renderedGalleryItems.splice(index, 1);
+  renderedGalleryItems.push(item);
+  renderGalleryCards(renderedGalleryItems);
+  setStatus(`Sample #${sampleId} moved to the end of this page`);
+}
+
 async function showModel() {
   const payload = await api("/api/model");
   dialogTitle.textContent = "Learned Model";
@@ -1979,7 +2085,7 @@ async function resetLibrary() {
     body: JSON.stringify({}),
   });
   applyGalleryPage(payload);
-  renderQueueCounts({ review: 0, continuing_updates: 0, short_repeats: 0 });
+  renderQueueCounts({ review: 0, continuing_updates: 0, short_repeats: 0, classification_samples: 0 });
   await loadStatus();
   refreshQueueCounts();
   const removed = payload.removed || {};
@@ -2095,6 +2201,7 @@ function renderParentChain(item) {
 
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
+  const classifierMode = mode === "classifier";
   if (!append) {
     renderedGalleryUrls = [];
     renderedGalleryItems = [];
@@ -2121,7 +2228,7 @@ function renderGalleryCards(items, append = false) {
     const thumbContent = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
-    const thumb = item.thumb_url && mode === "review"
+    const thumb = item.thumb_url && (mode === "review" || classifierMode)
       ? `<a class="thumb" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer" aria-label="Open ${escapeAttr(item.title)}">${thumbContent}</a>`
       : `<div class="thumb">${thumbContent}</div>`;
     const samples = item.samples || [];
@@ -2166,7 +2273,19 @@ function renderGalleryCards(items, append = false) {
       : classificationPrediction
         ? `<div class="meta">Learned classification: ${escapeHtml(classificationPrediction.classification)} · ${Math.round(Number(classificationPrediction.confidence || 0) * 100)}% confidence</div>`
         : "";
-    const classificationActions = currentView === "review"
+    const classifierSampleKind = item.sampling_strategy === "random"
+      ? "Random evaluation holdout"
+      : "Active learning sample";
+    const classifierSampleMeta = classifierMode
+      ? `<div class="meta classifier-sample-kind">Sample #${Number(item.classification_sample_id)} · ${escapeHtml(classifierSampleKind)}</div>`
+      : "";
+    const classificationActions = classifierMode
+      ? `<div class="card-actions classifier-actions">
+          <button class="classifier-review" type="button" data-sample-classification="review" data-sample-id="${Number(item.classification_sample_id)}" title="Label this as a normal or one-off gallery that belongs in Review.">Review</button>
+          <button class="classifier-updates" type="button" data-sample-classification="updates" data-sample-id="${Number(item.classification_sample_id)}" title="Label this as a cumulative or ongoing gallery that belongs in Updates.">Updates</button>
+          <button class="clear" type="button" data-sample-defer="1" data-sample-id="${Number(item.classification_sample_id)}" title="Move this sample to the end of the current page without labeling it.">Later</button>
+        </div>`
+      : currentView === "review"
       ? `<div class="card-actions"><button class="clear" type="button" data-classification="updates" data-url="${escapeAttr(item.url)}" title="This gallery is a continuing update and should be shown in Updates.">Mark as Updates</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
       : currentView === "continuing-updates"
         ? `<div class="card-actions"><button class="clear" type="button" data-classification="review" data-url="${escapeAttr(item.url)}" title="This is a normal gallery and should be shown in Review.">Move to Review</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
@@ -2193,7 +2312,7 @@ function renderGalleryCards(items, append = false) {
     const markActions = mode === "preview"
       ? ""
       : `<div class="card-actions">${banButton}${favoriteButton}${clearMarkButton}</div>`;
-    const feedbackControls = mode === "preview"
+    const feedbackControls = mode === "preview" || classifierMode
       ? ""
       : `<div class="votes">
           <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
@@ -2223,6 +2342,9 @@ function renderGalleryCards(items, append = false) {
         <div class="card-actions">${refreshMetadataButton}</div>
         ${feedbackActions}`;
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
+    const scoreMeta = classifierMode
+      ? `${escapeHtml(item.category || "Unknown")}${escapeHtml(pageCount)}`
+      : `${escapeHtml(item.category || "Unknown")} · ${item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}`;
     card.innerHTML = `
       <div class="media-preview">
         ${thumb}
@@ -2230,7 +2352,8 @@ function renderGalleryCards(items, append = false) {
       </div>
       <div class="body">
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
-        <div class="meta">${escapeHtml(item.category || "Unknown")} · ${item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}</div>
+        <div class="meta">${scoreMeta}</div>
+        ${classifierSampleMeta}
         ${Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
@@ -2250,7 +2373,7 @@ function renderGalleryCards(items, append = false) {
       </div>
     `;
     recommendationsEl.appendChild(card);
-    if (mode !== "preview") {
+    if (mode !== "preview" && !classifierMode) {
       queueVisualEmbedding(item);
     }
   }
@@ -2809,6 +2932,19 @@ for (const tab of viewTabs) {
   });
 }
 recommendationsEl.addEventListener("click", (event) => {
+  const sampleClassificationButton = event.target.closest("button[data-sample-classification]");
+  if (sampleClassificationButton) {
+    labelClassificationSample(
+      sampleClassificationButton.dataset.sampleId,
+      sampleClassificationButton.dataset.sampleClassification
+    ).catch((error) => setStatus(error.message, true));
+    return;
+  }
+  const sampleDeferButton = event.target.closest("button[data-sample-defer]");
+  if (sampleDeferButton) {
+    deferClassificationSample(sampleDeferButton.dataset.sampleId);
+    return;
+  }
   const button = event.target.closest("button[data-vote]");
   if (button) {
     vote(button.dataset.url, Number(button.dataset.vote)).catch((error) => setStatus(error.message, true));
