@@ -744,6 +744,8 @@ def get_settings() -> dict:
             "request_interval_seconds": request_interval_seconds(conn),
             "temporary_ban_pause_seconds": temporary_ban_pause_seconds(conn),
             "recommend_candidate_limit": recommend_candidate_limit(conn),
+            "updates_shortlist_limit": updates_shortlist_limit(conn),
+            "updates_min_new_pages": updates_min_new_pages(conn),
             "recommend_language_filter": configured_language_filter(conn),
             "recommend_model_mode": configured_model_mode(conn),
             "preview_freshness_weight": preview_freshness_weight(conn),
@@ -783,6 +785,8 @@ def get_status() -> dict:
                 "request_interval_seconds": request_interval_seconds(conn),
                 "temporary_ban_pause_seconds": temporary_ban_pause_seconds(conn),
                 "recommend_candidate_limit": recommend_candidate_limit(conn),
+                "updates_shortlist_limit": updates_shortlist_limit(conn),
+                "updates_min_new_pages": updates_min_new_pages(conn),
                 "recommend_language_filter": configured_language_filter(conn),
                 "recommend_model_mode": configured_model_mode(conn),
                 "preview_freshness_weight": preview_freshness_weight(conn),
@@ -886,6 +890,12 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "recommend_candidate_limit" in payload:
             limit = bounded_int(payload["recommend_candidate_limit"], default=2000, lower=100, upper=10000)
             db.set_setting(conn, "recommend_candidate_limit", str(limit))
+        if "updates_shortlist_limit" in payload:
+            limit = bounded_int(payload["updates_shortlist_limit"], default=40, lower=1, upper=500)
+            db.set_setting(conn, "updates_shortlist_limit", str(limit))
+        if "updates_min_new_pages" in payload:
+            pages = bounded_int(payload["updates_min_new_pages"], default=50, lower=0, upper=5000)
+            db.set_setting(conn, "updates_min_new_pages", str(pages))
         if "recommend_language_filter" in payload:
             languages = normalize_language_filter(str(payload["recommend_language_filter"]))
             db.set_setting(conn, "recommend_language_filter", ",".join(sorted(languages)))
@@ -3051,6 +3061,14 @@ def recommend_candidate_limit(conn) -> int:
     return bounded_int(db.get_setting(conn, "recommend_candidate_limit", "2000"), default=2000, lower=100, upper=10000)
 
 
+def updates_shortlist_limit(conn) -> int:
+    return bounded_int(db.get_setting(conn, "updates_shortlist_limit", "40"), default=40, lower=1, upper=500)
+
+
+def updates_min_new_pages(conn) -> int:
+    return bounded_int(db.get_setting(conn, "updates_min_new_pages", "50"), default=50, lower=0, upper=5000)
+
+
 def configured_language_filter(conn) -> str:
     languages = normalize_language_filter(db.get_setting(conn, "recommend_language_filter", "japanese,chinese"))
     return ",".join(sorted(languages))
@@ -3194,6 +3212,8 @@ def continuing_update_payload(
         offset=offset,
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
+        shortlist_limit=updates_shortlist_limit(conn),
+        min_new_pages=updates_min_new_pages(conn),
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     return {**page, "last_fetch": last_fetch_run(conn)}
@@ -3303,7 +3323,8 @@ def queue_counts_payload(conn) -> dict[str, int]:
              WHERE sampling_frame = 'full-library' AND classification IS NULL) AS classifier_pending,
             (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, '|'), '') FROM settings
              WHERE key IN ('recommend_candidate_limit', 'recommend_language_filter',
-                           'recommend_model_mode', 'review_require_bootstrap_match')) AS settings_version
+                           'recommend_model_mode', 'review_require_bootstrap_match',
+                           'updates_shortlist_limit', 'updates_min_new_pages')) AS settings_version
         """
     ).fetchone()
     fingerprint = tuple(fingerprint_row)
@@ -3327,7 +3348,12 @@ def queue_counts_payload(conn) -> dict[str, int]:
         conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
     )
     update_page = continuing_update_page(
-        conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
+        conn,
+        limit=1,
+        candidate_limit=candidate_limit,
+        continuing_updates=continuing_updates,
+        shortlist_limit=updates_shortlist_limit(conn),
+        min_new_pages=updates_min_new_pages(conn),
     )
     result = {
         "review": int(review["total"]),

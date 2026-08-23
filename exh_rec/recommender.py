@@ -500,7 +500,9 @@ def record_feedback(
     reason_code: str | None = None,
     surface: str | None = None,
 ) -> None:
-    snapshot_gallery_features(conn, gallery_url, "feedback")
+    # A vote needs its own baseline even when the gallery has not changed since
+    # the previous fetch; later Updates filtering compares growth to this row.
+    snapshot_gallery_features(conn, gallery_url, "feedback", force=True)
     previous = conn.execute(
         """
         SELECT vote
@@ -2461,13 +2463,17 @@ def continuing_update_page(
     filter_text: str | None = None,
     candidate_limit: int = 2000,
     continuing_updates: dict[str, dict] | None = None,
+    shortlist_limit: int = 40,
+    min_new_pages: int = 50,
 ) -> dict:
-    """Return one latest gallery card for every detected cumulative series."""
+    """Return a ranked shortlist of meaningful cumulative-gallery updates."""
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
     candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
     candidate_limit = max(limit + offset, candidate_limit)
+    shortlist_limit = max(1, min(500, int(shortlist_limit)))
+    min_new_pages = max(0, min(5000, int(min_new_pages)))
     series_index = continuing_updates if continuing_updates is not None else continuing_update_series_index(conn)
     overrides = classification_overrides(conn)
     latest = {
@@ -2489,14 +2495,15 @@ def continuing_update_page(
             }
     classifier_rows = conn.execute(
         """
-        SELECT * FROM galleries
+        SELECT url, title, title_jpn, category, page_count, parent_url
+        FROM galleries
         WHERE review_excluded = 0
         ORDER BY COALESCE(posted_at, last_seen_at) DESC, last_seen_at DESC
         LIMIT ?
         """,
         (candidate_limit,),
     ).fetchall()
-    classifier_inputs = [gallery_item_from_row(row) for row in classifier_rows]
+    classifier_inputs = [dict(row) for row in classifier_rows]
     classifier_decisions, classifier_status = continuing_classifier_decisions(conn, classifier_inputs)
     for gallery in classifier_inputs:
         url = normalize_gallery_url(gallery.get("url"))
@@ -2517,43 +2524,22 @@ def continuing_update_page(
     if not latest:
         return {
             "items": [], "limit": limit, "offset": offset, "next_offset": offset,
-            "total": 0, "has_more": False, "candidate_limit": candidate_limit,
+            "total": 0, "eligible_total": 0, "has_more": False,
+            "candidate_limit": candidate_limit, "shortlist_limit": shortlist_limit,
+            "updates_min_new_pages": min_new_pages,
         }
 
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
     tag_strengths = tag_corpus_strengths(conn)
-    manual_placeholders = ",".join("?" for _ in manual_update_urls) or "''"
-    rows = conn.execute(
-        f"""
-        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
-               f.feedback_created_at,
-               m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
-        FROM galleries g
-        LEFT JOIN (
-            SELECT feedback.id AS feedback_id, feedback.gallery_url, feedback.vote,
-                   feedback.score AS user_score, feedback.created_at AS feedback_created_at
-            FROM feedback
-            JOIN (
-                SELECT gallery_url, MAX(id) AS latest_id FROM feedback GROUP BY gallery_url
-            ) latest_feedback
-              ON latest_feedback.gallery_url = feedback.gallery_url AND latest_feedback.latest_id = feedback.id
-        ) f ON f.gallery_url = g.url
-        LEFT JOIN gallery_marks m ON m.gallery_url = g.url
-        WHERE g.review_excluded = 0
-        ORDER BY COALESCE(g.posted_at, g.last_seen_at) DESC, g.last_seen_at DESC
-        LIMIT ?
-        """,
-        (candidate_limit,),
-    ).fetchall()
-    selected_urls = {normalize_gallery_url(row["url"]) for row in rows}
-    missing_manual_urls = manual_update_urls - selected_urls
-    if missing_manual_urls:
-        placeholders = ",".join("?" for _ in missing_manual_urls)
-        rows = [
-            *rows,
-            *conn.execute(
+    rows = []
+    latest_urls = list(latest)
+    for chunk_offset in range(0, len(latest_urls), 500):
+        chunk = latest_urls[chunk_offset : chunk_offset + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows.extend(
+            conn.execute(
                 f"""
                 SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
                        f.feedback_created_at,
@@ -2571,34 +2557,66 @@ def continuing_update_page(
                 LEFT JOIN gallery_marks m ON m.gallery_url = g.url
                 WHERE g.url IN ({placeholders}) AND g.review_excluded = 0
                 """,
-                tuple(missing_manual_urls),
-            ).fetchall(),
-        ]
+                chunk,
+            ).fetchall()
+        )
 
     items: list[dict] = []
+    feedback_context = continuing_feedback_context(conn, series_index)
     for idx, row in enumerate(rows):
         gallery = apply_feedback_state(gallery_item_from_row(row))
         metadata = latest.get(gallery.get("url"))
         if not metadata:
             continue
-        if gallery["rated"]:
+        previous_feedback = continuing_previous_feedback(
+            conn,
+            gallery["url"],
+            metadata,
+            series_index,
+            include_current=True,
+            context=feedback_context,
+        )
+        if gallery["rated"] and previous_feedback is None:
             continue
+        new_pages = None
+        if previous_feedback is not None:
+            current_pages = positive_page_count(gallery.get("page_count"))
+            previous_pages = positive_page_count(previous_feedback.get("page_count_at_feedback"))
+            if current_pages is not None and previous_pages is not None:
+                new_pages = max(0, current_pages - previous_pages)
+            if min_new_pages and (new_pages is None or new_pages < min_new_pages):
+                continue
         if filter_text and not gallery_matches_filter(gallery, filter_text):
             continue
         score, reasons = score_gallery(gallery, bootstrap, weights, visual_model=visual_model, tag_strengths=tag_strengths)
         gallery.pop("visual_embedding", None)
         freshness = freshness_bonus(idx, candidate_limit)
         gallery["score"] = round(score + freshness, 3)
-        gallery["reasons"] = ["continuing update", metadata["reason"], *reasons][:5]
+        growth_reason = f"expanded +{new_pages} pages" if new_pages is not None else None
+        gallery["reasons"] = [
+            reason
+            for reason in ["continuing update", growth_reason, metadata["reason"], *reasons]
+            if reason
+        ][:5]
         gallery["continuing_update"] = True
         gallery["continuing_series"] = metadata
+        gallery["new_pages_since_feedback"] = new_pages
+        gallery["updates_min_new_pages"] = min_new_pages
         gallery["classification_override"] = overrides.get(normalize_gallery_url(gallery["url"]))
         gallery["classification_prediction"] = classifier_decisions.get(normalize_gallery_url(gallery["url"]))
-        gallery["previous_feedback"] = continuing_previous_feedback(
-            conn, gallery["url"], metadata, series_index
-        )
+        gallery["previous_feedback"] = previous_feedback
         items.append(gallery)
 
+    items.sort(
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            str(item.get("posted_at") or item.get("last_seen_at") or ""),
+        ),
+        reverse=True,
+    )
+    eligible_total = len(items)
+    if not filter_text:
+        items = items[:shortlist_limit]
     page_items = items[offset : offset + limit]
     next_offset = offset + len(page_items)
     return {
@@ -2607,9 +2625,70 @@ def continuing_update_page(
         "offset": offset,
         "next_offset": next_offset,
         "total": len(items),
+        "eligible_total": eligible_total,
         "has_more": next_offset < len(items),
         "candidate_limit": candidate_limit,
+        "shortlist_limit": shortlist_limit,
+        "updates_min_new_pages": min_new_pages,
         "continuing_classifier": classifier_status,
+    }
+
+
+def positive_page_count(value: object) -> int | None:
+    try:
+        page_count = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return page_count if page_count > 0 else None
+
+
+def continuing_feedback_context(
+    conn: sqlite3.Connection,
+    series_index: dict[str, dict],
+) -> dict[str, object]:
+    members_by_series: dict[str, set[str]] = {}
+    for url, metadata in series_index.items():
+        series_id = str(metadata.get("series_id") or "")
+        normalized_url = normalize_gallery_url(url)
+        if series_id and normalized_url:
+            members_by_series.setdefault(series_id, set()).add(normalized_url)
+    parent_by_url = {
+        normalize_gallery_url(row["url"]): normalize_gallery_url(row["parent_url"])
+        for row in conn.execute("SELECT url, parent_url FROM galleries WHERE parent_url IS NOT NULL")
+    }
+    feedback_rows = conn.execute(
+        """
+        SELECT f.id AS feedback_id, f.gallery_url AS url, f.vote AS user_vote,
+               f.score AS user_score, f.reason_code, f.created_at AS feedback_created_at,
+               g.title,
+               COALESCE(
+                   (
+                       SELECT s.page_count
+                       FROM gallery_feature_snapshots s
+                       WHERE s.gallery_url = f.gallery_url
+                         AND julianday(s.captured_at) IS NOT NULL
+                         AND julianday(s.captured_at) <= julianday(f.created_at)
+                       ORDER BY (s.source = 'feedback') DESC, s.captured_at DESC, s.id DESC
+                       LIMIT 1
+                   ),
+                   g.page_count
+               ) AS page_count_at_feedback
+        FROM feedback f
+        JOIN galleries g ON g.url = f.gallery_url
+        JOIN (
+            SELECT gallery_url, MAX(id) AS latest_id
+            FROM feedback
+            GROUP BY gallery_url
+        ) latest ON latest.latest_id = f.id
+        """
+    ).fetchall()
+    return {
+        "members_by_series": members_by_series,
+        "parent_by_url": parent_by_url,
+        "feedback_by_url": {
+            normalize_gallery_url(row["url"]): dict(row)
+            for row in feedback_rows
+        },
     }
 
 
@@ -2618,15 +2697,21 @@ def continuing_previous_feedback(
     gallery_url: str,
     metadata: dict,
     series_index: dict[str, dict],
+    *,
+    include_current: bool = False,
+    context: dict[str, object] | None = None,
 ) -> dict | None:
     gallery_url = normalize_gallery_url(gallery_url)
     series_id = metadata.get("series_id")
-    member_urls = {
-        normalize_gallery_url(url)
-        for url, member_metadata in series_index.items()
-        if member_metadata.get("series_id") == series_id
-    }
-    member_urls.discard(gallery_url)
+    context = context or continuing_feedback_context(conn, series_index)
+    members_by_series: dict[str, set[str]] = context["members_by_series"]  # type: ignore[assignment]
+    parent_by_url: dict[str, str] = context["parent_by_url"]  # type: ignore[assignment]
+    feedback_by_url: dict[str, dict] = context["feedback_by_url"]  # type: ignore[assignment]
+    member_urls = set(members_by_series.get(str(series_id or ""), set()))
+    if include_current:
+        member_urls.add(gallery_url)
+    else:
+        member_urls.discard(gallery_url)
     if not member_urls:
         return None
 
@@ -2634,8 +2719,7 @@ def continuing_previous_feedback(
     seen = {gallery_url}
     current = gallery_url
     while current and len(ancestors) < 12:
-        row = conn.execute("SELECT parent_url FROM galleries WHERE url = ?", (current,)).fetchone()
-        parent_url = normalize_gallery_url(row["parent_url"]) if row else ""
+        parent_url = parent_by_url.get(current, "")
         if not parent_url or parent_url in seen:
             break
         seen.add(parent_url)
@@ -2643,32 +2727,18 @@ def continuing_previous_feedback(
             ancestors.append(parent_url)
         current = parent_url
 
-    ordered_urls = [*ancestors, *sorted(member_urls - set(ancestors))]
-    placeholders = ",".join("?" for _ in ordered_urls)
-    rows = conn.execute(
-        f"""
-        SELECT f.id AS feedback_id, f.gallery_url AS url, f.vote AS user_vote,
-               f.score AS user_score, f.reason_code, f.created_at AS feedback_created_at,
-               g.title
-        FROM feedback f
-        JOIN galleries g ON g.url = f.gallery_url
-        JOIN (
-            SELECT gallery_url, MAX(id) AS latest_id
-            FROM feedback
-            GROUP BY gallery_url
-        ) latest ON latest.latest_id = f.id
-        WHERE f.gallery_url IN ({placeholders})
-        """,
-        ordered_urls,
-    ).fetchall()
-    by_url = {normalize_gallery_url(row["url"]): dict(row) for row in rows}
-    source = next((by_url[url] for url in ancestors if url in by_url), None)
-    if source is None and rows:
-        source = dict(max(rows, key=lambda row: int(row["feedback_id"])))
+    source = feedback_by_url.get(gallery_url) if include_current else None
+    if source is None:
+        source = next((feedback_by_url[url] for url in ancestors if url in feedback_by_url), None)
+    if source is None:
+        candidates = [feedback_by_url[url] for url in member_urls if url in feedback_by_url]
+        source = max(candidates, key=lambda row: int(row["feedback_id"])) if candidates else None
     if source is None:
         return None
+    source = dict(source)
     source["user_vote"] = round(float(source.get("user_vote") or 0.0), 3)
     source["is_parent"] = normalize_gallery_url(source["url"]) in ancestors
+    source["is_current"] = normalize_gallery_url(source["url"]) == gallery_url
     return source
 
 

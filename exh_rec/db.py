@@ -315,6 +315,8 @@ def init_db() -> None:
             "request_interval_seconds": "3.0",
             "temporary_ban_pause_seconds": "90.0",
             "recommend_candidate_limit": "2000",
+            "updates_shortlist_limit": "40",
+            "updates_min_new_pages": "50",
             "recommend_language_filter": "japanese,chinese",
             "recommend_model_mode": "hybrid",
             "preview_freshness_weight": "8.0",
@@ -433,6 +435,8 @@ def snapshot_gallery_features(
     gallery_url: str,
     source: str,
     captured_at: str | None = None,
+    *,
+    force: bool = False,
 ) -> int | None:
     row = conn.execute(
         """
@@ -462,7 +466,7 @@ def snapshot_gallery_features(
         """,
         (gallery_url, captured_at, captured_at),
     ).fetchone()
-    if previous is not None and tuple(previous) == tuple(row):
+    if not force and previous is not None and tuple(previous) == tuple(row):
         return None
     cursor = conn.execute(
         """

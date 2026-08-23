@@ -7,6 +7,8 @@ const staleFetchExtraPagesEl = document.querySelector("#staleFetchExtraPages");
 const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
+const updatesShortlistLimitEl = document.querySelector("#updatesShortlistLimit");
+const updatesMinNewPagesEl = document.querySelector("#updatesMinNewPages");
 const previewFreshnessWeightEl = document.querySelector("#previewFreshnessWeight");
 const previewPostedAfterEl = document.querySelector("#previewPostedAfter");
 const sampleExtraPagesEl = document.querySelector("#sampleExtraPages");
@@ -449,6 +451,8 @@ async function loadSettings() {
   detailLimitEl.value = settings.detail_fetch_limit;
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
+  updatesShortlistLimitEl.value = settings.updates_shortlist_limit ?? 40;
+  updatesMinNewPagesEl.value = settings.updates_min_new_pages ?? 50;
   previewFreshnessWeightEl.value = settings.preview_freshness_weight ?? 8;
   previewPostedAfterEl.value = settings.preview_posted_after || "";
   sampleExtraPagesEl.value = settings.sample_extra_pages;
@@ -491,6 +495,8 @@ async function saveSettings() {
     detail_fetch_limit: Number(detailLimitEl.value),
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
+    updates_shortlist_limit: Number(updatesShortlistLimitEl.value),
+    updates_min_new_pages: Number(updatesMinNewPagesEl.value),
     preview_freshness_weight: Number(previewFreshnessWeightEl.value),
     preview_posted_after: previewPostedAfterEl.value,
     sample_extra_pages: Number(sampleExtraPagesEl.value),
@@ -551,8 +557,8 @@ function viewCopy(view) {
   if (view === "continuing-updates") {
     return {
       title: "Continuing Updates",
-      subtitle: "Latest versions of cumulative galleries, separated from Review after the series has been judged once.",
-      empty: "No continuing gallery series detected yet.",
+      subtitle: "A ranked shortlist of unseen continuing galleries and substantially expanded series.",
+      empty: "No continuing updates currently pass the shortlist and growth filters.",
       loaded: "continuing gallery series loaded",
     };
   }
@@ -2373,7 +2379,7 @@ function renderGalleryCards(items, append = false) {
       </div>
     `;
     recommendationsEl.appendChild(card);
-    if (mode !== "preview" && !classifierMode) {
+    if (["review", "discovery", "short-repeats"].includes(mode)) {
       queueVisualEmbedding(item);
     }
   }

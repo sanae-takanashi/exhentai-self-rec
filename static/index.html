@@ -62,6 +62,14 @@
             <input id="candidateLimit" type="number" min="100" max="10000" step="100" value="2000">
           </label>
           <label>
+            Updates shown
+            <input id="updatesShortlistLimit" type="number" min="1" max="500" step="10" value="40">
+          </label>
+          <label>
+            Re-show after pages
+            <input id="updatesMinNewPages" type="number" min="0" max="5000" step="10" value="50">
+          </label>
+          <label>
             Preview freshness
             <input id="previewFreshnessWeight" type="number" min="0" max="50" step="0.5" value="8">
           </label>
@@ -355,6 +363,6 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js?v=20260821-2"></script>
+    <script src="/static/app.js?v=20260823-1"></script>
   </body>
 </html>

@@ -110,3 +110,18 @@ served NDCG@20 相对最佳 baseline 的 95% 差值区间为 `[0.192446, 0.41742
 - 严格报告、诊断报告和 feature ablation 均成功生成并通过 JSON 重解析。
 - 数据库已迁移，创建 8472 条 `migration-current` 初始快照和 60 条 classifier 待标注样本，其中 30 条属于有效的 `full-library` frame。
 - 数据库备份：`data/recommender.sqlite3.bak-20260821-followup`；评估报告也保留了对应时间戳备份。
+
+## 2026-08-23 Updates 队列收敛
+
+随着 continuing classifier 完成标注，Updates 会持续积累，但产品目标不是停止抓取或丢弃历史数据，而是只把值得再次查看的小部分暴露给 UI。本次调整保持抓取、图库入库和 feature snapshot 全部不变，只收敛展示队列：
+
+- 默认按现有兴趣分排序，只展示前 40 条；有文本搜索时取消 40 条上限，方便主动查找。
+- 某个系列已有评价时，默认只有相较评价基线新增至少 50 页才重新出现。页数基线未知、没有增长或增长不足时保持隐藏。
+- `Updates shown` 和 `Re-show after pages` 均进入 Settings，可分别在 1-500 和 0-5000 范围调整；门槛设为 0 可恢复旧的不过滤行为。
+- Updates 不再自动生成 visual embedding，避免打开列表后产生一批额外请求、写入和刷新。
+- classifier 初筛只读取轻量字段，最终候选才加载完整 gallery；系列历史评价与父链改为批量上下文，不再逐卡查询。
+- 每次评价强制留下专用 feature snapshot，并优先作为页数基线，避免评价和后续抓取落在同一秒时误用评价后的状态。
+
+真实库有 8653 个图库。关闭增长门槛时有 695 个 Updates 候选；要求至少新增 1 页后剩 534 个，默认 50 页后剩 532 个，最终 UI 只返回排名最高的 40 个。新代码的 40 项接口热调用约 1.14 秒、146 KB；旧常驻进程同接口热调用约 1.49 秒、126 KB。新 payload 因候选内容不同略大，但服务端筛选更快，且 UI 不再追加 visual embedding 请求。
+
+验证结果：Updates/recommender/app 专项 218 个测试全部通过；全量 356 个测试中 352 个通过、1 个跳过、3 个既有 H@H Windows 路径断言失败，与本次修改无关。`node.exe --check static/app.js` 和 `git diff --check` 通过。迁移前 SQLite 在线备份为 `data/recommender.sqlite3.bak-updates-20260823-195442`，`PRAGMA integrity_check` 返回 `ok`。

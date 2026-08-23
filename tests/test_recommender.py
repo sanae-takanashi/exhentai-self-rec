@@ -1248,7 +1248,7 @@ class RecommenderTest(unittest.TestCase):
         )
         record_feedback(self.conn, old_url, score=5)
 
-        item = continuing_update_page(self.conn, limit=10)["items"][0]
+        item = continuing_update_page(self.conn, limit=10, min_new_pages=0)["items"][0]
         source = copy_continuing_feedback(self.conn, latest_url)
         history = feedback_history(self.conn, latest_url)
 
@@ -1316,6 +1316,92 @@ class RecommenderTest(unittest.TestCase):
 
         clear_feedback(self.conn, url)
         self.assertIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+    def test_rated_update_returns_only_after_enough_new_pages(self):
+        url = "https://exhentai.org/g/8246/a/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=url, gid="8246", token="a", title="Growing Manual Update")],
+        )
+        store_gallery_samples(self.conn, url, 100, [])
+        set_classification_override(self.conn, url, "updates")
+        record_feedback(self.conn, url, score=5)
+
+        store_gallery_samples(self.conn, url, 149, [])
+        self.assertNotIn(url, [item["url"] for item in continuing_update_page(self.conn, limit=10)["items"]])
+
+        store_gallery_samples(self.conn, url, 150, [])
+        item = continuing_update_page(self.conn, limit=10)["items"][0]
+
+        self.assertEqual(item["url"], url)
+        self.assertEqual(item["new_pages_since_feedback"], 50)
+        self.assertTrue(item["previous_feedback"]["is_current"])
+
+    def test_voted_parent_update_uses_parent_page_count_at_feedback(self):
+        old_url = "https://exhentai.org/g/8247/a/"
+        latest_url = "https://exhentai.org/g/8248/a/"
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=old_url,
+                    gid="8247",
+                    token="a",
+                    title="[Fanbox] Growing Parent",
+                    tags=["artist:growing parent"],
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, old_url, 100, [])
+        record_feedback(self.conn, old_url, score=4)
+        store_galleries(
+            self.conn,
+            [
+                Gallery(
+                    url=latest_url,
+                    gid="8248",
+                    token="a",
+                    title="[Fanbox] Growing Parent",
+                    tags=["artist:growing parent"],
+                    parent_url=old_url,
+                ),
+            ],
+        )
+        store_gallery_samples(self.conn, latest_url, 165, [])
+
+        item = continuing_update_page(self.conn, limit=10)["items"][0]
+
+        self.assertEqual(item["url"], latest_url)
+        self.assertEqual(item["new_pages_since_feedback"], 65)
+        self.assertEqual(item["previous_feedback"]["url"], old_url)
+        self.assertTrue(item["previous_feedback"]["is_parent"])
+
+    def test_continuing_updates_rank_and_truncate_shortlist(self):
+        urls = [f"https://exhentai.org/g/8249{idx}/a/" for idx in range(3)]
+        tags = ["artist:high", "artist:medium", "artist:low"]
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url=url, gid=f"8249{idx}", token="a", title="Shortlist Update", tags=[tags[idx]])
+                for idx, url in enumerate(urls)
+            ],
+        )
+        for url in urls:
+            set_classification_override(self.conn, url, "updates")
+        upsert_bootstrap_tags(self.conn, [(tags[0], 5), (tags[1], 3), (tags[2], 1)])
+
+        page = continuing_update_page(self.conn, limit=10, shortlist_limit=2)
+        search_page = continuing_update_page(
+            self.conn,
+            limit=10,
+            shortlist_limit=2,
+            filter_text="shortlist",
+        )
+
+        self.assertEqual([item["url"] for item in page["items"]], urls[:2])
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(page["eligible_total"], 3)
+        self.assertEqual(search_page["total"], 3)
 
     def test_neutral_score_hides_automatic_update(self):
         old_url = "https://exhentai.org/g/8244/a/"
@@ -1532,7 +1618,7 @@ class RecommenderTest(unittest.TestCase):
         store_gallery_samples(self.conn, child_url, 80, [])
         record_feedback(self.conn, ancestor_url, score=5)
 
-        update_page = continuing_update_page(self.conn, limit=10)
+        update_page = continuing_update_page(self.conn, limit=10, min_new_pages=0)
         child_item = next(item for item in update_page["items"] if item["url"] == child_url)
         review_urls = [item["url"] for item in recommend_page(self.conn, limit=10)["items"]]
 

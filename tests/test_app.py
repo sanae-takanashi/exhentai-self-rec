@@ -67,6 +67,8 @@ from exh_rec.app import (
     queue_counts_payload,
     reaction_history_payload,
     recommend_candidate_limit,
+    updates_min_new_pages,
+    updates_shortlist_limit,
     recommendation_payload,
     response_page_payload,
     refresh_gallery_metadata_payload,
@@ -1373,6 +1375,7 @@ class AppTest(unittest.TestCase):
         )
         record_feedback(conn, old_url, score=4)
 
+        db.set_setting(conn, "updates_min_new_pages", "0")
         payload = continuing_update_payload(conn, limit=10)
 
         previous = payload["items"][0]["previous_feedback"]
@@ -2547,6 +2550,22 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     self.assertEqual(recommend_candidate_limit(conn), 10000)
 
+    def test_save_settings_clamps_updates_filters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+
+                save_settings({"updates_shortlist_limit": 0, "updates_min_new_pages": -5})
+                with db.connect() as conn:
+                    self.assertEqual(updates_shortlist_limit(conn), 1)
+                    self.assertEqual(updates_min_new_pages(conn), 0)
+
+                save_settings({"updates_shortlist_limit": 900, "updates_min_new_pages": 9000})
+                with db.connect() as conn:
+                    self.assertEqual(updates_shortlist_limit(conn), 500)
+                    self.assertEqual(updates_min_new_pages(conn), 5000)
+
     def test_save_settings_defaults_invalid_numeric_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
@@ -2563,6 +2582,8 @@ class AppTest(unittest.TestCase):
                         "request_interval_seconds": "bad",
                         "temporary_ban_pause_seconds": "bad",
                         "recommend_candidate_limit": "bad",
+                        "updates_shortlist_limit": "bad",
+                        "updates_min_new_pages": "bad",
                         "preview_freshness_weight": "bad",
                         "preview_posted_after": "not-a-date",
                         "hath_download_signal_weight": "bad",
@@ -2578,6 +2599,8 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(db.get_setting(conn, "request_interval_seconds", ""), "3.0")
                     self.assertEqual(db.get_setting(conn, "temporary_ban_pause_seconds", ""), "90.0")
                     self.assertEqual(recommend_candidate_limit(conn), 2000)
+                    self.assertEqual(updates_shortlist_limit(conn), 40)
+                    self.assertEqual(updates_min_new_pages(conn), 50)
                     self.assertEqual(db.get_setting(conn, "preview_freshness_weight", ""), "8.0")
                     self.assertEqual(db.get_setting(conn, "preview_posted_after", "missing"), "")
                     self.assertEqual(db.get_setting(conn, "hath_download_signal_weight", ""), "1.25")
@@ -2596,6 +2619,8 @@ class AppTest(unittest.TestCase):
                     db.set_setting(conn, "request_interval_seconds", "bad")
                     db.set_setting(conn, "temporary_ban_pause_seconds", "bad")
                     db.set_setting(conn, "recommend_candidate_limit", "bad")
+                    db.set_setting(conn, "updates_shortlist_limit", "bad")
+                    db.set_setting(conn, "updates_min_new_pages", "bad")
                     db.set_setting(conn, "preview_freshness_weight", "bad")
                     db.set_setting(conn, "preview_posted_after", "not-a-date")
                     db.set_setting(conn, "hath_download_signal_weight", "bad")
@@ -2610,6 +2635,8 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["request_interval_seconds"], 3.0)
                 self.assertEqual(settings["temporary_ban_pause_seconds"], 90.0)
                 self.assertEqual(settings["recommend_candidate_limit"], 2000)
+                self.assertEqual(settings["updates_shortlist_limit"], 40)
+                self.assertEqual(settings["updates_min_new_pages"], 50)
                 self.assertEqual(settings["preview_freshness_weight"], 8.0)
                 self.assertEqual(settings["preview_posted_after"], "")
                 self.assertEqual(settings["hath_download_signal_weight"], 1.25)
