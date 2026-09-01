@@ -1,6 +1,8 @@
 import os
 import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from exh_rec import db
@@ -72,6 +74,56 @@ class HathIntegrationTest(unittest.TestCase):
         self.assertFalse(second["completed_changed"])
         self.assertEqual(status["counts"], {"completed": 1})
         self.assertEqual(status["downloads"][0]["gallery_url"], "https://exhentai.org/g/123/abc/")
+
+    def test_late_progress_does_not_downgrade_completed_download(self):
+        ingest_event_batch(self.conn, completed_event())
+        ingest_event_batch(
+            self.conn,
+            {
+                "schema": "hath-observer-events-v1",
+                "client_id": "desktop-a",
+                "events": [
+                    {
+                        "event_id": "late-progress-1",
+                        "type": "download.progress",
+                        "occurred_at": "2026-08-18T08:31:00Z",
+                        "gid": "123",
+                        "resolution": "org",
+                        "directory_name": "Downloaded Gallery [123]",
+                        "downloaded_files": 20,
+                        "downloaded_bytes": 123456,
+                    }
+                ],
+            },
+        )
+
+        status = hath_status(self.conn)
+
+        self.assertEqual(status["counts"], {"completed": 1})
+        self.assertEqual(status["downloads"][0]["status"], "completed")
+
+    def test_init_db_repairs_completed_download_with_stale_active_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(db, "DATA_DIR", Path(tmpdir)), patch.object(
+            db, "DB_PATH", Path(tmpdir) / "recommender.sqlite3"
+        ):
+            db.init_db()
+            with db.connect() as conn:
+                conn.execute("INSERT INTO hath_clients(client_id) VALUES ('desktop-a')")
+                conn.execute(
+                    """
+                    INSERT INTO hath_downloads(
+                        client_id, gid, resolution, status, directory_name,
+                        total_files, downloaded_files, completed_at, updated_at
+                    ) VALUES ('desktop-a', '123', 'org', 'downloading', 'Downloaded Gallery [123]',
+                              20, 20, '2026-08-18T08:30:00Z', '2026-08-18T08:31:00Z')
+                    """
+                )
+
+            db.init_db()
+
+            with db.connect() as conn:
+                row = conn.execute("SELECT status FROM hath_downloads WHERE gid = '123'").fetchone()
+            self.assertEqual(row["status"], "completed")
 
     def test_completed_download_is_an_implicit_positive_until_explicit_feedback(self):
         ingest_event_batch(self.conn, completed_event())

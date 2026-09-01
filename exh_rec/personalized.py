@@ -22,6 +22,12 @@ CALIBRATION_HOLDOUT_FRACTION = 0.20
 BOOTSTRAP_MODELS = 8
 CALIBRATION_RECENCY_DECAY = 3.0
 CALIBRATION_C = 0.2
+LOW_INTEREST_MAX_POSITIVE_RATE = 0.10
+LOW_INTEREST_MAX_POSITIVE_LOSS_RATE = 0.05
+LOW_INTEREST_MAX_THRESHOLD = 0.50
+LOW_INTEREST_MIN_OOF_SAMPLES = 80
+LOW_INTEREST_MIN_TRIAGED_SAMPLES = 30
+LOW_INTEREST_WILSON_Z = 1.96
 NEGATIVE_REASON_CODES = {
     "visual_style",
     "content_tags",
@@ -548,7 +554,11 @@ def _classifier(modules: dict[str, Any], c_value: float):
 def _rolling_splits(count: int) -> list[tuple[int, int]]:
     if count <= MIN_CLASS * 2:
         return []
-    minimum_train = min(MIN_LABELED, max(MIN_CLASS * 2, count // 2))
+    minimum_train = (
+        MIN_CLASS * 2
+        if count <= MIN_LABELED
+        else min(MIN_LABELED, max(MIN_CLASS * 2, count // 2))
+    )
     window = max(10, min(100, count // 5))
     starts = sorted({max(minimum_train, int(count * fraction)) for fraction in (0.5, 0.65, 0.8)})
     starts = sorted({*starts, max(minimum_train, count - window)})
@@ -649,6 +659,136 @@ def _ece(labels, probabilities, modules: dict[str, Any], bins: int = 10) -> floa
     return result
 
 
+def _wilson_upper_bound(positives: int, total: int, z: float = LOW_INTEREST_WILSON_Z) -> float:
+    if total <= 0:
+        return 1.0
+    rate = positives / total
+    denominator = 1.0 + z * z / total
+    center = rate + z * z / (2.0 * total)
+    margin = z * math.sqrt((rate * (1.0 - rate) + z * z / (4.0 * total)) / total)
+    return min(1.0, (center + margin) / denominator)
+
+
+def _temporal_oof_probabilities(
+    examples: list[dict],
+    selected_c: float,
+    modules: dict[str, Any],
+) -> tuple[list[dict], list[dict], bool]:
+    predictions_by_index: dict[int, dict] = {}
+    folds: list[dict] = []
+    all_calibrated = True
+    for start, end in _rolling_splits(len(examples)):
+        train = examples[:start]
+        test = examples[start:end]
+        train_labels = modules["np"].asarray([int(item["label"]) for item in train], dtype="int8")
+        test_labels = modules["np"].asarray([int(item["label"]) for item in test], dtype="int8")
+        if len(set(train_labels)) < 2 or not test:
+            continue
+        fitted = _fit_vectorizers(train, modules)
+        train_weights = modules["np"].asarray(
+            [float(item["sample_weight"]) for item in train], dtype="float32"
+        )
+        calibration_start = _calibration_start(train_labels)
+        calibrator = _fit_calibrator(
+            fitted["matrix"], train_labels, train_weights, selected_c, modules, calibration_start
+        )
+        calibration_ready = calibrator is not None
+        all_calibrated = all_calibrated and calibration_ready
+        classifier = _classifier(modules, selected_c)
+        classifier.fit(fitted["matrix"], train_labels, sample_weight=train_weights)
+        test_matrix = _transform(test, fitted, modules)
+        probabilities = _calibrated(classifier.decision_function(test_matrix), calibrator, modules)
+        for relative_index, probability in enumerate(probabilities):
+            absolute_index = start + relative_index
+            predictions_by_index.setdefault(
+                absolute_index,
+                {
+                    "index": absolute_index,
+                    "probability": round(float(probability), 6),
+                    "label": int(test_labels[relative_index]),
+                },
+            )
+        folds.append(
+            {
+                "train_count": start,
+                "test_count": end - start,
+                "calibration_ready": calibration_ready,
+            }
+        )
+    return list(predictions_by_index.values()), folds, bool(folds) and all_calibrated
+
+
+def learn_low_interest_threshold(
+    examples: list[dict],
+    selected_c: float,
+    modules: dict[str, Any],
+    model_version: str,
+    generated_at: str,
+) -> dict:
+    predictions, folds, calibration_ready = _temporal_oof_probabilities(
+        examples, selected_c, modules
+    )
+    targets = {
+        "max_positive_rate": LOW_INTEREST_MAX_POSITIVE_RATE,
+        "max_positive_loss_rate": LOW_INTEREST_MAX_POSITIVE_LOSS_RATE,
+        "positive_rate_upper_95": LOW_INTEREST_MAX_POSITIVE_RATE,
+        "min_oof_samples": LOW_INTEREST_MIN_OOF_SAMPLES,
+        "min_triaged_samples": LOW_INTEREST_MIN_TRIAGED_SAMPLES,
+        "max_threshold": LOW_INTEREST_MAX_THRESHOLD,
+    }
+    base = {
+        "method": "temporal-oof",
+        "model_version": model_version,
+        "generated_at": generated_at,
+        "fold_count": len(folds),
+        "sample_count": len(predictions),
+        "calibration_ready": calibration_ready,
+        "targets": targets,
+        "folds": folds,
+    }
+    if len(predictions) < LOW_INTEREST_MIN_OOF_SAMPLES:
+        return {**base, "ready": False, "status": "insufficient-oof-data", "threshold": None}
+    if not calibration_ready:
+        return {**base, "ready": False, "status": "oof-calibration-unavailable", "threshold": None}
+
+    ordered = sorted(predictions, key=lambda item: (item["probability"], item["index"]))
+    total_positives = sum(item["label"] for item in ordered)
+    best: dict | None = None
+    triaged_positives = 0
+    cursor = 0
+    while cursor < len(ordered):
+        threshold = float(ordered[cursor]["probability"])
+        if threshold > LOW_INTEREST_MAX_THRESHOLD:
+            break
+        group_end = cursor
+        while group_end < len(ordered) and float(ordered[group_end]["probability"]) == threshold:
+            triaged_positives += int(ordered[group_end]["label"])
+            group_end += 1
+        triaged_count = group_end
+        if triaged_count >= LOW_INTEREST_MIN_TRIAGED_SAMPLES:
+            positive_rate = triaged_positives / triaged_count
+            positive_loss_rate = triaged_positives / max(1, total_positives)
+            upper_95 = _wilson_upper_bound(triaged_positives, triaged_count)
+            if (
+                positive_rate <= LOW_INTEREST_MAX_POSITIVE_RATE
+                and positive_loss_rate <= LOW_INTEREST_MAX_POSITIVE_LOSS_RATE
+                and upper_95 <= LOW_INTEREST_MAX_POSITIVE_RATE
+            ):
+                best = {
+                    "threshold": round(threshold, 6),
+                    "triaged_count": triaged_count,
+                    "triaged_positive_count": triaged_positives,
+                    "positive_rate": round(positive_rate, 6),
+                    "positive_rate_upper_95": round(upper_95, 6),
+                    "positive_loss_rate": round(positive_loss_rate, 6),
+                    "workload_reduction_rate": round(triaged_count / len(ordered), 6),
+                }
+        cursor = group_end
+    if best is None:
+        return {**base, "ready": False, "status": "safety-target-not-met", "threshold": None}
+    return {**base, **best, "ready": True, "status": "ready"}
+
+
 def train_personalized_model(
     conn: sqlite3.Connection,
     persist: bool = True,
@@ -696,6 +836,14 @@ def _train_personalized_model(
         classifier.fit(fitted["matrix"], labels, sample_weight=weights)
         bootstrap_models = _bootstrap_classifiers(fitted["matrix"], labels, weights, selected_c, modules)
         version = f"{MODEL_SCHEMA}-{signature}"
+        trained_at = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        low_interest_threshold = learn_low_interest_threshold(
+            examples,
+            selected_c,
+            modules,
+            model_version=version,
+            generated_at=trained_at,
+        )
         accepted, acceptance = (
             evaluation_acceptance(len(examples)) if _is_file_database(conn) else (True, {"source": "test"})
         )
@@ -715,7 +863,8 @@ def _train_personalized_model(
                 "sample_count": 0 if calibration_start is None else len(labels) - calibration_start,
                 "ready": calibrator is not None,
             },
-            "trained_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+            "low_interest_threshold": low_interest_threshold,
+            "trained_at": trained_at,
             "classifier": classifier,
             "calibrator": calibrator,
             "bootstrap_models": bootstrap_models,
@@ -781,7 +930,28 @@ def _record_training_run(conn: sqlite3.Connection, artifact: dict) -> None:
         pass
 
 
-def load_personalized_model(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
+def load_personalized_model(
+    conn: sqlite3.Connection,
+    train_if_needed: bool = True,
+    allow_stale: bool = False,
+) -> dict:
+    if allow_stale and _is_file_database(conn) and MODEL_PATH.exists():
+        active_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'model_retrain_active_signature'"
+        ).fetchone()
+        active_signature = str(active_row[0] or "") if active_row else ""
+        if active_signature:
+            try:
+                modules = sklearn_modules()
+                artifact = modules["joblib"].load(MODEL_PATH)
+                if (
+                    artifact.get("schema") == MODEL_SCHEMA
+                    and artifact.get("ready")
+                    and artifact.get("signature") == active_signature
+                ):
+                    return artifact
+            except Exception:
+                pass
     with _MODEL_LOCK:
         examples = training_examples(conn)
         signature = model_data_signature(conn, examples)
@@ -802,6 +972,20 @@ def load_personalized_model(conn: sqlite3.Connection, train_if_needed: bool = Tr
                     artifact["acceptance"] = acceptance
                     _MODEL_CACHE[signature] = artifact
                     return artifact
+                active_row = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'model_retrain_active_signature'"
+                ).fetchone()
+                active_signature = str(active_row[0] or "") if active_row else ""
+                if (
+                    allow_stale
+                    and artifact.get("schema") == MODEL_SCHEMA
+                    and artifact.get("ready")
+                    and artifact.get("signature") == active_signature
+                ):
+                    stale = dict(artifact)
+                    stale["stale"] = True
+                    stale["pending_signature"] = signature
+                    return stale
             except Exception:
                 pass
         if train_if_needed:
@@ -818,8 +1002,18 @@ def score_personalized_galleries(
     conn: sqlite3.Connection,
     galleries: list[dict],
     artifact: dict | None = None,
+    train_if_needed: bool = False,
+    allow_stale_model: bool = True,
 ) -> tuple[list[dict], dict]:
-    artifact = load_personalized_model(conn) if artifact is None else artifact
+    artifact = (
+        load_personalized_model(
+            conn,
+            train_if_needed=train_if_needed,
+            allow_stale=allow_stale_model,
+        )
+        if artifact is None
+        else artifact
+    )
     if not artifact.get("ready") or not galleries:
         return [], artifact
     modules = sklearn_modules()
@@ -931,7 +1125,7 @@ def model_public_status(artifact: dict) -> dict:
             "ready", "status", "model_version", "trained_at", "sample_count", "positive_count",
             "negative_count", "selected_c", "validation", "multi_interest_enabled", "error",
             "accepted", "acceptance",
-            "score_scale", "calibration",
+            "score_scale", "calibration", "low_interest_threshold",
         )
         if key in artifact
     }

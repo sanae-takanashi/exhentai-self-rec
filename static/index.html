@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ExHentai Recommender</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260821-2">
+    <link rel="stylesheet" href="/static/styles.css?v=20260831-3">
   </head>
   <body>
     <header class="topbar">
@@ -62,6 +62,14 @@
             <input id="candidateLimit" type="number" min="100" max="10000" step="100" value="2000">
           </label>
           <label>
+            Low-interest %
+            <input id="reviewLowInterestPercent" type="number" min="0" max="50" step="5" value="20">
+          </label>
+          <label>
+            Low-interest max %
+            <input id="reviewLowInterestMaxPercent" type="number" min="0" max="90" step="5" value="35">
+          </label>
+          <label>
             Updates shown
             <input id="updatesShortlistLimit" type="number" min="1" max="500" step="10" value="40">
           </label>
@@ -97,6 +105,22 @@
             Minutes
             <input id="minutes" type="number" min="5" max="240" value="30">
           </label>
+          <label>
+            Retrain
+            <select id="modelRetrainMode">
+              <option value="batched">Batch</option>
+              <option value="immediate">Each review</option>
+              <option value="manual">Manual</option>
+            </select>
+          </label>
+          <label>
+            Reviews per train
+            <input id="modelRetrainThreshold" type="number" min="1" max="100" value="10">
+          </label>
+          <label>
+            Train every minutes
+            <input id="modelRetrainInterval" type="number" min="1" max="240" value="10">
+          </label>
         </div>
 
         <label>
@@ -121,6 +145,11 @@
         <label class="check">
           <input id="reviewRequireBootstrapMatch" type="checkbox">
           Require bootstrap match in Review
+        </label>
+
+        <label class="check">
+          <input id="reviewLowInterestAutoThreshold" type="checkbox" checked>
+          Auto low-interest threshold
         </label>
 
         <label>
@@ -177,6 +206,7 @@
       <section class="content">
         <div class="view-tabs" role="tablist" aria-label="Gallery views">
           <button id="reviewTab" class="active" type="button" data-view="review">Review <span id="reviewQueueCount" class="queue-count" aria-live="polite">...</span></button>
+          <button id="lowInterestTab" type="button" data-view="low-interest">Low Interest <span id="lowInterestQueueCount" class="queue-count" aria-live="polite">...</span></button>
           <button id="discoveryTab" type="button" data-view="discovery">Discovery</button>
           <button id="continuingUpdatesTab" type="button" data-view="continuing-updates">Updates <span id="continuingUpdatesQueueCount" class="queue-count" aria-live="polite">...</span></button>
           <button id="classifierTab" type="button" data-view="classifier">Classifier <span id="classifierQueueCount" class="queue-count" aria-live="polite">...</span></button>
@@ -192,6 +222,10 @@
           <p id="viewSubtitle">Unrated galleries ready for feedback.</p>
         </div>
         <div id="galleryView">
+          <section id="lowInterestPolicyStatus" class="interest-policy-status hidden" aria-live="polite">
+            <strong id="lowInterestPolicyTitle">Low Interest</strong>
+            <span id="lowInterestPolicyDetail"></span>
+          </section>
           <div class="toolbar">
             <input id="query" type="search" placeholder="Optional one-off search query">
             <button id="searchFetchBtn" type="button">Fetch Query</button>
@@ -363,6 +397,6 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js?v=20260823-1"></script>
+    <script src="/static/app.js?v=20260831-3"></script>
   </body>
 </html>

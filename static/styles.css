@@ -1040,6 +1040,53 @@ button.danger:hover {
   background: var(--panel);
 }
 
+.low-interest-card {
+  min-height: 0;
+  border-color: #6f5535;
+}
+
+.low-interest-card .body {
+  gap: 8px;
+}
+
+.low-interest-card .reason {
+  max-height: 44px;
+  overflow: hidden;
+}
+
+.interest-badge {
+  width: fit-content;
+  border: 1px solid #8a693f;
+  border-radius: 4px;
+  padding: 3px 6px;
+  background: #2a2117;
+  color: #f0c786;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.learned-threshold-badge {
+  border-color: var(--danger);
+  background: #2b191c;
+  color: #f0b0b5;
+}
+
+.interest-policy-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: #15181d;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.interest-policy-status strong {
+  color: var(--text);
+}
+
 .media-preview {
   display: grid;
   gap: 6px;

@@ -633,7 +633,8 @@ def parse_log_lines(
 ) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     now = utc_now()
-    by_title = {item.get("title"): item for item in snapshots.values() if item.get("title")}
+    active_snapshots = [item for item in snapshots.values() if not item.get("complete")]
+    by_title = {item.get("title"): item for item in active_snapshots if item.get("title")}
     for raw in lines:
         line = raw.strip()
         if not line:
@@ -648,7 +649,7 @@ def parse_log_lines(
         page = PAGE_LOG_RE.search(line)
         if page:
             gid = page.group("gid")
-            item = next((value for value in snapshots.values() if value["gid"] == gid), None)
+            item = next((value for value in active_snapshots if value["gid"] == gid), None)
             if item:
                 events.append(
                     make_event(

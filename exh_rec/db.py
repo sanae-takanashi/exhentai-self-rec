@@ -305,6 +305,16 @@ def init_db() -> None:
             "TEXT NOT NULL DEFAULT 'legacy-unknown'",
         )
         ensure_column(conn, "fetch_runs", "enriched_count", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE hath_downloads
+            SET status = 'completed'
+            WHERE status IN ('discovered', 'downloading')
+              AND completed_at IS NOT NULL
+              AND total_files IS NOT NULL
+              AND downloaded_files >= total_files
+            """
+        )
         defaults = {
             "auto_refresh": "1",
             "refresh_interval_minutes": "30",
@@ -324,6 +334,16 @@ def init_db() -> None:
             "review_require_bootstrap_match": "1",
             "sample_extra_pages": "2",
             "hath_download_signal_weight": "1.25",
+            "model_retrain_mode": "batched",
+            "model_retrain_feedback_threshold": "10",
+            "model_retrain_interval_minutes": "10",
+            "model_retrain_pending_count": "0",
+            "model_retrain_pending_since": "",
+            "model_retrain_last_completed_at": "",
+            "model_retrain_active_signature": "",
+            "review_low_interest_percent": "20",
+            "review_low_interest_auto_threshold": "1",
+            "review_low_interest_max_percent": "35",
         }
         for key, value in defaults.items():
             conn.execute(

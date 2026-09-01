@@ -7,6 +7,9 @@ const staleFetchExtraPagesEl = document.querySelector("#staleFetchExtraPages");
 const detailLimitEl = document.querySelector("#detailLimit");
 const learnedLimitEl = document.querySelector("#learnedLimit");
 const candidateLimitEl = document.querySelector("#candidateLimit");
+const reviewLowInterestPercentEl = document.querySelector("#reviewLowInterestPercent");
+const reviewLowInterestMaxPercentEl = document.querySelector("#reviewLowInterestMaxPercent");
+const reviewLowInterestAutoThresholdEl = document.querySelector("#reviewLowInterestAutoThreshold");
 const updatesShortlistLimitEl = document.querySelector("#updatesShortlistLimit");
 const updatesMinNewPagesEl = document.querySelector("#updatesMinNewPages");
 const previewFreshnessWeightEl = document.querySelector("#previewFreshnessWeight");
@@ -16,6 +19,9 @@ const requestIntervalEl = document.querySelector("#requestInterval");
 const banPauseEl = document.querySelector("#banPause");
 const hathDownloadSignalWeightEl = document.querySelector("#hathDownloadSignalWeight");
 const minutesEl = document.querySelector("#minutes");
+const modelRetrainModeEl = document.querySelector("#modelRetrainMode");
+const modelRetrainThresholdEl = document.querySelector("#modelRetrainThreshold");
+const modelRetrainIntervalEl = document.querySelector("#modelRetrainInterval");
 const networkProxyEl = document.querySelector("#networkProxy");
 const languageFilterEl = document.querySelector("#languageFilter");
 const modelModeEl = document.querySelector("#modelMode");
@@ -93,6 +99,11 @@ const hathTrashPlanEl = document.querySelector("#hathTrashPlan");
 const viewTitleEl = document.querySelector("#viewTitle");
 const viewSubtitleEl = document.querySelector("#viewSubtitle");
 const reviewQueueCountEl = document.querySelector("#reviewQueueCount");
+const lowInterestQueueCountEl = document.querySelector("#lowInterestQueueCount");
+const lowInterestTab = document.querySelector("#lowInterestTab");
+const lowInterestPolicyStatusEl = document.querySelector("#lowInterestPolicyStatus");
+const lowInterestPolicyTitleEl = document.querySelector("#lowInterestPolicyTitle");
+const lowInterestPolicyDetailEl = document.querySelector("#lowInterestPolicyDetail");
 const continuingUpdatesQueueCountEl = document.querySelector("#continuingUpdatesQueueCount");
 const classifierQueueCountEl = document.querySelector("#classifierQueueCount");
 const shortRepeatsQueueCountEl = document.querySelector("#shortRepeatsQueueCount");
@@ -113,6 +124,7 @@ let hathPackStatusPayload = null;
 let lastRenderedFetchId = null;
 let currentView = "review";
 let reviewExploreSeed = "";
+let recommendationRequestId = 0;
 const recommendationLimit = 40;
 const pendingFeedbackUrls = new Set();
 const pendingClassificationSampleIds = new Set();
@@ -137,7 +149,7 @@ const staticTooltips = {
   fetchBtn: "Fetch gallery list pages using recent, bootstrap, and learned queries. Stores new local galleries.",
   enrichBtn: "Fetch full detail metadata and sample thumbnails for the current top recommendations.",
   refreshThumbsBtn: "Refresh cover thumbnails for galleries currently shown on the page.",
-  retrainBtn: "Rebuild the recommendation model from your saved feedback, favorites, bans, and visual embeddings.",
+  retrainBtn: "Immediately rebuild the recommendation model and clear all pending review feedback.",
   modelBtn: "Open the current learned model weights, counts, and visual model summary.",
   cookie: "Your ExHentai Cookie header. Leave blank when saving to keep the currently stored cookie.",
   checkBtn: "Test whether the stored cookie can access ExHentai gallery listings.",
@@ -148,6 +160,9 @@ const staticTooltips = {
   detailLimit: "Maximum galleries per fetch to enrich with full detail metadata and sample thumbnails.",
   learnedLimit: "Maximum learned positive tags to add as extra remote fetch queries.",
   candidateLimit: "Number of local candidate galleries considered when ranking recommendations.",
+  reviewLowInterestPercent: "Move this bottom percentage of the current Review ranking into Low Interest. Set to 0 to disable the percentile split.",
+  reviewLowInterestMaxPercent: "Maximum combined Low Interest share after the learned threshold adds galleries beyond the bottom percentage.",
+  reviewLowInterestAutoThreshold: "Use a validated probability threshold learned during periodic model training. It falls back to the bottom percentage when validation is unavailable.",
   previewFreshnessWeight: "Freshness boost used only in Preview. Higher values push newer galleries above older strong matches.",
   previewPostedAfter: "Optional Preview cutoff. When set, Preview only shows galleries posted on or after this date.",
   sampleExtraPages: "Additional gallery sample pages to inspect for preview images on large galleries.",
@@ -155,6 +170,9 @@ const staticTooltips = {
   banPause: "Fallback pause in seconds after a request-rate ban when the ban page does not state an expiry.",
   hathDownloadSignalWeight: "Learning weight for completed H@H downloads. Set to 0 to disable download-based positive signals.",
   minutes: "Background auto-refresh interval in minutes when Auto refresh is enabled.",
+  modelRetrainMode: "Batch trains after enough reviews or a time limit. Each review trains in the background. Manual waits for Retrain.",
+  modelRetrainThreshold: "In Batch mode, start background training after this many model-changing reviews.",
+  modelRetrainInterval: "In Batch mode, train pending review feedback after this many minutes even below the threshold.",
   networkProxy: "Optional HTTP, HTTPS, socks5, or socks5h proxy used for ExHentai and model downloads.",
   languageFilter: "Comma-separated languages allowed in recommendations, for example japanese,chinese.",
   modelMode: "Hybrid uses tags, title, marks, and visual signals. Visual only ranks by image embeddings.",
@@ -169,6 +187,7 @@ const staticTooltips = {
   replaceImport: "When importing, replace existing preference data instead of merging into it.",
   resetBtn: "Delete fetched galleries, feedback, learned model, marks, visual embeddings, and fetch history. Cookie and bootstrap tags remain.",
   reviewTab: "Show unrated recommendations to review and train the model.",
+  lowInterestTab: "Cover-first triage for the bottom part of the current model ranking. Items move automatically when the model changes.",
   discoveryTab: "Explore uncertain, under-estimated, and less-covered interests without diluting Review.",
   continuingUpdatesTab: "Show the latest version of galleries detected as cumulative Pixiv, Fanbox, Patreon, archive, or ongoing series.",
   classifierTab: "Label sampled galleries as normal Review items or continuing Updates.",
@@ -443,6 +462,12 @@ function applyVisualSettings(visual) {
 
 async function loadSettings() {
   const settings = await api("/api/settings");
+  const supportsLowInterest = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_percent");
+  const supportsLowInterestThreshold = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_auto_threshold");
+  lowInterestTab.hidden = !supportsLowInterest;
+  reviewLowInterestPercentEl.closest("label").hidden = !supportsLowInterest;
+  reviewLowInterestMaxPercentEl.closest("label").hidden = !supportsLowInterestThreshold;
+  reviewLowInterestAutoThresholdEl.closest("label").hidden = !supportsLowInterestThreshold;
   applyVisualSettings(settings.visual);
   cookiePreviewEl.textContent = cookiePreviewText(settings);
   tagsEl.value = bootstrapText(settings.bootstrap_tags);
@@ -451,6 +476,9 @@ async function loadSettings() {
   detailLimitEl.value = settings.detail_fetch_limit;
   learnedLimitEl.value = settings.learned_query_limit;
   candidateLimitEl.value = settings.recommend_candidate_limit;
+  reviewLowInterestPercentEl.value = supportsLowInterest ? settings.review_low_interest_percent : 20;
+  reviewLowInterestMaxPercentEl.value = supportsLowInterestThreshold ? settings.review_low_interest_max_percent : 35;
+  reviewLowInterestAutoThresholdEl.checked = supportsLowInterestThreshold && settings.review_low_interest_auto_threshold !== false;
   updatesShortlistLimitEl.value = settings.updates_shortlist_limit ?? 40;
   updatesMinNewPagesEl.value = settings.updates_min_new_pages ?? 50;
   previewFreshnessWeightEl.value = settings.preview_freshness_weight ?? 8;
@@ -460,6 +488,10 @@ async function loadSettings() {
   banPauseEl.value = settings.temporary_ban_pause_seconds;
   hathDownloadSignalWeightEl.value = settings.hath_download_signal_weight ?? 1.25;
   minutesEl.value = settings.refresh_interval_minutes;
+  modelRetrainModeEl.value = settings.model_retrain_mode || "batched";
+  modelRetrainThresholdEl.value = settings.model_retrain_feedback_threshold ?? 10;
+  modelRetrainIntervalEl.value = settings.model_retrain_interval_minutes ?? 10;
+  updateModelRetrainControls();
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
   modelModeEl.value = settings.recommend_model_mode || "hybrid";
@@ -485,6 +517,12 @@ async function previewPlan() {
   setStatus(`${payload.entries.length} planned fetch queries`);
 }
 
+function updateModelRetrainControls() {
+  const batched = modelRetrainModeEl.value === "batched";
+  modelRetrainThresholdEl.disabled = !batched;
+  modelRetrainIntervalEl.disabled = !batched;
+}
+
 async function saveSettings() {
   setStatus("Saving settings");
   const payload = {
@@ -495,6 +533,9 @@ async function saveSettings() {
     detail_fetch_limit: Number(detailLimitEl.value),
     learned_query_limit: Number(learnedLimitEl.value),
     recommend_candidate_limit: Number(candidateLimitEl.value),
+    review_low_interest_percent: Number(reviewLowInterestPercentEl.value),
+    review_low_interest_max_percent: Number(reviewLowInterestMaxPercentEl.value),
+    review_low_interest_auto_threshold: reviewLowInterestAutoThresholdEl.checked,
     updates_shortlist_limit: Number(updatesShortlistLimitEl.value),
     updates_min_new_pages: Number(updatesMinNewPagesEl.value),
     preview_freshness_weight: Number(previewFreshnessWeightEl.value),
@@ -504,6 +545,9 @@ async function saveSettings() {
     temporary_ban_pause_seconds: Number(banPauseEl.value),
     hath_download_signal_weight: Number(hathDownloadSignalWeightEl.value),
     refresh_interval_minutes: Number(minutesEl.value),
+    model_retrain_mode: modelRetrainModeEl.value,
+    model_retrain_feedback_threshold: Number(modelRetrainThresholdEl.value),
+    model_retrain_interval_minutes: Number(modelRetrainIntervalEl.value),
     network_proxy: networkProxyEl.value.trim(),
     recommend_language_filter: languageFilterEl.value.trim(),
     recommend_model_mode: modelModeEl.value,
@@ -610,6 +654,14 @@ function viewCopy(view) {
       loaded: "preview recommendations loaded",
     };
   }
+  if (view === "low-interest") {
+    return {
+      title: "Low Interest",
+      subtitle: "Cover-first triage for the bottom part of the current model ranking.",
+      empty: "No galleries are currently in the low-interest band.",
+      loaded: "low-interest galleries loaded",
+    };
+  }
   return {
     title: "Review Queue",
     subtitle: "Unrated galleries with a few random bootstrap-seed picks mixed in.",
@@ -629,9 +681,40 @@ function renderQueueCount(element, value, label) {
 
 function renderQueueCounts(payload) {
   renderQueueCount(reviewQueueCountEl, payload.review, "galleries");
+  renderQueueCount(lowInterestQueueCountEl, payload.low_interest, "low-interest galleries");
   renderQueueCount(continuingUpdatesQueueCountEl, payload.continuing_updates, "continuing series");
   renderQueueCount(classifierQueueCountEl, payload.classification_samples, "classifier samples");
   renderQueueCount(shortRepeatsQueueCountEl, payload.short_repeats, "short repeats");
+}
+
+function renderLowInterestPolicy(policy, view = currentView) {
+  const visible = (view === "review" || view === "low-interest") && policy;
+  lowInterestPolicyStatusEl.classList.toggle("hidden", !visible);
+  if (!visible) {
+    return;
+  }
+  const validation = policy.validation || {};
+  const fallbackPercent = Number(reviewLowInterestPercentEl.value || 0);
+  if (policy.active) {
+    const thresholdPercent = Math.round(Number(policy.threshold || 0) * 100);
+    const sampleCount = Number(validation.sample_count || 0);
+    const positiveRate = Number(validation.positive_rate || 0) * 100;
+    lowInterestPolicyTitleEl.textContent = `Auto threshold <= ${thresholdPercent}%`;
+    lowInterestPolicyDetailEl.textContent = `${sampleCount} temporal validation samples · estimated positives ${positiveRate.toFixed(1)}% · combined cap ${Number(policy.max_percent || 0)}%`;
+    return;
+  }
+  const reasonText = {
+    disabled: "automatic threshold is off",
+    "model-not-ready": "personalized model is not ready",
+    "model-not-accepted": "personalized model has not passed the release gate",
+    "model-calibration-not-ready": "probability calibration is not ready",
+    "insufficient-oof-data": "not enough temporal validation samples",
+    "oof-calibration-unavailable": "temporal folds are not fully calibrated",
+    "safety-target-not-met": "no threshold currently meets the false-omission limits",
+    "requires-hybrid-mode": "automatic threshold requires Hybrid mode",
+  }[policy.status] || "validated threshold is unavailable";
+  lowInterestPolicyTitleEl.textContent = `Bottom ${fallbackPercent}% only`;
+  lowInterestPolicyDetailEl.textContent = reasonText;
 }
 
 function loadQueueCounts() {
@@ -668,6 +751,8 @@ function updateCurrentQueueCount(payload) {
   }
   if (currentView === "review") {
     renderQueueCount(reviewQueueCountEl, payload.total, "galleries");
+  } else if (currentView === "low-interest") {
+    renderQueueCount(lowInterestQueueCountEl, payload.total, "low-interest galleries");
   } else if (currentView === "short-repeats") {
     renderQueueCount(shortRepeatsQueueCountEl, payload.total, "short repeats");
   } else if (currentView === "classifier") {
@@ -689,7 +774,7 @@ function setActiveView(view) {
   galleryViewEl.classList.toggle("hidden", hathView);
   hathViewEl.classList.toggle("hidden", !hathView);
   const historyView = view === "history";
-  const reviewView = view === "review";
+  const reviewView = view === "review" || view === "low-interest";
   const classifierView = view === "classifier";
   backfillReviewParentsBtn.classList.toggle("hidden", !reviewView);
   historySearchBtn.classList.toggle("hidden", !historyView);
@@ -698,6 +783,7 @@ function setActiveView(view) {
   queryEl.classList.toggle("hidden", classifierView);
   searchFetchBtn.classList.toggle("hidden", classifierView);
   classifierSummaryEl.classList.toggle("hidden", !classifierView);
+  lowInterestPolicyStatusEl.classList.toggle("hidden", !reviewView);
   localFilterEl.placeholder = historyView
     ? "Search voted history by title, alt title, tag, category, uploader"
     : classifierView
@@ -1583,7 +1669,7 @@ async function backfillParentsForCurrentFilter({ reloadView = currentView } = {}
 
 async function backfillReviewParents() {
   setStatus("Updating parent metadata for Review galleries");
-  await backfillParentsForCurrentFilter({ reloadView: "review" });
+  await backfillParentsForCurrentFilter({ reloadView: currentView });
 }
 
 async function backfillHistoryParents() {
@@ -1601,23 +1687,31 @@ async function loadMarkedGalleries(kind, offset = 0, append = false) {
 }
 
 async function loadRecommendations(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
-  const includeRated = currentView === "preview" ? "1" : "0";
-  const freshnessWeight = currentView === "preview" ? previewFreshnessWeightEl.value || "8" : "1";
-  const postedAfter = currentView === "preview" ? previewPostedAfterEl.value || "" : "";
+  const includeRated = requestedView === "preview" ? "1" : "0";
+  const freshnessWeight = requestedView === "preview" ? previewFreshnessWeightEl.value || "8" : "1";
+  const postedAfter = requestedView === "preview" ? previewPostedAfterEl.value || "" : "";
   const bootstrapExploreCount = "0";
-  const requireBootstrapMatch = currentView === "review" && reviewRequireBootstrapMatchEl.checked ? "1" : "0";
+  const reviewBand = requestedView === "review" || requestedView === "low-interest";
+  const requireBootstrapMatch = reviewBand && reviewRequireBootstrapMatchEl.checked ? "1" : "0";
+  const interestBand = requestedView === "review" ? "primary" : requestedView === "low-interest" ? "low" : "all";
   const languageFilter = languageFilterEl.value.trim();
   const modelMode = modelModeEl.value || "hybrid";
-  if (currentView === "review" && !append && offset === 0) {
+  if (requestedView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
   const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
-  recordPageImpressions(payload, currentView === "preview" ? "preview" : "review", offset);
-  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
+  renderLowInterestPolicy(payload.low_interest_policy, requestedView);
+  recordPageImpressions(payload, requestedView === "preview" ? "preview" : "review", offset);
+  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(requestedView).loaded}`);
 }
 
 async function fetchNew(query = "") {
@@ -1775,7 +1869,7 @@ async function vote(galleryUrl, voteValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
+    await applyFeedbackResult(payload, galleryUrl);
     setStatus(feedbackStatusMessage("Vote recorded", payload));
   });
 }
@@ -1797,7 +1891,7 @@ async function score(galleryUrl, scoreValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
+    await applyFeedbackResult(payload, galleryUrl);
     setStatus(feedbackStatusMessage("Score recorded", payload));
   });
 }
@@ -1818,7 +1912,7 @@ async function skip(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
+    await applyFeedbackResult(payload, galleryUrl);
     setStatus(feedbackStatusMessage("Gallery skipped", payload));
   });
 }
@@ -1838,7 +1932,7 @@ async function markGallery(galleryUrl, kind) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
+    await applyFeedbackResult(payload, galleryUrl);
     setStatus(markStatusMessage(kind === "ban" ? "Gallery banned" : "Favorite saved", payload));
   });
 }
@@ -1856,8 +1950,8 @@ async function clearMark(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
-    setStatus(payload.removed ? "Bookmark cleared" : "No bookmark to clear");
+    await applyFeedbackResult(payload, galleryUrl);
+    setStatus(markStatusMessage(payload.removed ? "Bookmark cleared" : "No bookmark to clear", payload));
   });
 }
 
@@ -1879,11 +1973,17 @@ async function clearRating(galleryUrl) {
   });
 }
 
-async function applyFeedbackResult(payload) {
+async function applyFeedbackResult(payload, galleryUrl) {
   if (currentView === "history") {
     await loadReactionHistory();
-  } else {
+  } else if (Array.isArray(payload.items)) {
     applyGalleryPage(payload);
+  } else {
+    const removedUrl = payload.removed_gallery_url || galleryUrl;
+    renderedGalleryItems = renderedGalleryItems.filter((item) => item && item.url !== removedUrl);
+    renderedGalleryUrls = renderedGalleryUrls.filter((url) => url !== removedUrl);
+    nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
+    renderGalleryCards(renderedGalleryItems);
   }
   refreshQueueCounts();
 }
@@ -1914,6 +2014,7 @@ async function classifyGallery(galleryUrl, classification) {
         gallery_url: galleryUrl,
         classification,
         filter_text: localFilterEl.value.trim(),
+        interest_band: currentView === "low-interest" ? "low" : "primary",
       }),
     });
     applyGalleryPage(currentView === "continuing-updates" ? payload.updates : payload.review);
@@ -2091,7 +2192,7 @@ async function resetLibrary() {
     body: JSON.stringify({}),
   });
   applyGalleryPage(payload);
-  renderQueueCounts({ review: 0, continuing_updates: 0, short_repeats: 0, classification_samples: 0 });
+  renderQueueCounts({ review: 0, low_interest: 0, continuing_updates: 0, short_repeats: 0, classification_samples: 0 });
   await loadStatus();
   refreshQueueCounts();
   const removed = payload.removed || {};
@@ -2208,6 +2309,7 @@ function renderParentChain(item) {
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
   const classifierMode = mode === "classifier";
+  const lowInterestMode = mode === "low-interest";
   if (!append) {
     renderedGalleryUrls = [];
     renderedGalleryItems = [];
@@ -2230,15 +2332,15 @@ function renderGalleryCards(items, append = false) {
   }
   for (const item of items) {
     const card = document.createElement("article");
-    card.className = "card";
+    card.className = lowInterestMode ? "card low-interest-card" : "card";
     const thumbContent = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
-    const thumb = item.thumb_url && (mode === "review" || classifierMode)
+    const thumb = item.thumb_url && (mode === "review" || lowInterestMode || classifierMode)
       ? `<a class="thumb" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer" aria-label="Open ${escapeAttr(item.title)}">${thumbContent}</a>`
       : `<div class="thumb">${thumbContent}</div>`;
     const samples = item.samples || [];
-    const samplesPreview = samples.length
+    const samplesPreview = samples.length && !lowInterestMode
       ? `<div class="samples">${samples
           .map((thumb, index) => `<img src="${escapeAttr(sampleSrc(item.url, index))}" alt="" loading="lazy">`)
           .join("")}</div>`
@@ -2291,7 +2393,7 @@ function renderGalleryCards(items, append = false) {
           <button class="classifier-updates" type="button" data-sample-classification="updates" data-sample-id="${Number(item.classification_sample_id)}" title="Label this as a cumulative or ongoing gallery that belongs in Updates.">Updates</button>
           <button class="clear" type="button" data-sample-defer="1" data-sample-id="${Number(item.classification_sample_id)}" title="Move this sample to the end of the current page without labeling it.">Later</button>
         </div>`
-      : currentView === "review"
+      : currentView === "review" || currentView === "low-interest"
       ? `<div class="card-actions"><button class="clear" type="button" data-classification="updates" data-url="${escapeAttr(item.url)}" title="This gallery is a continuing update and should be shown in Updates.">Mark as Updates</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
       : currentView === "continuing-updates"
         ? `<div class="card-actions"><button class="clear" type="button" data-classification="review" data-url="${escapeAttr(item.url)}" title="This is a normal gallery and should be shown in Review.">Move to Review</button>${classificationOverride ? `<button class="clear" type="button" data-classification="auto" data-url="${escapeAttr(item.url)}">Use Auto</button>` : ""}</div>`
@@ -2318,8 +2420,15 @@ function renderGalleryCards(items, append = false) {
     const markActions = mode === "preview"
       ? ""
       : `<div class="card-actions">${banButton}${favoriteButton}${clearMarkButton}</div>`;
+    const compactFeedbackControls = `<div class="votes">
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
+          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the queue.">Skip</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal and correct the low-interest ranking.">Thumb up</button>
+        </div>`;
     const feedbackControls = mode === "preview" || classifierMode
       ? ""
+      : lowInterestMode
+        ? compactFeedbackControls
       : `<div class="votes">
           <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
@@ -2351,12 +2460,18 @@ function renderGalleryCards(items, append = false) {
     const scoreMeta = classifierMode
       ? `${escapeHtml(item.category || "Unknown")}${escapeHtml(pageCount)}`
       : `${escapeHtml(item.category || "Unknown")} · ${item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}`;
+    const lowInterestBadge = lowInterestMode
+      ? item.low_interest_reason === "learned-threshold"
+        ? `<div class="interest-badge learned-threshold-badge">Very Low · model &le; ${Math.round(Number(item.low_interest_threshold || 0) * 100)}% · rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
+        : `<div class="interest-badge">Bottom ${Number(item.low_interest_cutoff_percent || 0)}% · rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
+      : "";
     card.innerHTML = `
       <div class="media-preview">
         ${thumb}
         ${samplesPreview}
       </div>
       <div class="body">
+        ${lowInterestBadge}
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
         <div class="meta">${scoreMeta}</div>
         ${classifierSampleMeta}
@@ -2370,16 +2485,16 @@ function renderGalleryCards(items, append = false) {
         ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
         ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
-        ${parentChain}
-        <div class="pillrow">${tags}</div>
+        ${lowInterestMode ? "" : parentChain}
+        ${lowInterestMode ? "" : `<div class="pillrow">${tags}</div>`}
         <div class="reason">${reasons}</div>
-        ${relatedFeedback}
+        ${lowInterestMode ? "" : relatedFeedback}
         ${classificationActions}
         ${feedbackControls}
       </div>
     `;
     recommendationsEl.appendChild(card);
-    if (["review", "discovery", "short-repeats"].includes(mode)) {
+    if (["review", "low-interest", "discovery", "short-repeats"].includes(mode)) {
       queueVisualEmbedding(item);
     }
   }
@@ -2422,6 +2537,12 @@ function feedbackStatusMessage(base, payload) {
   if (Number.isFinite(update.visual_rated_after)) {
     details.push(`visual rated ${update.visual_rated_before || 0}->${update.visual_rated_after}`);
   }
+  const retrain = update.model_retrain || {};
+  if (retrain.running) {
+    details.push("model training in background");
+  } else if (Number(retrain.pending_count || 0) > 0) {
+    details.push(`${Number(retrain.pending_count)} pending model update${Number(retrain.pending_count) === 1 ? "" : "s"}`);
+  }
   const enrichment = payload.feedback_enrichment || {};
   if (enrichment.status === "success") {
     details.push("full metadata learned");
@@ -2450,6 +2571,12 @@ function markStatusMessage(base, payload) {
   }
   if (Number.isFinite(update.banned_galleries_after)) {
     details.push(`bans ${update.banned_galleries_after}`);
+  }
+  const retrain = update.model_retrain || {};
+  if (retrain.running) {
+    details.push("model training in background");
+  } else if (Number(retrain.pending_count || 0) > 0) {
+    details.push(`${Number(retrain.pending_count)} pending model update${Number(retrain.pending_count) === 1 ? "" : "s"}`);
   }
   return details.length ? `${base}; ${details.join("; ")}` : base;
 }
@@ -2761,6 +2888,23 @@ function renderStatus(payload) {
       rows.push(["Auto Error", payload.refresh.last_error]);
     }
   }
+  if (payload.model_retrain) {
+    const training = payload.model_retrain;
+    const modeLabels = { immediate: "Each review", batched: "Batch", manual: "Manual" };
+    const state = training.running
+      ? `Training (${training.trigger || "background"})`
+      : `${Number(training.pending_count || 0)} pending`;
+    rows.push(["Training", `${modeLabels[training.mode] || training.mode}: ${state}`]);
+    if (training.next_check_at) {
+      rows.push(["Next Train", training.next_check_at]);
+    }
+    if (training.last_completed_at) {
+      rows.push(["Last Train", training.last_completed_at]);
+    }
+    if (training.last_error) {
+      rows.push(["Train Error", training.last_error]);
+    }
+  }
   const access = payload.settings && payload.settings.last_access_check;
   if (access) {
     rows.push(["Access", `${access.ok ? "OK" : "Failed"} at ${access.checked_at}`]);
@@ -2814,6 +2958,7 @@ function escapeAttr(value) {
 }
 
 document.querySelector("#saveBtn").addEventListener("click", () => saveSettings().catch((error) => setStatus(error.message, true)));
+modelRetrainModeEl.addEventListener("change", updateModelRetrainControls);
 document.querySelector("#fetchBtn").addEventListener("click", () => fetchNew().catch((error) => setStatus(error.message, true)));
 document.querySelector("#enrichBtn").addEventListener("click", () => enrichTopRecommendations().catch((error) => setStatus(error.message, true)));
 document.querySelector("#refreshThumbsBtn").addEventListener("click", () => refreshThumbnails().catch((error) => setStatus(error.message, true)));

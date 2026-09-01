@@ -85,11 +85,16 @@ BOOTSTRAP_NAMESPACES = {
 MODEL_MODE_HYBRID = "hybrid"
 MODEL_MODE_VISUAL = "visual"
 MODEL_MODE_LEGACY = "legacy"
+INTEREST_BAND_ALL = "all"
+INTEREST_BAND_PRIMARY = "primary"
+INTEREST_BAND_LOW = "low"
+DEFAULT_LOW_INTEREST_MAX_PERCENT = 35
 RETRAIN_LOCK = threading.RLock()
 SCAN_CACHE_LOCK = threading.RLock()
 SCAN_CACHE_TTL_SECONDS = 30.0
 SCAN_CACHE: dict[tuple[str, str], tuple[tuple, float, object]] = {}
 MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL, MODEL_MODE_LEGACY}
+INTEREST_BANDS = {INTEREST_BAND_ALL, INTEREST_BAND_PRIMARY, INTEREST_BAND_LOW}
 SHORT_REPEAT_PAGE_LIMIT = 10
 RELATED_FEEDBACK_REFERENCE_LIMIT = 5
 SHORT_REPEAT_IDENTITY_NAMESPACES = {"artist"}
@@ -196,7 +201,7 @@ def get_bootstrap_tags(conn: sqlite3.Connection) -> list[dict]:
 def learned_query_tags(conn: sqlite3.Connection, limit: int = 6) -> list[str]:
     if limit <= 0:
         return []
-    personalized = load_personalized_model(conn)
+    personalized = load_personalized_model(conn, train_if_needed=False, allow_stale=True)
     model_tags = positive_query_tags(personalized, limit=limit)
     if model_tags:
         negative_bootstrap = {
@@ -499,7 +504,8 @@ def record_feedback(
     score: int | None = None,
     reason_code: str | None = None,
     surface: str | None = None,
-) -> None:
+    retrain: bool = True,
+) -> bool:
     # A vote needs its own baseline even when the gallery has not changed since
     # the previous fetch; later Updates filtering compares growth to this row.
     snapshot_gallery_features(conn, gallery_url, "feedback", force=True)
@@ -522,18 +528,26 @@ def record_feedback(
         "INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface) VALUES (?, ?, ?, ?, ?, ?)",
         (gallery_url, signal, score, note, normalized_reason, normalize_surface(surface)),
     )
-    if signal != 0 or previous_signal != 0:
+    model_invalidated = signal != 0 or previous_signal != 0
+    if model_invalidated and retrain:
         retrain_model(conn)
+    return model_invalidated
 
 
-def clear_feedback(conn: sqlite3.Connection, gallery_url: str) -> int:
+def clear_feedback(conn: sqlite3.Connection, gallery_url: str, retrain: bool = True) -> int:
     cursor = conn.execute("DELETE FROM feedback WHERE gallery_url = ?", (gallery_url,))
-    if cursor.rowcount:
+    if cursor.rowcount and retrain:
         retrain_model(conn)
     return cursor.rowcount
 
 
-def record_gallery_mark(conn: sqlite3.Connection, gallery_url: str, kind: str, note: str | None = None) -> None:
+def record_gallery_mark(
+    conn: sqlite3.Connection,
+    gallery_url: str,
+    kind: str,
+    note: str | None = None,
+    retrain: bool = True,
+) -> bool:
     snapshot_gallery_features(conn, gallery_url, "mark")
     kind = normalize_mark_kind(kind)
     existing = conn.execute("SELECT kind FROM gallery_marks WHERE gallery_url = ?", (gallery_url,)).fetchone()
@@ -558,12 +572,15 @@ def record_gallery_mark(conn: sqlite3.Connection, gallery_url: str, kind: str, n
             """,
             (gallery_url, kind, note),
         )
-    retrain_model(conn)
+    model_invalidated = not existing or existing["kind"] != kind
+    if model_invalidated and retrain:
+        retrain_model(conn)
+    return model_invalidated
 
 
-def clear_gallery_mark(conn: sqlite3.Connection, gallery_url: str) -> int:
+def clear_gallery_mark(conn: sqlite3.Connection, gallery_url: str, retrain: bool = True) -> int:
     cursor = conn.execute("DELETE FROM gallery_marks WHERE gallery_url = ?", (gallery_url,))
-    if cursor.rowcount:
+    if cursor.rowcount and retrain:
         retrain_model(conn)
     return cursor.rowcount
 
@@ -959,12 +976,12 @@ def import_feedback_score(value: object) -> int | None:
     return score
 
 
-def retrain_model(conn: sqlite3.Connection) -> None:
+def retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -> dict:
     with RETRAIN_LOCK:
-        _retrain_model(conn)
+        return _retrain_model(conn, release_write_lock=release_write_lock)
 
 
-def _retrain_model(conn: sqlite3.Connection) -> None:
+def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -> dict:
     conn.execute("DELETE FROM feature_weights")
     tag_strengths = tag_corpus_strengths(conn)
     confidence_by_id = feedback_confidence_index(conn)
@@ -1021,7 +1038,17 @@ def _retrain_model(conn: sqlite3.Connection) -> None:
             gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
             gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
             apply_feedback_features(conn, gallery, download_signal, tag_strengths=tag_strengths)
-    train_personalized_model(conn)
+    if release_write_lock:
+        conn.commit()
+    personalized = train_personalized_model(conn)
+    conn.execute(
+        """
+        INSERT INTO settings(key, value) VALUES ('model_retrain_active_signature', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(personalized.get("signature") or ""),),
+    )
+    return personalized
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
@@ -1342,6 +1369,10 @@ def recommend(
     model_mode: str = MODEL_MODE_HYBRID,
     require_bootstrap_match: bool = False,
     posted_after: str | None = None,
+    low_interest_percent: int = 20,
+    low_interest_auto_threshold: bool = True,
+    low_interest_max_percent: int = DEFAULT_LOW_INTEREST_MAX_PERCENT,
+    interest_band: str = INTEREST_BAND_ALL,
 ) -> list[dict]:
     return recommend_page(
         conn,
@@ -1357,6 +1388,10 @@ def recommend(
         model_mode=model_mode,
         require_bootstrap_match=require_bootstrap_match,
         posted_after=posted_after,
+        low_interest_percent=low_interest_percent,
+        low_interest_auto_threshold=low_interest_auto_threshold,
+        low_interest_max_percent=low_interest_max_percent,
+        interest_band=interest_band,
     )["items"]
 
 
@@ -1377,6 +1412,10 @@ def recommend_page(
     exclude_short_repeats: bool = True,
     continuing_updates: dict[str, dict] | None = None,
     personalized_artifact: dict | None = None,
+    low_interest_percent: int = 20,
+    low_interest_auto_threshold: bool = True,
+    low_interest_max_percent: int = DEFAULT_LOW_INTEREST_MAX_PERCENT,
+    interest_band: str = INTEREST_BAND_ALL,
 ) -> dict:
     limit = max(1, min(10000, int(limit)))
     offset = max(0, int(offset))
@@ -1388,6 +1427,12 @@ def recommend_page(
     language_filter_values = normalize_language_filter(language_filter)
     model_mode = normalize_model_mode(model_mode)
     posted_after = normalize_posted_after(posted_after)
+    low_interest_percent = max(0, min(50, int(low_interest_percent)))
+    low_interest_max_percent = max(
+        low_interest_percent,
+        min(90, max(0, int(low_interest_max_percent))),
+    )
+    interest_band = normalize_interest_band(interest_band)
     if model_mode == MODEL_MODE_VISUAL:
         bootstrap_explore_count = 0
         require_bootstrap_match = False
@@ -1515,15 +1560,20 @@ def recommend_page(
         scored.append(gallery)
 
     personalized_status: dict = {"ready": False, "status": "not-requested"}
+    active_personalized_artifact = personalized_artifact or {}
     if model_mode == MODEL_MODE_HYBRID and personalized_inputs:
         if personalized_artifact is None:
-            predictions, artifact = score_personalized_galleries(conn, personalized_inputs)
+            predictions, active_personalized_artifact = score_personalized_galleries(conn, personalized_inputs)
         else:
-            predictions, artifact = score_personalized_galleries(
+            predictions, active_personalized_artifact = score_personalized_galleries(
                 conn, personalized_inputs, artifact=personalized_artifact
             )
-        personalized_status = model_public_status(artifact)
-        if artifact.get("ready") and artifact.get("accepted") and len(predictions) == len(scored):
+        personalized_status = model_public_status(active_personalized_artifact)
+        if (
+            active_personalized_artifact.get("ready")
+            and active_personalized_artifact.get("accepted")
+            and len(predictions) == len(scored)
+        ):
             for gallery, prediction in zip(scored, predictions):
                 probability = float(prediction["like_probability"])
                 prior_rank_score = apply_bootstrap_probability_prior(
@@ -1546,6 +1596,25 @@ def recommend_page(
             gallery.update(legacy_prediction_fields(gallery, personalized_status))
 
     scored.sort(key=lambda item: item.get("rank_score", item["score"]), reverse=True)
+    low_interest_policy = resolve_low_interest_threshold_policy(
+        active_personalized_artifact,
+        enabled=bool(low_interest_auto_threshold),
+        model_mode=model_mode,
+        max_percent=low_interest_max_percent,
+    )
+    low_interest_policy = annotate_interest_bands(
+        scored,
+        low_interest_percent,
+        threshold_policy=low_interest_policy,
+        max_percent=low_interest_max_percent,
+    )
+    low_interest_total = int(low_interest_policy["low_interest_total"])
+    overall_total = len(scored)
+    primary_total = overall_total - low_interest_total
+    if interest_band == INTEREST_BAND_PRIMARY:
+        scored = [item for item in scored if not item["low_interest"]]
+    elif interest_band == INTEREST_BAND_LOW:
+        scored = [item for item in scored if item["low_interest"]]
     scored = diversify_ranked_galleries(scored)
     if bootstrap_explore_count and not include_rated and scored:
         scored = mix_bootstrap_exploration(
@@ -1563,6 +1632,12 @@ def recommend_page(
         "offset": offset,
         "next_offset": next_offset,
         "total": len(scored),
+        "overall_total": overall_total,
+        "primary_total": primary_total,
+        "low_interest_total": low_interest_total,
+        "low_interest_percent": low_interest_percent,
+        "low_interest_policy": low_interest_policy,
+        "interest_band": interest_band,
         "has_more": next_offset < len(scored),
         "candidate_limit": candidate_limit,
         "bootstrap_explore_count": bootstrap_explore_count,
@@ -1788,6 +1863,125 @@ def normalize_model_mode(value: object) -> str:
     if mode in MODEL_MODES:
         return mode
     return MODEL_MODE_HYBRID
+
+
+def normalize_interest_band(value: object) -> str:
+    band = str(value or INTEREST_BAND_ALL).strip().lower()
+    if band in INTEREST_BANDS:
+        return band
+    return INTEREST_BAND_ALL
+
+
+def resolve_low_interest_threshold_policy(
+    artifact: dict,
+    *,
+    enabled: bool,
+    model_mode: str,
+    max_percent: int,
+) -> dict:
+    learned = artifact.get("low_interest_threshold") or {}
+    status = {
+        "mode": "auto" if enabled else "off",
+        "active": False,
+        "status": "disabled" if not enabled else "unavailable",
+        "threshold": learned.get("threshold"),
+        "model_version": learned.get("model_version") or artifact.get("model_version"),
+        "max_percent": max_percent,
+        "validation": learned,
+    }
+    if not enabled:
+        return status
+    checks = (
+        (model_mode == MODEL_MODE_HYBRID, "requires-hybrid-mode"),
+        (bool(artifact.get("ready")), "model-not-ready"),
+        (bool(artifact.get("accepted")), "model-not-accepted"),
+        (artifact.get("score_scale") == "probability", "score-scale-not-probability"),
+        (bool((artifact.get("calibration") or {}).get("ready")), "model-calibration-not-ready"),
+        (bool(learned.get("ready")), str(learned.get("status") or "threshold-not-ready")),
+        (
+            learned.get("model_version") == artifact.get("model_version"),
+            "threshold-model-version-mismatch",
+        ),
+    )
+    for passed, reason in checks:
+        if not passed:
+            status["status"] = reason
+            return status
+    threshold = optional_float(learned.get("threshold"))
+    if threshold is None or threshold < 0.0 or threshold > 1.0:
+        status["status"] = "invalid-threshold"
+        return status
+    status.update({"active": True, "status": "active", "threshold": threshold})
+    return status
+
+
+def annotate_interest_bands(
+    scored: list[dict],
+    low_interest_percent: int,
+    *,
+    threshold_policy: dict | None = None,
+    max_percent: int = DEFAULT_LOW_INTEREST_MAX_PERCENT,
+) -> dict:
+    total = len(scored)
+    if total <= 1 or low_interest_percent <= 0:
+        percentile_count = 0
+    else:
+        percentile_count = min(total - 1, math.ceil(total * low_interest_percent / 100.0))
+    low_start = total - percentile_count
+    percentile_indices = set(range(low_start, total))
+    selected_indices = set(percentile_indices)
+    policy = dict(threshold_policy or {})
+    threshold = optional_float(policy.get("threshold")) if policy.get("active") else None
+    threshold_indices: set[int] = set()
+    if threshold is not None:
+        model_version = policy.get("model_version")
+        candidates = []
+        for index, item in enumerate(scored):
+            probability = optional_float(item.get("like_probability"))
+            if (
+                probability is not None
+                and probability <= threshold
+                and item.get("score_scale") == "probability"
+                and item.get("model_version") == model_version
+            ):
+                candidates.append((probability, index))
+        cap_count = min(
+            max(0, total - 1),
+            max(percentile_count, math.ceil(total * max_percent / 100.0)),
+        )
+        for _probability, index in sorted(candidates):
+            if index in selected_indices:
+                threshold_indices.add(index)
+                continue
+            if len(selected_indices) >= cap_count:
+                continue
+            selected_indices.add(index)
+            threshold_indices.add(index)
+    for index, item in enumerate(scored):
+        item["interest_rank"] = index + 1
+        item["interest_total"] = total
+        item["interest_percentile"] = round((total - index) * 100.0 / total, 1) if total else None
+        item["low_interest"] = index in selected_indices
+        item["low_interest_cutoff_percent"] = low_interest_percent
+        item["very_low_interest"] = index in threshold_indices
+        item["low_interest_reason"] = (
+            "learned-threshold"
+            if index in threshold_indices
+            else "bottom-percent"
+            if index in percentile_indices
+            else None
+        )
+        item["low_interest_threshold"] = threshold
+    policy.update(
+        {
+            "percentile_count": percentile_count,
+            "threshold_count": len(threshold_indices),
+            "threshold_added_count": len(threshold_indices - percentile_indices),
+            "low_interest_total": len(selected_indices),
+            "overall_total": total,
+        }
+    )
+    return policy
 
 
 def normalize_language_filter(value: list[str] | str | None) -> set[str]:
@@ -3135,7 +3329,13 @@ def bootstrap_search_text(gallery: dict) -> str:
 def model_snapshot(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
     visual_model = visual_preference_model(conn)
     visual_counts = visual_version_counts(conn)
-    personalized_model = model_public_status(load_personalized_model(conn, train_if_needed=train_if_needed))
+    personalized_model = model_public_status(
+        load_personalized_model(
+            conn,
+            train_if_needed=train_if_needed,
+            allow_stale=not train_if_needed,
+        )
+    )
     continuing_classifier = (
         public_classifier_status(load_continuing_classifier(conn))
         if train_if_needed

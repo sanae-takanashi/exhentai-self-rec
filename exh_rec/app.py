@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
 import io
@@ -114,6 +115,16 @@ FETCH_STATE: dict[str, Any] = {"running": False}
 PARENT_UPDATE_STATE: dict[str, Any] = {"running": False, "logs": []}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
+MODEL_RETRAIN_MODES = frozenset({"immediate", "batched", "manual"})
+MODEL_RETRAIN_STATE: dict[str, Any] = {
+    "running": False,
+    "trigger": None,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_error": None,
+}
+MODEL_RETRAIN_WAKE = threading.Event()
+MODEL_RETRAIN_RUN_LOCK = threading.Lock()
 FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
 FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
 FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
@@ -208,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
                 explore_seed = str(query.get("explore_seed", [""])[0])[:80]
                 language_filter = query.get("language_filter", [None])[0]
                 model_mode = query.get("model_mode", [None])[0]
+                interest_band = query.get("interest_band", ["all"])[0]
                 require_bootstrap_match = parse_bool(query.get("require_bootstrap_match", ["0"])[0])
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
@@ -224,6 +236,7 @@ class Handler(BaseHTTPRequestHandler):
                             explore_seed=explore_seed,
                             language_filter=language_filter,
                             model_mode=model_mode,
+                            interest_band=interest_band,
                             require_bootstrap_match=require_bootstrap_match,
                         )
                     )
@@ -321,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
                     with db.connect() as conn:
                         result = ingest_event_batch(conn, payload)
                         if result["completed_changed"]:
-                            retrain_model(conn)
+                            retrain_model(conn, release_write_lock=True)
                 except HathPayloadError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
                 self.send_json(result)
@@ -408,6 +421,7 @@ class Handler(BaseHTTPRequestHandler):
                             conn,
                             limit=40,
                             filter_text=payload.get("filter_text"),
+                            interest_band=payload.get("interest_band") or "primary",
                             require_bootstrap_match=configured_review_require_bootstrap_match(conn),
                         )
                         updates = continuing_update_payload(
@@ -444,15 +458,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
                 vote, score = parse_feedback_request(payload)
                 signal = feedback_signal(vote=vote, score=score)
-                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn, train_if_needed=False)
-                    before_signature = model_signature(conn)
+                    before_model = feedback_metrics_snapshot(conn)
                     update_started = time.perf_counter()
                     log_feedback_received("record", gallery_url, vote=vote, score=score)
                     try:
-                        record_feedback(
+                        model_invalidated = record_feedback(
                             conn,
                             gallery_url,
                             vote=vote,
@@ -460,12 +472,15 @@ class Handler(BaseHTTPRequestHandler):
                             note=payload.get("note"),
                             reason_code=payload.get("reason_code"),
                             surface=payload.get("surface") or payload.get("view"),
+                            retrain=False,
                         )
                     except ValueError as exc:
                         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                    retrain_status = (
+                        mark_model_retrain_pending(conn) if model_invalidated else model_retrain_status(conn)
+                    )
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
-                    after_model = model_snapshot(conn)
-                    after_signature = model_signature(conn)
+                    after_model = feedback_metrics_snapshot(conn)
                     feedback_update = feedback_update_summary(
                         conn,
                         action="record",
@@ -473,17 +488,25 @@ class Handler(BaseHTTPRequestHandler):
                         vote=vote,
                         score=score,
                         before_model=before_model,
-                        before_signature=before_signature,
+                        before_signature={},
                         after_model=after_model,
-                        after_signature=after_signature,
-                        retrained=signal != 0 or before_signature != after_signature,
+                        after_signature={},
+                        retrained=False,
                         elapsed_ms=elapsed_ms,
                     )
+                    feedback_update["model_retrain"] = retrain_status
                     log_feedback_update(feedback_update)
                 feedback_enrichment = feedback_enrichment_plan(signal, payload)
-                with db.connect() as conn:
-                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
-                self.send_json({"ok": True, "feedback_update": feedback_update, "feedback_enrichment": feedback_enrichment, **page})
+                if model_invalidated:
+                    MODEL_RETRAIN_WAKE.set()
+                self.send_json(
+                    {
+                        "ok": True,
+                        "removed_gallery_url": gallery_url,
+                        "feedback_update": feedback_update,
+                        "feedback_enrichment": feedback_enrichment,
+                    }
+                )
             elif path == "/api/feedback/copy-continuing":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "").strip()
@@ -507,29 +530,44 @@ class Handler(BaseHTTPRequestHandler):
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
                 kind = parse_mark_kind(payload.get("kind"))
-                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn, train_if_needed=False)
-                    before_signature = model_signature(conn)
+                    before_model = feedback_metrics_snapshot(conn)
                     update_started = time.perf_counter()
-                    record_gallery_mark(conn, gallery_url, kind=kind, note=payload.get("note"))
+                    model_invalidated = record_gallery_mark(
+                        conn,
+                        gallery_url,
+                        kind=kind,
+                        note=payload.get("note"),
+                        retrain=False,
+                    )
+                    retrain_status = (
+                        mark_model_retrain_pending(conn) if model_invalidated else model_retrain_status(conn)
+                    )
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
-                    after_model = model_snapshot(conn)
-                    after_signature = model_signature(conn)
+                    after_model = feedback_metrics_snapshot(conn)
                     mark_update = mark_update_summary(
                         conn,
                         action="record",
                         gallery_url=gallery_url,
                         kind=kind,
                         before_model=before_model,
-                        before_signature=before_signature,
+                        before_signature={},
                         after_model=after_model,
-                        after_signature=after_signature,
+                        after_signature={},
+                        retrained=False,
                         elapsed_ms=elapsed_ms,
                     )
-                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
-                self.send_json({"ok": True, "mark_update": mark_update, **page})
+                    mark_update["model_retrain"] = retrain_status
+                if model_invalidated:
+                    MODEL_RETRAIN_WAKE.set()
+                self.send_json(
+                    {
+                        "ok": True,
+                        "removed_gallery_url": gallery_url,
+                        "mark_update": mark_update,
+                    }
+                )
             elif path == "/api/impressions":
                 payload = self.read_json()
                 items = payload.get("items") or []
@@ -551,45 +589,52 @@ class Handler(BaseHTTPRequestHandler):
                 gallery_url = str(payload.get("gallery_url") or "")
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
-                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn, train_if_needed=False)
-                    before_signature = model_signature(conn)
+                    before_model = feedback_metrics_snapshot(conn)
                     update_started = time.perf_counter()
-                    removed = clear_gallery_mark(conn, gallery_url)
+                    removed = clear_gallery_mark(conn, gallery_url, retrain=False)
+                    retrain_status = mark_model_retrain_pending(conn) if removed else model_retrain_status(conn)
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
-                    after_model = model_snapshot(conn)
-                    after_signature = model_signature(conn)
+                    after_model = feedback_metrics_snapshot(conn)
                     mark_update = mark_update_summary(
                         conn,
                         action="clear",
                         gallery_url=gallery_url,
                         kind=None,
                         before_model=before_model,
-                        before_signature=before_signature,
+                        before_signature={},
                         after_model=after_model,
-                        after_signature=after_signature,
+                        after_signature={},
                         removed=removed,
+                        retrained=False,
                         elapsed_ms=elapsed_ms,
                     )
-                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
-                self.send_json({"ok": True, "removed": removed, "mark_update": mark_update, **page})
+                    mark_update["model_retrain"] = retrain_status
+                if removed:
+                    MODEL_RETRAIN_WAKE.set()
+                self.send_json(
+                    {
+                        "ok": True,
+                        "removed": removed,
+                        "removed_gallery_url": gallery_url,
+                        "mark_update": mark_update,
+                    }
+                )
             elif path == "/api/feedback/clear":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
                 if not gallery_url:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url is required")
-                require_bootstrap_match = parse_bool(payload.get("require_bootstrap_match"))
                 with db.connect() as conn:
                     ensure_gallery_exists(conn, gallery_url)
-                    before_model = model_snapshot(conn, train_if_needed=False)
-                    before_signature = model_signature(conn)
+                    before_model = feedback_metrics_snapshot(conn)
                     update_started = time.perf_counter()
                     log_feedback_received("clear", gallery_url)
-                    removed = clear_feedback(conn, gallery_url)
+                    removed = clear_feedback(conn, gallery_url, retrain=False)
+                    retrain_status = mark_model_retrain_pending(conn) if removed else model_retrain_status(conn)
                     elapsed_ms = round((time.perf_counter() - update_started) * 1000, 2)
-                    after_model = model_snapshot(conn)
+                    after_model = feedback_metrics_snapshot(conn)
                     feedback_update = feedback_update_summary(
                         conn,
                         action="clear",
@@ -597,15 +642,25 @@ class Handler(BaseHTTPRequestHandler):
                         vote=None,
                         score=None,
                         before_model=before_model,
-                        before_signature=before_signature,
+                        before_signature={},
                         after_model=after_model,
-                        after_signature=model_signature(conn),
+                        after_signature={},
                         removed=removed,
+                        retrained=False,
                         elapsed_ms=elapsed_ms,
                     )
+                    feedback_update["model_retrain"] = retrain_status
                     log_feedback_update(feedback_update)
-                    page = response_page_payload(conn, payload, require_bootstrap_match=require_bootstrap_match)
-                self.send_json({"ok": True, "removed": removed, "feedback_update": feedback_update, **page})
+                if removed:
+                    MODEL_RETRAIN_WAKE.set()
+                self.send_json(
+                    {
+                        "ok": True,
+                        "removed": removed,
+                        "removed_gallery_url": gallery_url if removed else None,
+                        "feedback_update": feedback_update,
+                    }
+                )
             elif path == "/api/short-repeats/recalculate":
                 payload = self.read_json()
                 with db.connect() as conn:
@@ -622,12 +677,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             elif path == "/api/retrain":
                 payload = self.read_json()
+                retrain_status = run_model_retrain("manual", force=True)
                 with db.connect() as conn:
-                    retrain_model(conn)
                     self.send_json(
                         {
                             "ok": True,
                             "model": model_snapshot(conn),
+                            "model_retrain": retrain_status,
                             **recommendation_payload(
                                 conn,
                                 limit=40,
@@ -737,6 +793,10 @@ def get_settings() -> dict:
             "cookie_missing_keys": missing_common_cookie_keys(cookie),
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
             "refresh_interval_minutes": refresh_interval_minutes(conn),
+            "model_retrain_mode": configured_model_retrain_mode(conn),
+            "model_retrain_feedback_threshold": model_retrain_feedback_threshold(conn),
+            "model_retrain_interval_minutes": model_retrain_interval_minutes(conn),
+            "model_retrain": model_retrain_status(conn),
             "fetch_pages": fetch_pages(conn),
             "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
             "detail_fetch_limit": detail_fetch_limit(conn),
@@ -748,6 +808,9 @@ def get_settings() -> dict:
             "updates_min_new_pages": updates_min_new_pages(conn),
             "recommend_language_filter": configured_language_filter(conn),
             "recommend_model_mode": configured_model_mode(conn),
+            "review_low_interest_percent": review_low_interest_percent(conn),
+            "review_low_interest_auto_threshold": review_low_interest_auto_threshold(conn),
+            "review_low_interest_max_percent": review_low_interest_max_percent(conn),
             "preview_freshness_weight": preview_freshness_weight(conn),
             "preview_posted_after": preview_posted_after(conn),
             "hath_download_signal_weight": hath_download_signal_weight(conn),
@@ -775,9 +838,13 @@ def get_status() -> dict:
             "fetch_history": fetch_runs(conn, limit=5),
             "plan": plan_fetch_from_conn(conn),
             "refresh": refresh_summary(conn),
+            "model_retrain": model_retrain_status(conn),
             "settings": {
                 "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
                 "refresh_interval_minutes": refresh_interval_minutes(conn),
+                "model_retrain_mode": configured_model_retrain_mode(conn),
+                "model_retrain_feedback_threshold": model_retrain_feedback_threshold(conn),
+                "model_retrain_interval_minutes": model_retrain_interval_minutes(conn),
                 "fetch_pages": fetch_pages(conn),
                 "stale_fetch_extra_pages": stale_fetch_extra_pages(conn),
                 "detail_fetch_limit": detail_fetch_limit(conn),
@@ -789,6 +856,9 @@ def get_status() -> dict:
                 "updates_min_new_pages": updates_min_new_pages(conn),
                 "recommend_language_filter": configured_language_filter(conn),
                 "recommend_model_mode": configured_model_mode(conn),
+                "review_low_interest_percent": review_low_interest_percent(conn),
+                "review_low_interest_auto_threshold": review_low_interest_auto_threshold(conn),
+                "review_low_interest_max_percent": review_low_interest_max_percent(conn),
                 "preview_freshness_weight": preview_freshness_weight(conn),
                 "preview_posted_after": preview_posted_after(conn),
                 "hath_download_signal_weight": hath_download_signal_weight(conn),
@@ -822,7 +892,14 @@ def active_hath_archive_names() -> set[str]:
             """
             SELECT DISTINCT directory_name
             FROM hath_downloads
-            WHERE status = 'downloading' AND directory_name IS NOT NULL AND directory_name != ''
+            WHERE status = 'downloading'
+              AND NOT (
+                  completed_at IS NOT NULL
+                  AND total_files IS NOT NULL
+                  AND downloaded_files >= total_files
+              )
+              AND directory_name IS NOT NULL
+              AND directory_name != ''
             """
         ).fetchall()
     return {str(row["directory_name"]) for row in rows}
@@ -842,6 +919,7 @@ def hath_archive_inventory() -> dict[str, Any]:
 def save_settings(payload: dict[str, Any]) -> None:
     refresh_relevant_change = False
     model_relevant_change = False
+    retrain_schedule_change = False
     with db.connect() as conn:
         if parse_bool(payload.get("clear_cookie")):
             db.set_setting(conn, "cookie_header", "")
@@ -863,6 +941,22 @@ def save_settings(payload: dict[str, Any]) -> None:
             minutes = bounded_int(payload["refresh_interval_minutes"], default=30, lower=5, upper=240)
             db.set_setting(conn, "refresh_interval_minutes", str(minutes))
             refresh_relevant_change = True
+        if "model_retrain_mode" in payload:
+            mode = str(payload["model_retrain_mode"] or "").strip().lower()
+            if mode not in MODEL_RETRAIN_MODES:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "model_retrain_mode must be immediate, batched, or manual")
+            db.set_setting(conn, "model_retrain_mode", mode)
+            retrain_schedule_change = True
+        if "model_retrain_feedback_threshold" in payload:
+            threshold = bounded_int(
+                payload["model_retrain_feedback_threshold"], default=10, lower=1, upper=100
+            )
+            db.set_setting(conn, "model_retrain_feedback_threshold", str(threshold))
+            retrain_schedule_change = True
+        if "model_retrain_interval_minutes" in payload:
+            minutes = bounded_int(payload["model_retrain_interval_minutes"], default=10, lower=1, upper=240)
+            db.set_setting(conn, "model_retrain_interval_minutes", str(minutes))
+            retrain_schedule_change = True
         if "fetch_pages" in payload:
             pages = bounded_int(payload["fetch_pages"], default=1, lower=1, upper=5)
             db.set_setting(conn, "fetch_pages", str(pages))
@@ -901,6 +995,20 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "recommend_language_filter", ",".join(sorted(languages)))
         if "recommend_model_mode" in payload:
             db.set_setting(conn, "recommend_model_mode", normalize_model_mode(payload["recommend_model_mode"]))
+        if "review_low_interest_percent" in payload:
+            percent = bounded_int(payload["review_low_interest_percent"], default=20, lower=0, upper=50)
+            db.set_setting(conn, "review_low_interest_percent", str(percent))
+        if "review_low_interest_auto_threshold" in payload:
+            db.set_setting(
+                conn,
+                "review_low_interest_auto_threshold",
+                "1" if parse_bool(payload["review_low_interest_auto_threshold"]) else "0",
+            )
+        if "review_low_interest_max_percent" in payload:
+            max_percent = bounded_int(
+                payload["review_low_interest_max_percent"], default=35, lower=0, upper=90
+            )
+            db.set_setting(conn, "review_low_interest_max_percent", str(max_percent))
         if "preview_freshness_weight" in payload:
             weight = bounded_float(payload["preview_freshness_weight"], default=8.0, lower=0.0, upper=50.0)
             db.set_setting(conn, "preview_freshness_weight", str(weight))
@@ -941,10 +1049,12 @@ def save_settings(payload: dict[str, Any]) -> None:
             upsert_bootstrap_tags(conn, parse_bootstrap_tags(str(payload["bootstrap_tags_raw"])))
             refresh_relevant_change = True
         if model_relevant_change:
-            retrain_model(conn)
+            retrain_model(conn, release_write_lock=True)
         configure_request_rate_limit_from_conn(conn)
     if refresh_relevant_change:
         wake_background_refresh()
+    if retrain_schedule_change:
+        MODEL_RETRAIN_WAKE.set()
 
 
 def wake_background_refresh() -> None:
@@ -1145,6 +1255,24 @@ def visual_settings(encoder: str | None = None, device: str | None = None) -> di
     }
 
 
+def feedback_metrics_snapshot(conn) -> dict:
+    counts = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM feedback) AS feedback_events,
+            (SELECT COUNT(DISTINCT gallery_url) FROM feedback) AS rated_galleries,
+            (SELECT COUNT(*) FROM gallery_marks) AS marked_galleries,
+            (SELECT COUNT(*) FROM gallery_marks WHERE kind = 'favorite') AS favorite_galleries,
+            (SELECT COUNT(*) FROM gallery_marks WHERE kind = 'ban') AS banned_galleries,
+            (SELECT COUNT(*) FROM feature_weights) AS model_features
+        """
+    ).fetchone()
+    return {
+        "counts": dict(counts),
+        "visual": {},
+    }
+
+
 def model_signature(conn) -> dict:
     feature_rows = [
         (
@@ -1228,6 +1356,7 @@ def mark_update_summary(
     after_model: dict,
     after_signature: dict,
     removed: int | None = None,
+    retrained: bool = True,
     elapsed_ms: float | None = None,
 ) -> dict:
     before_counts = before_model.get("counts", {})
@@ -1257,7 +1386,7 @@ def mark_update_summary(
         "model_features_before": before_counts.get("model_features", 0),
         "model_features_after": after_counts.get("model_features", 0),
         "model_changed": before_signature != after_signature,
-        "retrained": True if action != "clear" else removed != 0,
+        "retrained": retrained,
         "elapsed_ms": elapsed_ms,
     }
 
@@ -1298,6 +1427,10 @@ def reset_library_payload() -> dict:
     try:
         with db.connect() as conn:
             removed = reset_library(conn)
+            db.set_setting(conn, "model_retrain_pending_count", "0")
+            db.set_setting(conn, "model_retrain_pending_since", "")
+            db.set_setting(conn, "model_retrain_active_signature", "")
+            retrain_model(conn, release_write_lock=True)
             page = recommendation_payload(conn, limit=40)
             model = model_snapshot(conn)
     finally:
@@ -1827,7 +1960,7 @@ def fetch_and_store(
             clear_shared_thumbnail_metadata(conn)
             if enriched:
                 update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
-                retrain_model(conn)
+                retrain_model(conn, release_write_lock=True)
                 model_retrained = True
             conn.execute(
                 """
@@ -2003,7 +2136,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             clear_shared_thumbnail_metadata(conn)
             if enriched:
                 update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
-                retrain_model(conn)
+                retrain_model(conn, release_write_lock=True)
                 model_retrained = True
             conn.execute(
                 """
@@ -2707,7 +2840,8 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         except Exception as exc:
             visual_result = {"status": "failed", "reason": str(exc)}
     with db.connect() as conn:
-        retrain_model(conn)
+        retrain_status = mark_model_retrain_pending(conn, increment=False)
+    MODEL_RETRAIN_WAKE.set()
     parent_error = None
     try:
         parent_enriched = fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
@@ -2720,6 +2854,7 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
         "parent_enriched": parent_enriched,
         "parent_error": parent_error,
         "visual": visual_result,
+        "model_retrain": retrain_status,
     }
 
 
@@ -3057,6 +3192,38 @@ def refresh_interval_minutes(conn) -> int:
     return bounded_int(db.get_setting(conn, "refresh_interval_minutes", "30"), default=30, lower=5, upper=240)
 
 
+def configured_model_retrain_mode(conn) -> str:
+    mode = db.get_setting(conn, "model_retrain_mode", "batched").strip().lower()
+    return mode if mode in MODEL_RETRAIN_MODES else "batched"
+
+
+def model_retrain_feedback_threshold(conn) -> int:
+    return bounded_int(
+        db.get_setting(conn, "model_retrain_feedback_threshold", "10"),
+        default=10,
+        lower=1,
+        upper=100,
+    )
+
+
+def model_retrain_interval_minutes(conn) -> int:
+    return bounded_int(
+        db.get_setting(conn, "model_retrain_interval_minutes", "10"),
+        default=10,
+        lower=1,
+        upper=240,
+    )
+
+
+def model_retrain_pending_count(conn) -> int:
+    return bounded_int(
+        db.get_setting(conn, "model_retrain_pending_count", "0"),
+        default=0,
+        lower=0,
+        upper=1_000_000,
+    )
+
+
 def recommend_candidate_limit(conn) -> int:
     return bounded_int(db.get_setting(conn, "recommend_candidate_limit", "2000"), default=2000, lower=100, upper=10000)
 
@@ -3076,6 +3243,29 @@ def configured_language_filter(conn) -> str:
 
 def configured_model_mode(conn) -> str:
     return normalize_model_mode(db.get_setting(conn, "recommend_model_mode", "hybrid"))
+
+
+def review_low_interest_percent(conn) -> int:
+    return bounded_int(
+        db.get_setting(conn, "review_low_interest_percent", "20"),
+        default=20,
+        lower=0,
+        upper=50,
+    )
+
+
+def review_low_interest_auto_threshold(conn) -> bool:
+    return db.get_setting(conn, "review_low_interest_auto_threshold", "1") == "1"
+
+
+def review_low_interest_max_percent(conn) -> int:
+    configured = bounded_int(
+        db.get_setting(conn, "review_low_interest_max_percent", "35"),
+        default=35,
+        lower=0,
+        upper=90,
+    )
+    return max(review_low_interest_percent(conn), configured)
 
 
 def preview_freshness_weight(conn) -> float:
@@ -3107,6 +3297,7 @@ def recommendation_payload(
     model_mode: str | None = None,
     require_bootstrap_match: bool = False,
     posted_after: str | None = None,
+    interest_band: str = "all",
 ) -> dict:
     if language_filter is None:
         language_filter = configured_language_filter(conn)
@@ -3126,6 +3317,10 @@ def recommendation_payload(
         model_mode=model_mode,
         require_bootstrap_match=require_bootstrap_match,
         posted_after=posted_after,
+        low_interest_percent=review_low_interest_percent(conn),
+        low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
+        low_interest_max_percent=review_low_interest_max_percent(conn),
+        interest_band=interest_band,
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     page["request_id"] = hashlib.sha256(
@@ -3324,6 +3519,8 @@ def queue_counts_payload(conn) -> dict[str, int]:
             (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, '|'), '') FROM settings
              WHERE key IN ('recommend_candidate_limit', 'recommend_language_filter',
                            'recommend_model_mode', 'review_require_bootstrap_match',
+                           'review_low_interest_percent',
+                           'review_low_interest_auto_threshold', 'review_low_interest_max_percent',
                            'updates_shortlist_limit', 'updates_min_new_pages')) AS settings_version
         """
     ).fetchone()
@@ -3343,6 +3540,9 @@ def queue_counts_payload(conn) -> dict[str, int]:
         model_mode=configured_model_mode(conn),
         require_bootstrap_match=configured_review_require_bootstrap_match(conn),
         continuing_updates=continuing_updates,
+        low_interest_percent=review_low_interest_percent(conn),
+        low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
+        low_interest_max_percent=review_low_interest_max_percent(conn),
     )
     short_repeats = short_repeat_page(
         conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
@@ -3356,7 +3556,8 @@ def queue_counts_payload(conn) -> dict[str, int]:
         min_new_pages=updates_min_new_pages(conn),
     )
     result = {
-        "review": int(review["total"]),
+        "review": int(review["primary_total"]),
+        "low_interest": int(review["low_interest_total"]),
         "short_repeats": int(short_repeats["total"]),
         "continuing_updates": int(update_page["total"]),
         "classification_samples": int(fingerprint_row[5]),
@@ -3389,6 +3590,7 @@ def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match
         include_rated=parse_bool(payload.get("include_rated")),
         filter_text=payload.get("filter_text"),
         require_bootstrap_match=require_bootstrap_match,
+        interest_band="low" if view == "low-interest" else "primary" if view == "review" else "all",
     )
 
 
@@ -3952,6 +4154,152 @@ def safe_json_list(raw: str | None) -> list:
     return value if isinstance(value, list) else []
 
 
+def model_retrain_pending_age_seconds(conn) -> float:
+    pending_since = db.get_setting(conn, "model_retrain_pending_since", "")
+    if not pending_since:
+        return 0.0
+    try:
+        pending_epoch = calendar.timegm(time.strptime(pending_since, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return 0.0
+    return max(0.0, time.time() - pending_epoch)
+
+
+def model_retrain_status(conn) -> dict[str, Any]:
+    mode = configured_model_retrain_mode(conn)
+    threshold = model_retrain_feedback_threshold(conn)
+    interval = model_retrain_interval_minutes(conn)
+    pending = model_retrain_pending_count(conn)
+    pending_since = db.get_setting(conn, "model_retrain_pending_since", "") or None
+    running = bool(MODEL_RETRAIN_STATE.get("running"))
+    next_check_at = None
+    if pending and not running and mode != "manual":
+        age = model_retrain_pending_age_seconds(conn)
+        due_in = 0 if mode == "immediate" or pending >= threshold else max(0, interval * 60 - age)
+        next_check_at = timestamp_after(due_in)
+    return {
+        "mode": mode,
+        "feedback_threshold": threshold,
+        "interval_minutes": interval,
+        "pending_count": pending,
+        "pending_since": pending_since,
+        "running": running,
+        "trigger": MODEL_RETRAIN_STATE.get("trigger"),
+        "next_check_at": next_check_at,
+        "last_started_at": MODEL_RETRAIN_STATE.get("last_started_at"),
+        "last_completed_at": (
+            MODEL_RETRAIN_STATE.get("last_completed_at")
+            or db.get_setting(conn, "model_retrain_last_completed_at", "")
+            or None
+        ),
+        "last_error": MODEL_RETRAIN_STATE.get("last_error"),
+    }
+
+
+def mark_model_retrain_pending(conn, increment: bool = True) -> dict[str, Any]:
+    current = model_retrain_pending_count(conn)
+    pending = current + 1 if increment else max(1, current)
+    db.set_setting(conn, "model_retrain_pending_count", str(pending))
+    if pending == 1 or not db.get_setting(conn, "model_retrain_pending_since", ""):
+        db.set_setting(conn, "model_retrain_pending_since", current_timestamp())
+    return model_retrain_status(conn)
+
+
+def model_retrain_due(conn) -> tuple[bool, str | None, float]:
+    pending = model_retrain_pending_count(conn)
+    if not pending:
+        return False, None, 3600.0
+    mode = configured_model_retrain_mode(conn)
+    if mode == "manual":
+        return False, None, 3600.0
+    if mode == "immediate":
+        return True, "feedback", 0.0
+    threshold = model_retrain_feedback_threshold(conn)
+    if pending >= threshold:
+        return True, "threshold", 0.0
+    interval_seconds = model_retrain_interval_minutes(conn) * 60
+    remaining = max(0.0, interval_seconds - model_retrain_pending_age_seconds(conn))
+    return remaining <= 0, "interval" if remaining <= 0 else None, remaining
+
+
+def run_model_retrain(trigger: str, force: bool = False) -> dict[str, Any]:
+    if not MODEL_RETRAIN_RUN_LOCK.acquire(blocking=False):
+        raise ApiError(HTTPStatus.CONFLICT, "Model retraining is already running")
+    claimed_count = 0
+    claimed_since = ""
+    try:
+        with db.connect() as conn:
+            claimed_count = model_retrain_pending_count(conn)
+            claimed_since = db.get_setting(conn, "model_retrain_pending_since", "")
+            if not force and claimed_count <= 0:
+                return model_retrain_status(conn)
+            db.set_setting(conn, "model_retrain_pending_count", "0")
+            db.set_setting(conn, "model_retrain_pending_since", "")
+        started_at = current_timestamp()
+        MODEL_RETRAIN_STATE.update(
+            {
+                "running": True,
+                "trigger": trigger,
+                "last_started_at": started_at,
+                "last_error": None,
+            }
+        )
+        with db.connect() as conn:
+            retrain_model(conn, release_write_lock=True)
+            completed_at = current_timestamp()
+            db.set_setting(conn, "model_retrain_last_completed_at", completed_at)
+        MODEL_RETRAIN_STATE.update(
+            {
+                "running": False,
+                "trigger": None,
+                "last_completed_at": completed_at,
+                "last_error": None,
+            }
+        )
+        with db.connect() as conn:
+            return model_retrain_status(conn)
+    except Exception as exc:
+        if claimed_count:
+            with db.connect() as conn:
+                pending = model_retrain_pending_count(conn)
+                db.set_setting(conn, "model_retrain_pending_count", str(pending + claimed_count))
+                if not db.get_setting(conn, "model_retrain_pending_since", ""):
+                    db.set_setting(conn, "model_retrain_pending_since", claimed_since or current_timestamp())
+        MODEL_RETRAIN_STATE.update({"running": False, "trigger": None, "last_error": str(exc)})
+        raise
+    finally:
+        MODEL_RETRAIN_RUN_LOCK.release()
+
+
+def background_model_retrain(stop: threading.Event) -> None:
+    while not stop.is_set():
+        try:
+            with db.connect() as conn:
+                due, trigger, wait_seconds = model_retrain_due(conn)
+            if due and trigger:
+                run_model_retrain(trigger)
+                continue
+            wait_for_model_retrain_wake(stop, min(3600.0, max(1.0, wait_seconds)))
+        except ApiError as exc:
+            if exc.status != HTTPStatus.CONFLICT:
+                print(f"background model retrain failed: {exc}")
+            wait_for_model_retrain_wake(stop, 5.0)
+        except Exception as exc:
+            print(f"background model retrain failed: {exc}")
+            wait_for_model_retrain_wake(stop, 60.0)
+
+
+def wait_for_model_retrain_wake(stop: threading.Event, timeout: float) -> None:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if MODEL_RETRAIN_WAKE.wait(min(remaining, 1.0)):
+            MODEL_RETRAIN_WAKE.clear()
+            return
+
+
 def background_refresh(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
@@ -3996,11 +4344,18 @@ def main() -> None:
         configure_request_rate_limit_from_conn(conn)
         finish_interrupted_fetch_runs(conn)
         clear_shared_thumbnail_metadata(conn)
-        retrain_model(conn)
+        retrain_model(conn, release_write_lock=True)
+        completed_at = current_timestamp()
+        db.set_setting(conn, "model_retrain_pending_count", "0")
+        db.set_setting(conn, "model_retrain_pending_since", "")
+        db.set_setting(conn, "model_retrain_last_completed_at", completed_at)
+        MODEL_RETRAIN_STATE.update({"last_completed_at": completed_at, "last_error": None})
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop = threading.Event()
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
+    retrain_worker = threading.Thread(target=background_model_retrain, args=(stop,), daemon=True)
     worker.start()
+    retrain_worker.start()
     print(f"Serving ExHentai recommender at {server_display_url(HOST, PORT)}")
     if HOST == "0.0.0.0":
         print(f"Remote clients can use http://<server-ip>:{PORT}")

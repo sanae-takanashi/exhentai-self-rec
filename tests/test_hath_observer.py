@@ -170,6 +170,31 @@ class HathObserverTest(unittest.TestCase):
         self.assertTrue(all(event["gid"] == "123" for event in events))
         self.assertEqual(events[1]["downloaded_files"], 5)
 
+    def test_log_parser_ignores_late_lines_for_completed_snapshot(self):
+        snapshots = {
+            "123:org": {
+                "gid": "123",
+                "resolution": "org",
+                "title": "Log Gallery",
+                "directory_name": "Log Gallery [123]",
+                "downloaded_files": 5,
+                "downloaded_bytes": 100,
+                "complete": True,
+            }
+        }
+
+        events = parse_log_lines(
+            "client-a",
+            [
+                "GalleryDownloader: Starting download of gallery: Log Gallery\n",
+                "GalleryDownloader: Finished downloading gid=123 page=5: 005.jpg\n",
+                "GalleryDownloader: Permanently failed downloading gallery: Log Gallery\n",
+            ],
+            snapshots,
+        )
+
+        self.assertEqual(events, [])
+
     def test_p2p_log_metrics_are_aggregated_without_request_details(self):
         lines = [
             "2026-08-18T12:40:18Z [info] {request/203.0.113.2} Code=200 Bytes=186206 GET /h/secret-path HTTP/1.1\n",

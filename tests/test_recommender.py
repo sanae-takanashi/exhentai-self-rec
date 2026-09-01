@@ -6,6 +6,7 @@ from exh_rec import db
 from exh_rec.exhentai import Gallery
 from exh_rec.recommender import (
     LEARNING_RATE,
+    annotate_interest_bands,
     clear_feedback,
     clear_gallery_mark,
     clear_shared_thumbnail_metadata,
@@ -32,6 +33,7 @@ from exh_rec.recommender import (
     record_feedback,
     record_gallery_mark,
     retrain_model,
+    resolve_low_interest_threshold_policy,
     score_gallery,
     set_classification_override,
     short_repeat_page,
@@ -1075,6 +1077,21 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["favorite_galleries"], 1)
         self.assertEqual(snapshot["counts"]["banned_galleries"], 1)
 
+    def test_gallery_mark_only_invalidates_model_when_signal_changes(self):
+        gallery_url = "https://exhentai.org/g/6mi/f/"
+        store_galleries(
+            self.conn,
+            [Gallery(url=gallery_url, gid="6mi", token="f", title="Mark Invalidation")],
+        )
+
+        first = record_gallery_mark(self.conn, gallery_url, "favorite", retrain=False)
+        same_kind = record_gallery_mark(self.conn, gallery_url, "favorite", note="updated", retrain=False)
+        switched = record_gallery_mark(self.conn, gallery_url, "ban", retrain=False)
+
+        self.assertTrue(first)
+        self.assertFalse(same_kind)
+        self.assertTrue(switched)
+
     def test_gallery_marks_hide_from_review_and_have_pages(self):
         favorite_url = "https://exhentai.org/g/6fa/f/"
         banned_url = "https://exhentai.org/g/6ba/f/"
@@ -1986,6 +2003,138 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(second["offset"], 2)
         self.assertEqual(first["total"], 5)
         self.assertEqual(first["candidate_limit"], 2000)
+
+    def test_recommend_page_splits_dynamic_low_interest_band(self):
+        galleries = [
+            Gallery(
+                url=f"https://exhentai.org/g/{9100 + idx}/a/",
+                gid=str(9100 + idx),
+                token="a",
+                title=f"Interest Band Item {idx}",
+            )
+            for idx in range(10)
+        ]
+        store_galleries(self.conn, galleries)
+
+        all_items = recommend_page(self.conn, limit=20, low_interest_percent=20)
+        primary = recommend_page(
+            self.conn,
+            limit=20,
+            low_interest_percent=20,
+            interest_band="primary",
+        )
+        low = recommend_page(
+            self.conn,
+            limit=20,
+            low_interest_percent=20,
+            interest_band="low",
+        )
+
+        self.assertEqual(all_items["overall_total"], 10)
+        self.assertEqual(all_items["primary_total"], 8)
+        self.assertEqual(all_items["low_interest_total"], 2)
+        self.assertEqual(primary["total"], 8)
+        self.assertEqual(low["total"], 2)
+        self.assertTrue(all(item["low_interest"] for item in low["items"]))
+        self.assertTrue(all(not item["low_interest"] for item in primary["items"]))
+        self.assertEqual(
+            {item["url"] for item in all_items["items"]},
+            {item["url"] for item in primary["items"]} | {item["url"] for item in low["items"]},
+        )
+        self.assertTrue(all(item["low_interest_cutoff_percent"] == 20 for item in low["items"]))
+
+    def test_zero_low_interest_percent_keeps_full_review_queue(self):
+        store_galleries(
+            self.conn,
+            [
+                Gallery(url="https://exhentai.org/g/9200/a/", gid="9200", token="a", title="First"),
+                Gallery(url="https://exhentai.org/g/9201/a/", gid="9201", token="a", title="Second"),
+            ],
+        )
+
+        primary = recommend_page(
+            self.conn,
+            limit=10,
+            low_interest_percent=0,
+            interest_band="primary",
+        )
+        low = recommend_page(
+            self.conn,
+            limit=10,
+            low_interest_percent=0,
+            interest_band="low",
+        )
+
+        self.assertEqual(primary["total"], 2)
+        self.assertEqual(low["total"], 0)
+
+    def test_learned_threshold_adds_very_low_items_with_combined_cap(self):
+        scored = [
+            {
+                "url": str(index),
+                "score": probability,
+                "rank_score": probability,
+                "like_probability": probability,
+                "score_scale": "probability",
+                "model_version": "model-v1",
+            }
+            for index, probability in enumerate([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.35, 0.3, 0.2, 0.1])
+        ]
+        policy = annotate_interest_bands(
+            scored,
+            20,
+            threshold_policy={
+                "active": True,
+                "threshold": 0.5,
+                "model_version": "model-v1",
+                "max_percent": 35,
+            },
+            max_percent=35,
+        )
+
+        low = [item for item in scored if item["low_interest"]]
+        self.assertEqual(policy["percentile_count"], 2)
+        self.assertEqual(policy["low_interest_total"], 4)
+        self.assertEqual(policy["threshold_added_count"], 2)
+        self.assertTrue(all(item["very_low_interest"] for item in low))
+        self.assertEqual({item["like_probability"] for item in low}, {0.35, 0.3, 0.2, 0.1})
+
+    def test_learned_threshold_requires_an_accepted_matching_probability_model(self):
+        base_artifact = {
+            "ready": True,
+            "accepted": False,
+            "score_scale": "probability",
+            "model_version": "model-v1",
+            "calibration": {"ready": True},
+            "low_interest_threshold": {
+                "ready": True,
+                "status": "ready",
+                "threshold": 0.2,
+                "model_version": "model-v1",
+            },
+        }
+
+        rejected = resolve_low_interest_threshold_policy(
+            base_artifact, enabled=True, model_mode="hybrid", max_percent=35
+        )
+        mismatched = resolve_low_interest_threshold_policy(
+            {
+                **base_artifact,
+                "accepted": True,
+                "low_interest_threshold": {
+                    **base_artifact["low_interest_threshold"],
+                    "model_version": "model-v0",
+                },
+            },
+            enabled=True,
+            model_mode="hybrid",
+            max_percent=35,
+        )
+
+        self.assertFalse(rejected["active"])
+        self.assertEqual(rejected["status"], "model-not-accepted")
+        self.assertFalse(mismatched["active"])
+        self.assertEqual(mismatched["status"], "threshold-model-version-mismatch")
 
     def test_recommend_candidate_limit_controls_scored_pool(self):
         galleries = [

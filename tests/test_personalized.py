@@ -14,6 +14,7 @@ from exh_rec.personalized import (
     MIN_LABELED,
     MODEL_SCHEMA,
     evaluation_acceptance,
+    learn_low_interest_threshold,
     model_data_signature,
     normalize_reason_code,
     normalize_surface,
@@ -265,6 +266,50 @@ class PersonalizedTest(unittest.TestCase):
         self.assertGreaterEqual(len(splits), 2)
         self.assertEqual(splits[0][0], MIN_CLASS * 2)
         self.assertEqual(max(end for _start, end in splits), MIN_LABELED)
+
+    def test_low_interest_threshold_selects_largest_safe_temporal_cutoff(self):
+        predictions = [
+            {
+                "index": index,
+                "probability": round((index + 1) / 100, 6),
+                "label": 0 if index < 40 else int(index % 3 == 0),
+            }
+            for index in range(100)
+        ]
+        with patch(
+            "exh_rec.personalized._temporal_oof_probabilities",
+            return_value=(predictions, [{"train_count": 50, "test_count": 50}], True),
+        ):
+            policy = learn_low_interest_threshold(
+                [], 0.2, {}, model_version="model-v1", generated_at="2026-08-31 00:00:00"
+            )
+
+        self.assertTrue(policy["ready"])
+        self.assertEqual(policy["threshold"], 0.42)
+        self.assertEqual(policy["triaged_count"], 42)
+        self.assertEqual(policy["triaged_positive_count"], 0)
+        self.assertLessEqual(policy["positive_rate_upper_95"], 0.10)
+
+    def test_low_interest_threshold_stays_disabled_when_false_omission_is_unsafe(self):
+        predictions = [
+            {
+                "index": index,
+                "probability": round((index + 1) / 100, 6),
+                "label": int(index % 5 == 0),
+            }
+            for index in range(100)
+        ]
+        with patch(
+            "exh_rec.personalized._temporal_oof_probabilities",
+            return_value=(predictions, [{"train_count": 50, "test_count": 50}], True),
+        ):
+            policy = learn_low_interest_threshold(
+                [], 0.2, {}, model_version="model-v1", generated_at="2026-08-31 00:00:00"
+            )
+
+        self.assertFalse(policy["ready"])
+        self.assertEqual(policy["status"], "safety-target-not-met")
+        self.assertIsNone(policy["threshold"])
 
     def test_probability_mmr_never_selects_outside_window(self):
         items = [

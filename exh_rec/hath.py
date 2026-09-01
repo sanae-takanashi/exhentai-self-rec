@@ -231,6 +231,22 @@ def _apply_event(conn: sqlite3.Connection, client_id: str, event: dict[str, Any]
         (gid,),
     ).fetchone()
     status = DOWNLOAD_EVENT_STATUS[event["type"]]
+    if (
+        existing
+        and existing["completed_at"]
+        and status in {"discovered", "downloading"}
+        and existing["total_files"] is not None
+        and event.get("downloaded_files", 0) >= existing["total_files"]
+        and (
+            not event.get("directory_name")
+            or not existing["directory_name"]
+            or event["directory_name"] == existing["directory_name"]
+        )
+    ):
+        # H@H can flush a final page log after galleryinfo.txt has already
+        # produced the completion event. Do not let that late progress event
+        # downgrade the completed download back to an active state.
+        status = "completed"
     started_at = event["occurred_at"] if status == "downloading" else None
     completed_at = event["occurred_at"] if status == "completed" else None
     failed_at = event["occurred_at"] if status == "failed" else None

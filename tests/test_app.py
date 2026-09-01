@@ -55,7 +55,10 @@ from exh_rec.app import (
     is_remote_search_preference,
     marked_gallery_payload,
     mark_update_summary,
+    mark_model_retrain_pending,
     missing_common_cookie_keys,
+    model_retrain_due,
+    model_retrain_status,
     model_snapshot,
     model_signature,
     network_proxy,
@@ -777,6 +780,160 @@ class AppTest(unittest.TestCase):
         self.assertIsNotNone(summary["latest_feedback_id"])
         conn.close()
 
+    def test_feedback_can_be_recorded_without_synchronous_retraining(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        gallery_url = "https://exhentai.org/g/10b/a/"
+        store_galleries(
+            conn,
+            [Gallery(url=gallery_url, gid="10b", token="a", title="Batched Feedback", tags=["artist:batch"])],
+        )
+
+        invalidated = record_feedback(conn, gallery_url, vote=1, retrain=False)
+
+        self.assertTrue(invalidated)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM feature_weights").fetchone()[0], 0)
+        conn.close()
+
+    def test_feedback_api_queues_retraining_without_rebuilding_the_response_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/10api/a/"
+                with db.connect() as conn:
+                    store_galleries(
+                        conn,
+                        [Gallery(url=gallery_url, gid="10api", token="a", title="Fast Feedback API")],
+                    )
+
+                sent = []
+                handler = Handler.__new__(Handler)
+                handler.path = "/api/feedback"
+                handler.read_json = lambda: {
+                    "gallery_url": gallery_url,
+                    "vote": 1,
+                    "view": "review",
+                    "enrich_feedback": False,
+                }
+                handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+                handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+                with patch(
+                    "exh_rec.app.response_page_payload",
+                    side_effect=AssertionError("feedback response must not rebuild the recommendation page"),
+                ), patch(
+                    "exh_rec.app.retrain_model",
+                    side_effect=AssertionError("feedback response must not retrain synchronously"),
+                ):
+                    handler.do_POST()
+
+                with db.connect() as conn:
+                    retrain = model_retrain_status(conn)
+                    feedback_count = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+
+                payload, status = sent[0]
+                self.assertEqual(status, HTTPStatus.OK)
+                self.assertEqual(payload["removed_gallery_url"], gallery_url)
+                self.assertNotIn("items", payload)
+                self.assertFalse(payload["feedback_update"]["retrained"])
+                self.assertEqual(feedback_count, 1)
+                self.assertEqual(retrain["pending_count"], 1)
+
+    def test_mark_api_queues_retraining_without_rebuilding_the_response_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/10mark/a/"
+                with db.connect() as conn:
+                    store_galleries(
+                        conn,
+                        [Gallery(url=gallery_url, gid="10mark", token="a", title="Fast Mark API")],
+                    )
+
+                sent = []
+                handler = Handler.__new__(Handler)
+                handler.path = "/api/mark"
+                handler.read_json = lambda: {
+                    "gallery_url": gallery_url,
+                    "kind": "favorite",
+                    "view": "review",
+                }
+                handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+                handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+                with patch(
+                    "exh_rec.app.response_page_payload",
+                    side_effect=AssertionError("mark response must not rebuild the recommendation page"),
+                ), patch(
+                    "exh_rec.recommender.retrain_model",
+                    side_effect=AssertionError("mark response must not retrain synchronously"),
+                ):
+                    handler.do_POST()
+
+                with db.connect() as conn:
+                    retrain = model_retrain_status(conn)
+                    mark = conn.execute(
+                        "SELECT kind FROM gallery_marks WHERE gallery_url = ?",
+                        (gallery_url,),
+                    ).fetchone()
+
+                payload, status = sent[0]
+                self.assertEqual(status, HTTPStatus.OK)
+                self.assertEqual(payload["removed_gallery_url"], gallery_url)
+                self.assertNotIn("items", payload)
+                self.assertFalse(payload["mark_update"]["retrained"])
+                self.assertEqual(mark["kind"], "favorite")
+                self.assertEqual(retrain["pending_count"], 1)
+
+    def test_clear_mark_api_queues_retraining_without_rebuilding_the_response_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
+                db.init_db()
+                gallery_url = "https://exhentai.org/g/10clear/a/"
+                with db.connect() as conn:
+                    store_galleries(
+                        conn,
+                        [Gallery(url=gallery_url, gid="10clear", token="a", title="Fast Clear Mark API")],
+                    )
+                    record_gallery_mark(conn, gallery_url, "ban", retrain=False)
+
+                sent = []
+                handler = Handler.__new__(Handler)
+                handler.path = "/api/mark/clear"
+                handler.read_json = lambda: {"gallery_url": gallery_url, "view": "history"}
+                handler.send_json = lambda payload, status=HTTPStatus.OK: sent.append((payload, status))
+                handler.handle_error = lambda exc: (_ for _ in ()).throw(exc)
+
+                with patch(
+                    "exh_rec.app.response_page_payload",
+                    side_effect=AssertionError("clear mark response must not rebuild the recommendation page"),
+                ), patch(
+                    "exh_rec.recommender.retrain_model",
+                    side_effect=AssertionError("clear mark response must not retrain synchronously"),
+                ):
+                    handler.do_POST()
+
+                with db.connect() as conn:
+                    retrain = model_retrain_status(conn)
+                    mark_count = conn.execute(
+                        "SELECT COUNT(*) FROM gallery_marks WHERE gallery_url = ?",
+                        (gallery_url,),
+                    ).fetchone()[0]
+
+                payload, status = sent[0]
+                self.assertEqual(status, HTTPStatus.OK)
+                self.assertEqual(payload["removed"], 1)
+                self.assertEqual(payload["removed_gallery_url"], gallery_url)
+                self.assertNotIn("items", payload)
+                self.assertFalse(payload["mark_update"]["retrained"])
+                self.assertEqual(mark_count, 0)
+                self.assertEqual(retrain["pending_count"], 1)
+
     def test_feedback_update_summary_can_report_no_retrain_for_neutral_skip(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -808,6 +965,60 @@ class AppTest(unittest.TestCase):
         self.assertEqual(summary["signal"], 0.0)
         self.assertEqual(summary["feedback_events_after"], 1)
         self.assertEqual(summary["rated_galleries_after"], 1)
+        conn.close()
+
+    def test_batched_model_retrain_waits_for_threshold_then_becomes_due(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        db.set_setting(conn, "model_retrain_mode", "batched")
+        db.set_setting(conn, "model_retrain_feedback_threshold", "2")
+        db.set_setting(conn, "model_retrain_interval_minutes", "10")
+
+        first = mark_model_retrain_pending(conn)
+        first_due, first_trigger, _ = model_retrain_due(conn)
+        second = mark_model_retrain_pending(conn)
+        second_due, second_trigger, _ = model_retrain_due(conn)
+
+        self.assertEqual(first["pending_count"], 1)
+        self.assertFalse(first_due)
+        self.assertIsNone(first_trigger)
+        self.assertEqual(second["pending_count"], 2)
+        self.assertTrue(second_due)
+        self.assertEqual(second_trigger, "threshold")
+        conn.close()
+
+    def test_model_retrain_manual_mode_keeps_pending_feedback_until_triggered(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        db.set_setting(conn, "model_retrain_mode", "manual")
+        mark_model_retrain_pending(conn)
+
+        due, trigger, _ = model_retrain_due(conn)
+        status = model_retrain_status(conn)
+
+        self.assertFalse(due)
+        self.assertIsNone(trigger)
+        self.assertEqual(status["pending_count"], 1)
+        self.assertIsNone(status["next_check_at"])
+        conn.close()
+
+    def test_batched_model_retrain_interval_is_a_fallback(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA)
+        db.set_setting(conn, "model_retrain_mode", "batched")
+        db.set_setting(conn, "model_retrain_feedback_threshold", "10")
+        db.set_setting(conn, "model_retrain_interval_minutes", "1")
+        db.set_setting(conn, "model_retrain_pending_count", "1")
+        db.set_setting(conn, "model_retrain_pending_since", "2020-01-01 00:00:00")
+
+        due, trigger, remaining = model_retrain_due(conn)
+
+        self.assertTrue(due)
+        self.assertEqual(trigger, "interval")
+        self.assertEqual(remaining, 0)
         conn.close()
 
     def test_feedback_enrichment_plan_defers_remote_fetch_by_default(self):
@@ -1425,7 +1636,13 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(
             counts,
-            {"review": 1, "short_repeats": 1, "continuing_updates": 0, "classification_samples": 0},
+            {
+                "review": 1,
+                "low_interest": 0,
+                "short_repeats": 1,
+                "continuing_updates": 0,
+                "classification_samples": 0,
+            },
         )
         conn.close()
 
@@ -1693,7 +1910,7 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(result["reason"], "no cookie")
                 fetch_detail.assert_not_called()
 
-    def test_enrich_feedback_gallery_retrains_from_detail_tags(self):
+    def test_enrich_feedback_gallery_queues_detail_tags_for_scheduled_retraining(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
             with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
@@ -1724,12 +1941,15 @@ class AppTest(unittest.TestCase):
                 with db.connect() as conn:
                     row = conn.execute("SELECT detail_fetched_at FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
                     learned = learned_query_tags(conn, limit=5)
+                    retrain = model_retrain_status(conn)
 
                 self.assertEqual(result["status"], "success")
                 fetch_detail.assert_called_once()
                 self.assertEqual(fetch_detail.call_args.kwargs["delay"], 0)
                 self.assertIsNotNone(row["detail_fetched_at"])
-                self.assertIn("artist:detailfav", learned)
+                self.assertNotIn("artist:detailfav", learned)
+                self.assertEqual(retrain["pending_count"], 1)
+                self.assertEqual(result["model_retrain"]["pending_count"], 1)
                 self.assertEqual(result["visual"]["image_count"], 2)
                 save_visual.assert_called_once_with(
                     gallery_url,
@@ -2427,6 +2647,9 @@ class AppTest(unittest.TestCase):
                         "network_proxy": "127.0.0.1:7890",
                         "recommend_language_filter": "language:japanese, Chinese",
                         "recommend_model_mode": "visual",
+                        "review_low_interest_percent": "35",
+                        "review_low_interest_auto_threshold": False,
+                        "review_low_interest_max_percent": "45",
                         "preview_freshness_weight": "14.5",
                         "preview_posted_after": "2026-06-01",
                         "hath_download_signal_weight": "0.5",
@@ -2447,6 +2670,9 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(settings["network_proxy_preview"], "http://127.0.0.1:7890")
                 self.assertEqual(settings["recommend_language_filter"], "chinese,japanese")
                 self.assertEqual(settings["recommend_model_mode"], "visual")
+                self.assertEqual(settings["review_low_interest_percent"], 35)
+                self.assertFalse(settings["review_low_interest_auto_threshold"])
+                self.assertEqual(settings["review_low_interest_max_percent"], 45)
                 self.assertEqual(settings["preview_freshness_weight"], 14.5)
                 self.assertEqual(settings["preview_posted_after"], "2026-06-01")
                 self.assertEqual(settings["hath_download_signal_weight"], 0.5)

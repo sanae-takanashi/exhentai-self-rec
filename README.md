@@ -251,7 +251,11 @@ Recommendation reasons include bootstrap matches, learned feature hits, rating a
 
 The ranked queue applies a small diversity penalty to repeated artists, groups, parodies, characters, and uploaders so one learned preference does not completely crowd out nearby alternatives.
 
-When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background of the same action and retrains from the fuller tag set. If no cookie is saved or the detail request fails, the feedback still records normally.
+Review is split into a normal queue and a dynamic `Low Interest` queue. By default, the bottom 20% of the current active ranking is removed from Review and shown separately with cover-first cards. Periodic personalized-model training also evaluates a calibrated `like_probability` threshold on temporal out-of-fold predictions. That threshold is used only after the model and threshold safety gates pass; otherwise the queue remains percentage-only. The combined queue is capped at 35% by default.
+
+Each Low Interest card shows either the configured bottom band or a `Very Low` learned-threshold badge, plus its rank in the eligible candidate pool. Use `Low-interest %`, `Low-interest max %`, and `Auto low-interest threshold` to control the fallback, cap, and learned rule. This is a reversible view filter, not automatic negative feedback: retraining or new metadata can move a gallery back into Review. A thumb-up acts as an explicit correction when the model placed something desirable in the low band. See [`LOW-INTEREST-TRIAGE.md`](LOW-INTEREST-TRIAGE.md) for the false-omission gates and current validation state.
+
+When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background. If no cookie is saved or the detail request fails, the feedback still records normally.
 
 Rated galleries are hidden from the main queue by default after you vote, score, or skip them. A neutral score of `3` also hides the gallery but does not add positive or negative learned weight. Enable `Rated` in the toolbar to review already-rated galleries.
 
@@ -271,9 +275,11 @@ Fetch and Enrich retrain the learned model after successfully saving new detail 
 
 Detail enrichment preserves the gallery's original listing freshness, so opening metadata for an older gallery does not make it look newly fetched in the recent queue.
 
-Use `Clear` on a rated card to remove that gallery's feedback history, retrain the model, and put it back into the unrated queue.
+Use `Clear` on a rated card to remove that gallery's feedback history, queue a model update, and put it back into the unrated queue.
 
-Use `Retrain` to rebuild learned weights from stored feedback. This is also done automatically at server startup and after every new vote/score.
+Use the `Retrain` setting to choose how review feedback, favorites, and bans update the model. `Batch` (the default) trains in the background after 10 model-changing actions or after 10 minutes with pending feedback, whichever comes first. `Each review` queues a background training run for every model-changing action. `Manual` keeps changes pending until you click `Retrain`. The `Reviews per train` and `Train every minutes` settings tune the Batch thresholds.
+
+Use the top-bar `Retrain` button to rebuild learned weights immediately from all stored feedback and clear the pending review count. The server also rebuilds the model at startup. Review responses keep using the most recently completed model while a new one trains, so saving feedback does not wait for model fitting.
 
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
 
