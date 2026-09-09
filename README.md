@@ -6,6 +6,12 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 
 ## Features
 
+Audit safety update: delivered pages and confirmed-visible cards are now tracked
+separately. Pending audits resume within a frozen opening-day budget. The
+learned absolute threshold currently fails closed until candidate-region
+prospective validation exists, even if numerical diagnostic checks pass.
+See [AUDIT-IMPLEMENTATION.md](AUDIT-IMPLEMENTATION.md) for verification and limits.
+
 - Local web UI for recommendations and voting.
 - Optional standard-library-only H@H observer subproject. It monitors an official downloader's output directory and logs, durably forwards idempotent progress/completion events, exposes client/download status through the local API, and learns from completed downloads without overriding explicit feedback.
 - Cookie-based ExHentai access.
@@ -34,6 +40,7 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 - A separate Discovery view samples uncertain boundary items, text/visual disagreements, and less-covered interests without diluting the high-confidence Review queue.
 - Optional negative-feedback reasons include visual style, content, creator, quality, gallery size, and too few relevant images. Reasons remain diagnostic metadata and do not alter feature values; duplicate/update feedback is excluded from preference training.
 - Recommendation impressions are stored locally for diagnostics and are never treated as negative feedback.
+- Each local opening day has 5-10 frozen audit slots. Eligible pending audits resume first; remaining slots uniformly sample the current-plus-retained Low Interest pool. Days without an opening create no synthetic samples. Original selection probabilities, score ranges, delivered/visible events, incomplete audits, dual-model ranks and feature snapshots are retained locally.
 - Review and Updates cards can override a mistaken continuing-gallery classification, with `Use Auto` available to remove the override. Manual labels take effect immediately, survive preference export/import, and train a separate lightweight classifier after at least 20 labels with 5 examples in each class; learned predictions require cross-validated balanced accuracy of 0.65 and 80% per-item confidence.
 - The Classifier view presents pending full-library random and active-learning samples as gallery cards, with one-click Review/Updates labels, live holdout counts, and classifier readiness status. Model probabilities are intentionally hidden during labeling.
 - Configurable recommendation candidate pool so older local galleries can still be considered by the learned ranker.
@@ -251,9 +258,9 @@ Recommendation reasons include bootstrap matches, learned feature hits, rating a
 
 The ranked queue applies a small diversity penalty to repeated artists, groups, parodies, characters, and uploaders so one learned preference does not completely crowd out nearby alternatives.
 
-Review is split into a normal queue and a dynamic `Low Interest` queue. By default, the bottom 20% of the current active ranking is removed from Review and shown separately with cover-first cards. Periodic personalized-model training also evaluates a calibrated `like_probability` threshold on temporal out-of-fold predictions. That threshold is used only after the model and threshold safety gates pass; otherwise the queue remains percentage-only. The combined queue is capped at 35% by default.
+Review is split into a normal queue and a dynamic `Low Interest` queue. By default, the bottom 20% is removed from Review and shown separately with cover-first cards. Percentage assignments are sticky: reviewing high-ranked galleries cannot make previously classified tail galleries leak back into normal Review as the active denominator shrinks. Newly ranked tail galleries are added, while acted-on galleries leave both queues normally. Each local opening day allows 6 audit slots by default (configurable 5-10), including carried pending assignments. Random selection does not guarantee unbiased completed labels when users can skip items. Periodic personalized-model training proposes a calibrated `like_probability` threshold from temporal out-of-fold predictions, but automatic activation currently remains unavailable pending a valid candidate-region prospective protocol. The automatic-threshold additions are capped at 35% by default; retained percentage assignments may exceed that share while an old backlog is being drained.
 
-Each Low Interest card shows either the configured bottom band or a `Very Low` learned-threshold badge, plus its rank in the eligible candidate pool. Use `Low-interest %`, `Low-interest max %`, and `Auto low-interest threshold` to control the fallback, cap, and learned rule. This is a reversible view filter, not automatic negative feedback: retraining or new metadata can move a gallery back into Review. A thumb-up acts as an explicit correction when the model placed something desirable in the low band. See [`LOW-INTEREST-TRIAGE.md`](LOW-INTEREST-TRIAGE.md) for the false-omission gates and current validation state.
+Each Low Interest card shows the current bottom band, a `Kept Low` retained-assignment badge, or a `Very Low` learned-threshold badge, plus its rank in the eligible candidate pool. Audited cards show their selection probability. Use `Low-interest %`, `Low-interest max %`, `Auto low-interest threshold`, `Random tail audit`, and `Audit items per opening day` to control the behavior. This is a reversible view filter, not automatic negative feedback. Changing the percentage or eligibility policy starts a separate assignment policy; a thumb-up acts as an explicit correction when the model placed something desirable in the low band. See [`LOW-INTEREST-TRIAGE.md`](LOW-INTEREST-TRIAGE.md) for the prospective gates and automatic fallback behavior.
 
 When you vote or score a gallery that still has only list metadata, the app uses your saved cookie to fetch that gallery's detail page in the background. If no cookie is saved or the detail request fails, the feedback still records normally.
 
@@ -284,6 +291,15 @@ Use the top-bar `Retrain` button to rebuild learned weights immediately from all
 Learned feature weights are intentionally simple and inspectable. The model view separates positive and negative learned weights so you can see what the recommender is favoring or avoiding. Artist/group/parody/character tags and uploaders get more learning signal than broad categories or noisy title words; language tags are learned more gently.
 
 Visual embeddings can use either browser-side simple vectors or server-side DINOv2. Use `Visual encoder` in the settings panel, or `EXH_REC_VISUAL_ENCODER=simple`, on slow CPU-only machines. Use `dinov2` on a laptop/workstation with enough CPU/GPU. DINOv2 uses `facebook/dinov2-small` by default, configurable with `EXH_REC_DINOV2_MODEL`. Install the optional stack with your preferred PyTorch build plus `transformers`, `torchvision`, and `Pillow`; if DINOv2 is disabled or cannot load, the browser decodes same-origin `/thumb` images into the existing `8x8` RGB fallback vector. A gallery's vector uses its cover thumbnail plus up to ten stored random sample thumbnails. Once you rate galleries that have vectors, recommendations can include `visual +...` or `visual -...` reasons. Set `Model mode` to `Visual only` if you want recommendation ranking to ignore tag/bootstrap/rating scores and use only the active visual embedding model.
+
+SigLIP2 is available only as an offline shadow challenger. It is stored in `gallery_visual_embeddings` and versioned `gallery_visual_images`; it never overwrites `galleries.visual_embedding_json` or changes the production DINOv2 encoder. Encode the same images for both challengers, then run the common-gallery bake-off:
+
+```bash
+./.venv-rocm/Scripts/python.exe scripts/encode_visual_shadow.py --encoders dinov2,siglip2 --device rocm --limit 25
+python3 scripts/benchmark_visual_encoders.py
+```
+
+The benchmark uses repeated stratified folds plus a newest-20% temporal holdout, train-fold-only visual centering, common gallery rows, and paired deltas for ROC-AUC, precision@10, NDCG@20, Brier score, and ECE. Confidence intervals are paired gallery-bootstrap intervals over one complete out-of-fold pass, not bootstrap intervals over repeated folds. Its report is diagnostic because current shadow embeddings can postdate historical labels; it is not a production encoder switch criterion by itself. Use `--dry-run` on the encoder command to inspect candidates without migrating or writing the database.
 
 Set `DINOv2 device` in the settings panel, or use `EXH_REC_DINOV2_DEVICE`, to control where PyTorch runs:
 

@@ -35,6 +35,7 @@ from exh_rec.recommender import (
     record_impressions,
     store_galleries,
     store_visual_embedding,
+    store_visual_embedding_variant,
     store_visual_image_embeddings,
     set_classification_override,
 )
@@ -371,6 +372,38 @@ class PersonalizedTest(unittest.TestCase):
         self.assertEqual(record_impressions(self.conn, "request-1", "review", [item]), 1)
         self.assertEqual(record_impressions(self.conn, "request-1", "review", [item]), 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
+
+    def test_shadow_visual_embedding_is_stored_without_overwriting_production(self):
+        url = "https://exhentai.org/g/9004/a/"
+        store_galleries(self.conn, [Gallery(url=url, gid="9004", token="a", title="Shadow")])
+        store_visual_embedding(self.conn, url, [1.0, *([0.0] * 15)])
+        production = self.conn.execute(
+            "SELECT visual_embedding_json, visual_embedding_version FROM galleries WHERE url = ?",
+            (url,),
+        ).fetchone()
+
+        store_visual_embedding_variant(
+            self.conn,
+            url,
+            [0.0, 3.0, *([0.0] * 14)],
+            version="siglip2-test-v1",
+            encoder="siglip2",
+            image_count=2,
+        )
+        shadow = self.conn.execute(
+            "SELECT * FROM gallery_visual_embeddings WHERE gallery_url = ?",
+            (url,),
+        ).fetchone()
+        current = self.conn.execute(
+            "SELECT visual_embedding_json, visual_embedding_version FROM galleries WHERE url = ?",
+            (url,),
+        ).fetchone()
+
+        self.assertEqual(tuple(current), tuple(production))
+        self.assertEqual(shadow["embedding_version"], "siglip2-test-v1")
+        self.assertEqual(shadow["encoder"], "siglip2")
+        self.assertEqual(shadow["dimensions"], 16)
+        self.assertEqual(shadow["image_count"], 2)
 
     def test_sklearn_model_outputs_calibrated_fields_when_available(self):
         try:

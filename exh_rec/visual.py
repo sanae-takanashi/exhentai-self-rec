@@ -10,11 +10,16 @@ from typing import Any
 
 SIMPLE_VISUAL_VERSION = "canvas-rgb-8x8-v1"
 DINOV2_VISUAL_VERSION = "dinov2-small-cls-v1"
+DINOV2_BAKEOFF_VISUAL_VERSION = f"{DINOV2_VISUAL_VERSION}-bakeoff-v1"
+SIGLIP2_VISUAL_VERSION = "siglip2-base-patch16-224-image-v1"
 DEFAULT_VISUAL_ENCODER = os.environ.get("EXH_REC_VISUAL_ENCODER", "dinov2")
 DINOV2_MODEL_NAME = os.environ.get("EXH_REC_DINOV2_MODEL", "facebook/dinov2-small")
+SIGLIP2_MODEL_NAME = os.environ.get("EXH_REC_SIGLIP2_MODEL", "google/siglip2-base-patch16-224")
 DEFAULT_DINOV2_DEVICE = os.environ.get("EXH_REC_DINOV2_DEVICE", "auto")
 _DINO_LOCK = threading.Lock()
 _DINO_STATE: dict[str, Any] = {}
+_SIGLIP2_LOCK = threading.Lock()
+_SIGLIP2_STATE: dict[str, Any] = {}
 
 
 class VisualEncoderUnavailable(RuntimeError):
@@ -196,6 +201,86 @@ def dinov2_embedding(image_blobs: list[bytes], device: str | None = None) -> lis
     return average_embeddings(dinov2_image_embeddings(image_blobs, device=device))
 
 
+def siglip2_image_embeddings(image_blobs: list[bytes], device: str | None = None) -> list[list[float]]:
+    if not image_blobs:
+        raise ValueError("at least one image is required")
+    processor, model, torch, Image = load_siglip2(device)
+    images = [Image.open(io.BytesIO(blob)).convert("RGB") for blob in image_blobs]
+    inputs = processor(images=images, return_tensors="pt")
+    resolved_device = next(model.parameters()).device
+    inputs = {key: value.to(resolved_device) for key, value in inputs.items()}
+    with torch.no_grad():
+        features = model.get_image_features(**inputs)
+    if hasattr(features, "pooler_output"):
+        features = features.pooler_output
+    elif hasattr(features, "image_embeds"):
+        features = features.image_embeds
+    elif isinstance(features, (tuple, list)):
+        features = features[1] if len(features) > 1 else features[0]
+    if not hasattr(features, "detach"):
+        raise VisualEncoderUnavailable(
+            f"SigLIP2 returned unsupported image features: {type(features).__name__}"
+        )
+    return [normalize_embedding(vector) for vector in features.detach().float().cpu().tolist()]
+
+
+def siglip2_embedding(image_blobs: list[bytes], device: str | None = None) -> list[float]:
+    return average_embeddings(siglip2_image_embeddings(image_blobs, device=device))
+
+
+def load_siglip2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
+    requested_device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
+    if _SIGLIP2_STATE.get("loaded") and _SIGLIP2_STATE.get("device_config") == requested_device:
+        return (
+            _SIGLIP2_STATE["processor"],
+            _SIGLIP2_STATE["model"],
+            _SIGLIP2_STATE["torch"],
+            _SIGLIP2_STATE["Image"],
+        )
+    with _SIGLIP2_LOCK:
+        if _SIGLIP2_STATE.get("loaded") and _SIGLIP2_STATE.get("device_config") == requested_device:
+            return (
+                _SIGLIP2_STATE["processor"],
+                _SIGLIP2_STATE["model"],
+                _SIGLIP2_STATE["torch"],
+                _SIGLIP2_STATE["Image"],
+            )
+        try:
+            import torch
+            from PIL import Image
+            from transformers import AutoModel, AutoProcessor
+        except Exception as exc:
+            raise VisualEncoderUnavailable(f"SigLIP2 dependencies are unavailable: {exc}") from exc
+        try:
+            resolved_device = resolve_dinov2_device(torch, requested_device)
+            processor = AutoProcessor.from_pretrained(SIGLIP2_MODEL_NAME)
+            model = AutoModel.from_pretrained(SIGLIP2_MODEL_NAME)
+            model.to(resolved_device)
+            model.eval()
+        except Exception as exc:
+            _SIGLIP2_STATE.clear()
+            _SIGLIP2_STATE.update(
+                {
+                    "device_config": requested_device,
+                    "load_error": f"SigLIP2 model is unavailable: {exc}",
+                }
+            )
+            raise VisualEncoderUnavailable(_SIGLIP2_STATE["load_error"]) from exc
+        _SIGLIP2_STATE.clear()
+        _SIGLIP2_STATE.update(
+            {
+                "loaded": True,
+                "device_config": requested_device,
+                "device": resolved_device,
+                "processor": processor,
+                "model": model,
+                "torch": torch,
+                "Image": Image,
+            }
+        )
+        return processor, model, torch, Image
+
+
 def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
     requested_device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
     if _DINO_STATE.get("loaded") and _DINO_STATE.get("device_config") == requested_device:
@@ -360,3 +445,7 @@ def resolve_dinov2_device(torch: Any, requested_device: str) -> str:
 
 def reset_dinov2_state_for_tests() -> None:
     _DINO_STATE.clear()
+
+
+def reset_siglip2_state_for_tests() -> None:
+    _SIGLIP2_STATE.clear()

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
+from .audit import low_interest_audit_report, record_visible_impressions
 from .exhentai import (
     Gallery,
     apply_gallery_metadata,
@@ -199,6 +200,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/queue-counts":
                 with db.connect() as conn:
                     self.send_json(queue_counts_payload(conn))
+            elif path == "/api/low-interest-audit":
+                with db.connect() as conn:
+                    self.send_json(low_interest_audit_report(conn))
             elif path == "/api/fetch-runs":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=10, lower=1, upper=100)
@@ -568,6 +572,16 @@ class Handler(BaseHTTPRequestHandler):
                         "mark_update": mark_update,
                     }
                 )
+            elif path == "/api/impressions/visible":
+                payload = self.read_json()
+                try:
+                    with db.connect() as conn:
+                        updated = record_visible_impressions(
+                            conn, payload.get("request_id"), payload.get("surface"), payload.get("items")
+                        )
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self.send_json({"ok": True, "updated": updated})
             elif path == "/api/impressions":
                 payload = self.read_json()
                 items = payload.get("items") or []
@@ -811,6 +825,9 @@ def get_settings() -> dict:
             "review_low_interest_percent": review_low_interest_percent(conn),
             "review_low_interest_auto_threshold": review_low_interest_auto_threshold(conn),
             "review_low_interest_max_percent": review_low_interest_max_percent(conn),
+            "review_low_interest_audit_enabled": review_low_interest_audit_enabled(conn),
+            "review_low_interest_audit_daily_count": review_low_interest_audit_daily_count(conn),
+            "low_interest_audit": low_interest_audit_report(conn),
             "preview_freshness_weight": preview_freshness_weight(conn),
             "preview_posted_after": preview_posted_after(conn),
             "hath_download_signal_weight": hath_download_signal_weight(conn),
@@ -859,6 +876,8 @@ def get_status() -> dict:
                 "review_low_interest_percent": review_low_interest_percent(conn),
                 "review_low_interest_auto_threshold": review_low_interest_auto_threshold(conn),
                 "review_low_interest_max_percent": review_low_interest_max_percent(conn),
+                "review_low_interest_audit_enabled": review_low_interest_audit_enabled(conn),
+                "review_low_interest_audit_daily_count": review_low_interest_audit_daily_count(conn),
                 "preview_freshness_weight": preview_freshness_weight(conn),
                 "preview_posted_after": preview_posted_after(conn),
                 "hath_download_signal_weight": hath_download_signal_weight(conn),
@@ -1009,6 +1028,17 @@ def save_settings(payload: dict[str, Any]) -> None:
                 payload["review_low_interest_max_percent"], default=35, lower=0, upper=90
             )
             db.set_setting(conn, "review_low_interest_max_percent", str(max_percent))
+        if "review_low_interest_audit_enabled" in payload:
+            db.set_setting(
+                conn,
+                "review_low_interest_audit_enabled",
+                "1" if parse_bool(payload["review_low_interest_audit_enabled"]) else "0",
+            )
+        if "review_low_interest_audit_daily_count" in payload:
+            audit_count = bounded_int(
+                payload["review_low_interest_audit_daily_count"], default=6, lower=5, upper=10
+            )
+            db.set_setting(conn, "review_low_interest_audit_daily_count", str(audit_count))
         if "preview_freshness_weight" in payload:
             weight = bounded_float(payload["preview_freshness_weight"], default=8.0, lower=0.0, upper=50.0)
             db.set_setting(conn, "preview_freshness_weight", str(weight))
@@ -3268,6 +3298,19 @@ def review_low_interest_max_percent(conn) -> int:
     return max(review_low_interest_percent(conn), configured)
 
 
+def review_low_interest_audit_enabled(conn) -> bool:
+    return db.get_setting(conn, "review_low_interest_audit_enabled", "1") == "1"
+
+
+def review_low_interest_audit_daily_count(conn) -> int:
+    return bounded_int(
+        db.get_setting(conn, "review_low_interest_audit_daily_count", "6"),
+        default=6,
+        lower=5,
+        upper=10,
+    )
+
+
 def preview_freshness_weight(conn) -> float:
     return bounded_float(db.get_setting(conn, "preview_freshness_weight", "8.0"), default=8.0, lower=0.0, upper=50.0)
 
@@ -3321,6 +3364,12 @@ def recommendation_payload(
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),
         interest_band=interest_band,
+        low_interest_audit_daily_count=(
+            review_low_interest_audit_daily_count(conn)
+            if review_low_interest_audit_enabled(conn)
+            else 0
+        ),
+        require_prospective_threshold_validation=True,
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     page["request_id"] = hashlib.sha256(
@@ -3521,6 +3570,7 @@ def queue_counts_payload(conn) -> dict[str, int]:
                            'recommend_model_mode', 'review_require_bootstrap_match',
                            'review_low_interest_percent',
                            'review_low_interest_auto_threshold', 'review_low_interest_max_percent',
+                           'review_low_interest_audit_enabled', 'review_low_interest_audit_daily_count',
                            'updates_shortlist_limit', 'updates_min_new_pages')) AS settings_version
         """
     ).fetchone()
@@ -3543,6 +3593,12 @@ def queue_counts_payload(conn) -> dict[str, int]:
         low_interest_percent=review_low_interest_percent(conn),
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),
+        low_interest_audit_daily_count=(
+            review_low_interest_audit_daily_count(conn)
+            if review_low_interest_audit_enabled(conn)
+            else 0
+        ),
+        require_prospective_threshold_validation=True,
     )
     short_repeats = short_repeat_page(
         conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates

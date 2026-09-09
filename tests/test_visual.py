@@ -11,6 +11,59 @@ from exh_rec.visual import (
 
 
 class VisualTest(unittest.TestCase):
+    def test_siglip2_image_embeddings_uses_model_image_features(self):
+        class FakeTensor:
+            def __init__(self, values=None):
+                self.values = values
+
+            def to(self, _device):
+                return self
+
+            def detach(self):
+                return self
+
+            def float(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return self.values
+
+        class FakeModel:
+            def parameters(self):
+                yield types.SimpleNamespace(device="cpu")
+
+            def get_image_features(self, **inputs):
+                self.inputs = inputs
+                return types.SimpleNamespace(pooler_output=FakeTensor([[3.0, 4.0]]))
+
+        class NoGrad:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class FakeImage:
+            def convert(self, _mode):
+                return self
+
+        fake_image_module = types.SimpleNamespace(open=lambda _stream: FakeImage())
+
+        model = FakeModel()
+        processor = lambda **_kwargs: {"pixel_values": FakeTensor()}
+        fake_torch = types.SimpleNamespace(no_grad=lambda: NoGrad())
+        original = visual.load_siglip2
+        visual.load_siglip2 = lambda _device=None: (processor, model, fake_torch, fake_image_module)
+        self.addCleanup(lambda: setattr(visual, "load_siglip2", original))
+
+        embeddings = visual.siglip2_image_embeddings([b"fake-image"], device="cpu")
+
+        self.assertEqual(embeddings, [[0.6, 0.8]])
+        self.assertIn("pixel_values", model.inputs)
+
     def test_normalize_dinov2_device_accepts_cpu_auto_and_cuda_index(self):
         self.assertEqual(normalize_dinov2_device(""), "auto")
         self.assertEqual(normalize_dinov2_device("AUTO"), "auto")

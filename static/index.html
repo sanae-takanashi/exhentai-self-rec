@@ -152,6 +152,16 @@
           Auto low-interest threshold
         </label>
 
+        <label class="check">
+          <input id="reviewLowInterestAuditEnabled" type="checkbox" checked>
+          Random tail audit
+        </label>
+
+        <label>
+          Audit items per opening day
+          <input id="reviewLowInterestAuditDailyCount" type="number" min="5" max="10" value="6">
+        </label>
+
         <label>
           Visual encoder
           <select id="visualEncoder">
@@ -397,6 +407,7 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js?v=20260831-3"></script>
+    <script src="/static/visibility.js?v=20260909-1"></script>
+    <script src="/static/app.js?v=20260909-1"></script>
   </body>
 </html>

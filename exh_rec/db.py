@@ -75,8 +75,65 @@ CREATE TABLE IF NOT EXISTS recommendation_impressions (
     position INTEGER NOT NULL,
     model_version TEXT,
     like_probability REAL,
+    feature_snapshot_id INTEGER REFERENCES gallery_feature_snapshots(id) ON DELETE SET NULL,
+    audit_id INTEGER,
+    ranking_context_json TEXT NOT NULL DEFAULT '{}',
+    visibility_protocol TEXT,
+    visible_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(request_id, gallery_url, surface)
+);
+
+CREATE TABLE IF NOT EXISTS low_interest_audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_date TEXT NOT NULL,
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'bottom-20-random',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'completed', 'incomplete')),
+    selection_probability REAL NOT NULL,
+    sampling_frame TEXT NOT NULL DEFAULT 'served-bottom-20',
+    frame_size INTEGER NOT NULL,
+    score_band_low REAL,
+    score_band_high REAL,
+    served_model TEXT,
+    served_rank_score REAL,
+    served_rank INTEGER,
+    legacy_score REAL,
+    legacy_rank INTEGER,
+    personalized_model_version TEXT,
+    personalized_like_probability REAL,
+    personalized_rank_score REAL,
+    personalized_rank INTEGER,
+    feature_snapshot_id INTEGER REFERENCES gallery_feature_snapshots(id) ON DELETE SET NULL,
+    selected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    exposed_at TEXT,
+    visible_at TEXT,
+    completed_at TEXT,
+    outcome_source TEXT,
+    outcome_positive INTEGER CHECK(outcome_positive IN (0, 1)),
+    feedback_id INTEGER,
+    UNIQUE(audit_date, gallery_url)
+);
+
+CREATE TABLE IF NOT EXISTS low_interest_audit_days (
+    audit_date TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS low_interest_audit_slots (
+    audit_date TEXT NOT NULL REFERENCES low_interest_audit_days(audit_date) ON DELETE CASCADE,
+    audit_id INTEGER NOT NULL REFERENCES low_interest_audits(id) ON DELETE CASCADE,
+    PRIMARY KEY(audit_date, audit_id)
+);
+
+CREATE TABLE IF NOT EXISTS low_interest_memberships (
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    policy_key TEXT NOT NULL,
+    cutoff_percent INTEGER NOT NULL,
+    assigned_score REAL,
+    assigned_model TEXT,
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(gallery_url, policy_key)
 );
 
 CREATE TABLE IF NOT EXISTS model_training_runs (
@@ -100,6 +157,18 @@ CREATE TABLE IF NOT EXISTS gallery_visual_images (
     embedding_version TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY(gallery_url, image_key, embedding_version)
+);
+
+CREATE TABLE IF NOT EXISTS gallery_visual_embeddings (
+    gallery_url TEXT NOT NULL REFERENCES galleries(url) ON DELETE CASCADE,
+    embedding_version TEXT NOT NULL,
+    encoder TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    embedding_digest TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    image_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(gallery_url, embedding_version)
 );
 
 CREATE TABLE IF NOT EXISTS gallery_feature_snapshots (
@@ -230,7 +299,13 @@ CREATE INDEX IF NOT EXISTS idx_feedback_gallery ON feedback(gallery_url, created
 CREATE INDEX IF NOT EXISTS idx_feedback_gallery_id ON feedback(gallery_url, id DESC);
 CREATE INDEX IF NOT EXISTS idx_impressions_created ON recommendation_impressions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_impressions_gallery ON recommendation_impressions(gallery_url, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_low_interest_audits_date ON low_interest_audits(audit_date DESC, status);
+CREATE INDEX IF NOT EXISTS idx_low_interest_audits_gallery ON low_interest_audits(gallery_url, selected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_low_interest_memberships_policy
+    ON low_interest_memberships(policy_key, assigned_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_training_created ON model_training_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gallery_visual_embeddings_version
+    ON gallery_visual_embeddings(embedding_version, gallery_url);
 CREATE INDEX IF NOT EXISTS idx_gallery_marks_kind ON gallery_marks(kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gallery_snapshots_lookup
     ON gallery_feature_snapshots(gallery_url, captured_at DESC, id DESC);
@@ -285,6 +360,17 @@ def init_db() -> None:
         ensure_column(conn, "feedback", "score", "INTEGER")
         ensure_column(conn, "feedback", "reason_code", "TEXT")
         ensure_column(conn, "feedback", "surface", "TEXT")
+        ensure_column(conn, "recommendation_impressions", "feature_snapshot_id", "INTEGER")
+        ensure_column(conn, "recommendation_impressions", "audit_id", "INTEGER")
+        ensure_column(conn, "recommendation_impressions", "visibility_protocol", "TEXT")
+        ensure_column(conn, "recommendation_impressions", "visible_at", "TEXT")
+        ensure_column(conn, "low_interest_audits", "visible_at", "TEXT")
+        ensure_column(
+            conn,
+            "recommendation_impressions",
+            "ranking_context_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
         ensure_column(conn, "galleries", "title_jpn", "TEXT")
         ensure_column(conn, "galleries", "parent_url", "TEXT")
         ensure_column(conn, "galleries", "review_excluded", "INTEGER NOT NULL DEFAULT 0")
@@ -344,6 +430,8 @@ def init_db() -> None:
             "review_low_interest_percent": "20",
             "review_low_interest_auto_threshold": "1",
             "review_low_interest_max_percent": "35",
+            "review_low_interest_audit_enabled": "1",
+            "review_low_interest_audit_daily_count": "6",
         }
         for key, value in defaults.items():
             conn.execute(

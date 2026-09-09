@@ -94,7 +94,10 @@ def normalize_reason_code(value: object) -> str | None:
 
 def normalize_surface(value: object, default: str = "review") -> str:
     surface = str(value or default).strip().lower().replace("_", "-")
-    if surface not in {"review", "discovery", "updates", "preview", "history", "favorite", "ban", "api"}:
+    if surface not in {
+        "review", "low-interest", "audit", "discovery", "updates", "preview",
+        "history", "favorite", "ban", "api",
+    }:
         return default
     return surface
 

@@ -1071,6 +1071,18 @@ button.danger:hover {
   color: #f0b0b5;
 }
 
+.retained-interest-badge {
+  border-color: #6687a8;
+  background: #172431;
+  color: #b6d2ec;
+}
+
+.audit-badge {
+  border-color: #c58b23;
+  background: #2d2415;
+  color: #f2c76e;
+}
+
 .interest-policy-status {
   display: flex;
   flex-wrap: wrap;

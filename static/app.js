@@ -10,6 +10,8 @@ const candidateLimitEl = document.querySelector("#candidateLimit");
 const reviewLowInterestPercentEl = document.querySelector("#reviewLowInterestPercent");
 const reviewLowInterestMaxPercentEl = document.querySelector("#reviewLowInterestMaxPercent");
 const reviewLowInterestAutoThresholdEl = document.querySelector("#reviewLowInterestAutoThreshold");
+const reviewLowInterestAuditEnabledEl = document.querySelector("#reviewLowInterestAuditEnabled");
+const reviewLowInterestAuditDailyCountEl = document.querySelector("#reviewLowInterestAuditDailyCount");
 const updatesShortlistLimitEl = document.querySelector("#updatesShortlistLimit");
 const updatesMinNewPagesEl = document.querySelector("#updatesMinNewPages");
 const previewFreshnessWeightEl = document.querySelector("#previewFreshnessWeight");
@@ -160,9 +162,11 @@ const staticTooltips = {
   detailLimit: "Maximum galleries per fetch to enrich with full detail metadata and sample thumbnails.",
   learnedLimit: "Maximum learned positive tags to add as extra remote fetch queries.",
   candidateLimit: "Number of local candidate galleries considered when ranking recommendations.",
-  reviewLowInterestPercent: "Move this bottom percentage of the current Review ranking into Low Interest. Set to 0 to disable the percentile split.",
+  reviewLowInterestPercent: "Move this bottom percentage into Low Interest and retain that assignment while the Review backlog is drained. Set to 0 to disable the percentile split.",
   reviewLowInterestMaxPercent: "Maximum combined Low Interest share after the learned threshold adds galleries beyond the bottom percentage.",
   reviewLowInterestAutoThreshold: "Use a validated probability threshold learned during periodic model training. It falls back to the bottom percentage when validation is unavailable.",
+  reviewLowInterestAuditEnabled: "Randomly return a probability-recorded sample from the current bottom band to Review for unbiased tail labels.",
+  reviewLowInterestAuditDailyCount: "Number of random tail audits selected each local day the recommender is opened. Exposure, completion, and sampling probability are retained.",
   previewFreshnessWeight: "Freshness boost used only in Preview. Higher values push newer galleries above older strong matches.",
   previewPostedAfter: "Optional Preview cutoff. When set, Preview only shows galleries posted on or after this date.",
   sampleExtraPages: "Additional gallery sample pages to inspect for preview images on large galleries.",
@@ -464,10 +468,13 @@ async function loadSettings() {
   const settings = await api("/api/settings");
   const supportsLowInterest = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_percent");
   const supportsLowInterestThreshold = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_auto_threshold");
+  const supportsLowInterestAudit = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_audit_enabled");
   lowInterestTab.hidden = !supportsLowInterest;
   reviewLowInterestPercentEl.closest("label").hidden = !supportsLowInterest;
   reviewLowInterestMaxPercentEl.closest("label").hidden = !supportsLowInterestThreshold;
   reviewLowInterestAutoThresholdEl.closest("label").hidden = !supportsLowInterestThreshold;
+  reviewLowInterestAuditEnabledEl.closest("label").hidden = !supportsLowInterestAudit;
+  reviewLowInterestAuditDailyCountEl.closest("label").hidden = !supportsLowInterestAudit;
   applyVisualSettings(settings.visual);
   cookiePreviewEl.textContent = cookiePreviewText(settings);
   tagsEl.value = bootstrapText(settings.bootstrap_tags);
@@ -479,6 +486,8 @@ async function loadSettings() {
   reviewLowInterestPercentEl.value = supportsLowInterest ? settings.review_low_interest_percent : 20;
   reviewLowInterestMaxPercentEl.value = supportsLowInterestThreshold ? settings.review_low_interest_max_percent : 35;
   reviewLowInterestAutoThresholdEl.checked = supportsLowInterestThreshold && settings.review_low_interest_auto_threshold !== false;
+  reviewLowInterestAuditEnabledEl.checked = supportsLowInterestAudit && settings.review_low_interest_audit_enabled !== false;
+  reviewLowInterestAuditDailyCountEl.value = supportsLowInterestAudit ? settings.review_low_interest_audit_daily_count : 6;
   updatesShortlistLimitEl.value = settings.updates_shortlist_limit ?? 40;
   updatesMinNewPagesEl.value = settings.updates_min_new_pages ?? 50;
   previewFreshnessWeightEl.value = settings.preview_freshness_weight ?? 8;
@@ -536,6 +545,8 @@ async function saveSettings() {
     review_low_interest_percent: Number(reviewLowInterestPercentEl.value),
     review_low_interest_max_percent: Number(reviewLowInterestMaxPercentEl.value),
     review_low_interest_auto_threshold: reviewLowInterestAutoThresholdEl.checked,
+    review_low_interest_audit_enabled: reviewLowInterestAuditEnabledEl.checked,
+    review_low_interest_audit_daily_count: Number(reviewLowInterestAuditDailyCountEl.value),
     updates_shortlist_limit: Number(updatesShortlistLimitEl.value),
     updates_min_new_pages: Number(updatesMinNewPagesEl.value),
     preview_freshness_weight: Number(previewFreshnessWeightEl.value),
@@ -657,7 +668,7 @@ function viewCopy(view) {
   if (view === "low-interest") {
     return {
       title: "Low Interest",
-      subtitle: "Cover-first triage for the bottom part of the current model ranking.",
+      subtitle: "Cover-first triage for the current tail plus earlier tail assignments kept out of normal Review.",
       empty: "No galleries are currently in the low-interest band.",
       loaded: "low-interest galleries loaded",
     };
@@ -694,13 +705,18 @@ function renderLowInterestPolicy(policy, view = currentView) {
     return;
   }
   const validation = policy.validation || {};
+  const prospective = policy.prospective_validation || {};
   const fallbackPercent = Number(reviewLowInterestPercentEl.value || 0);
+  const retainedCount = Number(policy.retained_added_count || 0);
+  const retentionText = retainedCount > 0
+    ? ` · ${retainedCount} kept from earlier tail rankings`
+    : "";
   if (policy.active) {
     const thresholdPercent = Math.round(Number(policy.threshold || 0) * 100);
     const sampleCount = Number(validation.sample_count || 0);
     const positiveRate = Number(validation.positive_rate || 0) * 100;
     lowInterestPolicyTitleEl.textContent = `Auto threshold <= ${thresholdPercent}%`;
-    lowInterestPolicyDetailEl.textContent = `${sampleCount} temporal validation samples · estimated positives ${positiveRate.toFixed(1)}% · combined cap ${Number(policy.max_percent || 0)}%`;
+    lowInterestPolicyDetailEl.textContent = `${sampleCount} temporal validation samples · estimated positives ${positiveRate.toFixed(1)}% · ${Number(prospective.completed_samples || 0)} audited · Wilson upper ${(Number(prospective.positive_rate_upper_95 || 0) * 100).toFixed(1)}%${retentionText}`;
     return;
   }
   const reasonText = {
@@ -712,9 +728,21 @@ function renderLowInterestPolicy(policy, view = currentView) {
     "oof-calibration-unavailable": "temporal folds are not fully calibrated",
     "safety-target-not-met": "no threshold currently meets the false-omission limits",
     "requires-hybrid-mode": "automatic threshold requires Hybrid mode",
+    "audit-insufficient-duration": "tail audit has not covered four weeks yet",
+    "audit-insufficient-active-days": "tail audit has too few active opening days",
+    "prospective-threshold-cohort-unavailable": "candidate threshold cohort is unavailable or mixed",
+    "prospective-candidate-protocol-unavailable": "candidate-region prospective validation is not implemented",
+    "audit-insufficient-samples": "tail audit has fewer than 150 completed samples",
+    "audit-insufficient-temporal-folds": "fewer than three non-overlapping audit folds are complete",
+    "audit-wilson-limit-exceeded": "tail positive-rate Wilson upper bound exceeds 10%",
+    "prospective-positive-loss-exceeded": "prospective threshold positive loss exceeds 5%",
+    "prospective-threshold-insufficient-exposure": "fewer than 30 distinct candidate-threshold galleries were exposed",
   }[policy.status] || "validated threshold is unavailable";
-  lowInterestPolicyTitleEl.textContent = `Bottom ${fallbackPercent}% only`;
-  lowInterestPolicyDetailEl.textContent = reasonText;
+  lowInterestPolicyTitleEl.textContent = `Stable bottom ${fallbackPercent}%`;
+  const auditProgress = prospective.completed_samples != null
+    ? ` · ${Number(prospective.completed_samples)} audited · ${Number(prospective.eligible_fold_count || 0)} folds`
+    : "";
+  lowInterestPolicyDetailEl.textContent = `${reasonText}${auditProgress}${retentionText}`;
 }
 
 function loadQueueCounts() {
@@ -1861,7 +1889,7 @@ async function vote(galleryUrl, voteValue) {
         gallery_url: galleryUrl,
         vote: voteValue,
         reason_code: voteValue < 0 ? optionalNegativeReason(galleryUrl) : null,
-        surface: currentView,
+        surface: feedbackSurface(galleryUrl),
         view: currentView,
         include_rated: false,
         enrich_feedback: true,
@@ -1883,7 +1911,7 @@ async function score(galleryUrl, scoreValue) {
         gallery_url: galleryUrl,
         score: scoreValue,
         reason_code: scoreValue < 3 ? optionalNegativeReason(galleryUrl) : null,
-        surface: currentView,
+        surface: feedbackSurface(galleryUrl),
         view: currentView,
         include_rated: false,
         enrich_feedback: true,
@@ -1904,7 +1932,7 @@ async function skip(galleryUrl) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: 3,
-        surface: currentView,
+        surface: feedbackSurface(galleryUrl),
         view: currentView,
         include_rated: false,
         enrich_feedback: false,
@@ -2036,6 +2064,11 @@ function optionalNegativeReason(galleryUrl) {
   return select && select.value ? select.value : null;
 }
 
+function feedbackSurface(galleryUrl) {
+  const item = renderedGalleryItems.find((entry) => entry && entry.url === galleryUrl);
+  return item && item.audit_id ? "audit" : currentView;
+}
+
 async function loadDiscovery(offset = 0, append = false) {
   const localFilter = localFilterEl.value.trim();
   const languageFilter = languageFilterEl.value.trim();
@@ -2051,18 +2084,57 @@ function recordPageImpressions(payload, surface, offset = 0) {
   if (!payload.request_id || !Array.isArray(payload.items) || !payload.items.length) {
     return;
   }
+  const entries = payload.items.map((item) => ({
+    gallery_url: item.url,
+    element: recommendationsEl.querySelector(`[data-gallery-url="${CSS.escape(item.url)}"]`),
+  })).filter((entry) => entry.element);
   api("/api/impressions", {
     method: "POST",
     body: JSON.stringify({
       request_id: payload.request_id,
       surface,
       items: payload.items.map((item, index) => ({
+        visibility_protocol: "viewport-v1",
         gallery_url: item.url,
         position: offset + index,
         model_version: item.model_version,
         like_probability: item.like_probability,
+        audit_id: item.audit_id,
+        audit_source: item.audit_source,
+        audit_selection_probability: item.audit_selection_probability,
+        audit_sampling_frame: item.audit_sampling_frame,
+        audit_selected_date: item.audit_selected_date,
+        audit_carried: item.audit_carried,
+        audit_original_low_interest: item.audit_original_low_interest,
+        audit_original_low_interest_reason: item.audit_original_low_interest_reason,
+        served_model: item.served_model,
+        served_rank_score: item.served_rank_score,
+        served_rank: item.served_rank,
+        legacy_score: item.legacy_score,
+        legacy_rank: item.legacy_rank,
+        legacy_percentile: item.legacy_percentile,
+        legacy_bottom_20: item.legacy_bottom_20,
+        personalized_model_version: item.personalized_model_version,
+        personalized_like_probability: item.personalized_like_probability,
+        personalized_rank_score: item.personalized_rank_score,
+        personalized_rank: item.personalized_rank,
+        personalized_percentile: item.personalized_percentile,
+        personalized_bottom_20: item.personalized_bottom_20,
+        low_interest: item.low_interest,
+        low_interest_percentile: item.low_interest_percentile,
+        low_interest_reason: item.low_interest_reason,
+        prospective_threshold: item.prospective_threshold,
+        prospective_threshold_model_version: item.prospective_threshold_model_version,
+        prospective_threshold_triage: item.prospective_threshold_triage,
       })),
     }),
+  }).then(() => {
+    observeVisibleCards(entries.filter((entry) => entry.element.isConnected), (gallery_url) =>
+      api("/api/impressions/visible", {
+        method: "POST",
+        body: JSON.stringify({ request_id: payload.request_id, surface, items: [{ gallery_url }] }),
+      })
+    );
   }).catch(() => null);
 }
 
@@ -2332,6 +2404,7 @@ function renderGalleryCards(items, append = false) {
   }
   for (const item of items) {
     const card = document.createElement("article");
+    card.dataset.galleryUrl = item.url;
     card.className = lowInterestMode ? "card low-interest-card" : "card";
     const thumbContent = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
@@ -2463,7 +2536,12 @@ function renderGalleryCards(items, append = false) {
     const lowInterestBadge = lowInterestMode
       ? item.low_interest_reason === "learned-threshold"
         ? `<div class="interest-badge learned-threshold-badge">Very Low · model &le; ${Math.round(Number(item.low_interest_threshold || 0) * 100)}% · rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
+        : item.low_interest_reason === "retained-percentile"
+        ? `<div class="interest-badge retained-interest-badge">Kept Low · previously bottom ${Number(item.low_interest_cutoff_percent || 0)}% · current rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
         : `<div class="interest-badge">Bottom ${Number(item.low_interest_cutoff_percent || 0)}% · rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
+      : "";
+    const auditBadge = item.audit_id
+      ? `<div class="interest-badge audit-badge">Random tail audit · p=${Number(item.audit_selection_probability || 0).toFixed(3)}</div>`
       : "";
     card.innerHTML = `
       <div class="media-preview">
@@ -2472,6 +2550,7 @@ function renderGalleryCards(items, append = false) {
       </div>
       <div class="body">
         ${lowInterestBadge}
+        ${auditBadge}
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
         <div class="meta">${scoreMeta}</div>
         ${classifierSampleMeta}

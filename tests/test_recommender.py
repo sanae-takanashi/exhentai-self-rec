@@ -2068,6 +2068,43 @@ class RecommenderTest(unittest.TestCase):
         self.assertEqual(primary["total"], 2)
         self.assertEqual(low["total"], 0)
 
+    def test_low_interest_membership_does_not_leak_when_high_ranked_items_are_reviewed(self):
+        galleries = [
+            Gallery(
+                url=f"https://exhentai.org/g/sticky-{index}/a/",
+                gid=f"sticky-{index}",
+                token="a",
+                title=f"Gallery {index}",
+            )
+            for index in range(10)
+        ]
+        store_galleries(self.conn, galleries)
+
+        initial = recommend_page(self.conn, limit=20, low_interest_percent=20)
+        initial_low_urls = {
+            item["url"] for item in initial["items"] if item["low_interest"]
+        }
+        initial_primary_urls = [
+            item["url"] for item in initial["items"] if not item["low_interest"]
+        ]
+        self.assertEqual(len(initial_low_urls), 2)
+
+        for gallery_url in initial_primary_urls[:6]:
+            record_feedback(self.conn, gallery_url, score=3, retrain=False)
+
+        remaining = recommend_page(self.conn, limit=20, low_interest_percent=20)
+        remaining_low_urls = {
+            item["url"] for item in remaining["items"] if item["low_interest"]
+        }
+
+        self.assertTrue(initial_low_urls <= remaining_low_urls)
+        self.assertEqual(remaining["low_interest_policy"]["percentile_count"], 1)
+        self.assertEqual(remaining["low_interest_policy"]["retained_added_count"], 1)
+        retained = [
+            item for item in remaining["items"] if item["low_interest_reason"] == "retained-percentile"
+        ]
+        self.assertEqual(len(retained), 1)
+
     def test_learned_threshold_adds_very_low_items_with_combined_cap(self):
         scored = [
             {
