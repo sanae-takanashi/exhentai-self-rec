@@ -1,17 +1,82 @@
 import unittest
+import subprocess
 from unittest.mock import call, patch
 
 from hath_observer.archive import (
+    ArchiveCommandError,
     ArchiveError,
     PURGE_TRASH_CONFIRMATION,
     build_plan,
     build_trash_plan,
     execute_plan,
     execute_trash_plan,
+    ensure_mega_directory,
     mega_remote_file,
     normalize_request,
     purge_archive_trash,
+    run_checked,
 )
+
+
+class MegaDirectoryTest(unittest.TestCase):
+    def test_root_needs_no_command(self):
+        with patch("hath_observer.archive.run_checked") as run:
+            ensure_mega_directory("/")
+        run.assert_not_called()
+
+    @patch("hath_observer.archive.command_path", side_effect=lambda name: name)
+    def test_new_directory(self, paths):
+        with patch("hath_observer.archive.run_checked", return_value="") as run:
+            ensure_mega_directory("/H@H Archives")
+        run.assert_called_once_with(["mega-mkdir", "-p", "/H@H Archives"])
+
+    @patch("hath_observer.archive.command_path", side_effect=lambda name: name)
+    def test_existing_directory_requires_exact_type_checked_readback(self, paths):
+        with patch("hath_observer.archive.run_checked", side_effect=[
+            ArchiveCommandError(54, "exists"),
+            "/H@H Archives\n/H@H Archives/child\n",
+        ]) as run:
+            ensure_mega_directory("/H@H Archives")
+        self.assertEqual(run.call_args_list, [
+            call(["mega-mkdir", "-p", "/H@H Archives"]),
+            call(["mega-find", "/H@H Archives", "--type=d"]),
+        ])
+
+    @patch("hath_observer.archive.command_path", side_effect=lambda name: name)
+    def test_file_or_inexact_directory_does_not_pass(self, paths):
+        for listing in ("", "/H@H Archives/child\n", "/H@H Archives extra\n"):
+            with self.subTest(listing=listing), patch(
+                "hath_observer.archive.run_checked",
+                side_effect=[ArchiveCommandError(54, "exists"), listing],
+            ):
+                with self.assertRaisesRegex(ArchiveError, "not a verified directory"):
+                    ensure_mega_directory("/H@H Archives")
+
+    @patch("hath_observer.archive.command_path", side_effect=lambda name: name)
+    def test_other_errors_are_not_swallowed(self, paths):
+        for code in (1, 51, 53, 57):
+            with self.subTest(code=code), patch(
+                "hath_observer.archive.run_checked",
+                side_effect=ArchiveCommandError(code, "failed"),
+            ) as run:
+                with self.assertRaises(ArchiveCommandError):
+                    ensure_mega_directory("/H@H Archives")
+                self.assertEqual(run.call_count, 1)
+
+    @patch("hath_observer.archive.command_path", side_effect=lambda name: name)
+    def test_readback_failure_stops_upload(self, paths):
+        with patch("hath_observer.archive.run_checked", side_effect=[
+            ArchiveCommandError(54, "exists"), ArchiveCommandError(53, "missing"),
+        ]):
+            with self.assertRaises(ArchiveCommandError):
+                ensure_mega_directory("/H@H Archives")
+
+    def test_run_checked_preserves_numeric_error_code(self):
+        with patch("hath_observer.archive.subprocess.run", return_value=
+                   subprocess.CompletedProcess(["mega-mkdir"], 54, "already exists")):
+            with self.assertRaises(ArchiveCommandError) as caught:
+                run_checked(["mega-mkdir"])
+        self.assertEqual(caught.exception.returncode, 54)
 
 
 class HathArchiveHelperTest(unittest.TestCase):
@@ -194,8 +259,8 @@ class HathArchiveHelperTest(unittest.TestCase):
             delete.call_args_list,
             [call("/archives/.trash/job-one"), call("/archives/.trash/job-two")],
         )
-        self.assertEqual(emit.call_args_list[-1].args, ("result",))
-        self.assertEqual(emit.call_args_list[-1].kwargs["result"]["freed_bytes"], 800)
+        self.assertEqual(emit.call_args_list[-1][0], ("result",))
+        self.assertEqual(emit.call_args_list[-1][1]["result"]["freed_bytes"], 800)
 
     def test_execute_plan_permanently_deletes_only_after_successful_upload(self):
         plan = {

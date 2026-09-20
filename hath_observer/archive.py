@@ -38,6 +38,12 @@ class ArchiveError(RuntimeError):
     pass
 
 
+class ArchiveCommandError(ArchiveError):
+    def __init__(self, returncode, message):
+        super().__init__(message)
+        self.returncode = returncode
+
+
 def emit(event, **values):
     payload = {"schema": SCHEMA, "event": event}
     payload.update(values)
@@ -455,10 +461,25 @@ def run_checked(command, cwd=None):
     )
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
-        raise ArchiveError(
+        raise ArchiveCommandError(
+            completed.returncode,
             "Command failed with code {0}: {1}".format(completed.returncode, output or command[0])
         )
     return output
+
+
+def ensure_mega_directory(destination):
+    if destination == "/":
+        return
+    try:
+        run_checked([command_path("mega-mkdir"), "-p", destination])
+    except ArchiveCommandError as exc:
+        if exc.returncode != 54:
+            raise
+        # MEGAcmd can return EEXIST even with -p. Verify the exact node type.
+        directories = run_checked([command_path("mega-find"), destination, "--type=d"])
+        if destination not in directories.splitlines():
+            raise ArchiveError("MEGA destination is not a verified directory: {0}".format(destination))
 
 
 def stage_existing_zip(source, destination):
@@ -548,8 +569,7 @@ def execute_plan(plan, download_dir, archive_dir):
             stage="preparing-upload",
             message="Preparing MEGA destination {0}".format(destination),
         )
-        if destination != "/":
-            run_checked([command_path("mega-mkdir"), "-p", destination])
+        ensure_mega_directory(destination)
         emit("progress", stage="uploading", message="Uploading archive to {0}".format(remote_file))
         output = run_checked(
             [command_path("mega-put"), archive_path, remote_file]
