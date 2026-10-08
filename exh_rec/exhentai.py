@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import random
 import re
@@ -89,6 +90,70 @@ class Gallery:
     sample_thumbs: list = field(default_factory=list)
     title_jpn: str | None = None
     parent_url: str | None = None
+
+
+class GalleryBatch(list[Gallery]):
+    def __init__(self, galleries=(), *, next_url: str | None = None):
+        super().__init__(galleries)
+        self.next_url = next_url
+
+
+class SearchNextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+        self.navigation_links: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag.lower() != "a":
+            return
+        attributes = dict(attrs)
+        href = attributes.get("href")
+        if not href:
+            return
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(href).query)
+        if attributes.get("id") in {"unext", "dnext"}:
+            self.navigation_links.append(href)
+        elif "next" in params and not ({"jump", "seek", "prev"} & params.keys()):
+            self.links.append(href)
+
+
+def validate_search_next_url(url: str, query: str | None = None) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    cursor = params.get("next", [])
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "exhentai.org"
+        or parsed.path != "/"
+        or parsed.fragment
+        or len(cursor) != 1
+        or not re.fullmatch(r"[1-9][0-9]{0,19}", cursor[0])
+        or params.get("f_search", [""]) != [query or ""]
+        or "prev" in params
+        or "page" in params
+    ):
+        raise RuntimeError("Invalid gallery pagination link")
+    return url
+
+
+def parse_search_next_url(page_html: str, current_url: str, query: str | None = None) -> str | None:
+    parser = SearchNextParser()
+    parser.feed(page_html)
+    links = {
+        validate_search_next_url(urllib.parse.urljoin(current_url, link), query)
+        for link in (parser.navigation_links or parser.links)
+    }
+    if not links:
+        return None
+    if len(links) != 1:
+        raise RuntimeError("Conflicting gallery pagination links")
+    next_url = links.pop()
+    current_cursor = urllib.parse.parse_qs(urllib.parse.urlsplit(current_url).query).get("next")
+    next_cursor = urllib.parse.parse_qs(urllib.parse.urlsplit(next_url).query)["next"][0]
+    if current_cursor and int(next_cursor) >= int(current_cursor[0]):
+        raise RuntimeError("Gallery pagination did not advance")
+    return next_url
 
 
 class LinkTitleParser(HTMLParser):
@@ -237,15 +302,26 @@ def is_cookie_name(value: str) -> bool:
 
 
 def build_search_url(query: str | None = None, page: int = 0) -> str:
+    if page:
+        raise ValueError("Numeric search pages are unsupported; follow the next link")
     params: dict[str, str] = {}
     if query:
         params["f_search"] = query
-    if page:
-        params["page"] = str(page)
     return BASE_URL + ("?" + urllib.parse.urlencode(params) if params else "")
 
 
 def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str = "") -> str:
+    for attempt in range(3):
+        try:
+            return _fetch_page_once(cookie_header, url, timeout=timeout, proxy_url=proxy_url)
+        except (http.client.IncompleteRead, ConnectionResetError):
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError("Page response retries exhausted")
+
+
+def _fetch_page_once(cookie_header: str, url: str, timeout: int = 30, proxy_url: str = "") -> str:
     request = urllib.request.Request(
         url,
         headers={
@@ -279,20 +355,39 @@ def fetch_galleries(
     start_page: int = 0,
     delay: float = 1.0,
     proxy_url: str = "",
-) -> list[Gallery]:
+    next_url: str | None = None,
+) -> GalleryBatch:
     galleries: list[Gallery] = []
     seen: set[str] = set()
     start_page = max(0, int(start_page))
     page_count = max(1, int(pages))
-    for page in range(start_page, start_page + page_count):
-        page_html = fetch_page(cookie_header, build_search_url(query, page), proxy_url=proxy_url)
-        for gallery in parse_gallery_list(page_html, source_query=query):
+    url = validate_search_next_url(next_url, query) if next_url else build_search_url(query)
+    if next_url and start_page:
+        raise ValueError("Use either a continuation URL or a start-page offset")
+    seen_pages: set[tuple[str, ...]] = set()
+    following = None
+    for page in range(start_page + page_count):
+        page_html = fetch_page(cookie_header, url, proxy_url=proxy_url)
+        batch = parse_gallery_list(page_html, source_query=query)
+        if not batch and not re.search(r"\bNo hits found\b", page_html, re.I):
+            raise RuntimeError("No gallery listings or explicit empty-search result; check ExHentai access")
+        signature = tuple(sorted(gallery.url for gallery in batch))
+        if batch and signature in seen_pages:
+            raise RuntimeError("Gallery pagination repeated a result page")
+        seen_pages.add(signature)
+        following = parse_search_next_url(page_html, url, query)
+        if not batch and following:
+            raise RuntimeError("Empty gallery page has a continuation link")
+        for gallery in (batch if page >= start_page else []):
             if gallery.url not in seen:
                 galleries.append(gallery)
                 seen.add(gallery.url)
+        if not following:
+            break
         if page + 1 < start_page + page_count:
             time.sleep(delay)
-    return galleries
+            url = following
+    return GalleryBatch(galleries, next_url=following)
 
 
 def post_api_json(cookie_header: str, payload: dict, timeout: int = 30, proxy_url: str = "") -> dict:

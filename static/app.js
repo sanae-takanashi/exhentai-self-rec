@@ -2932,6 +2932,9 @@ function renderStatus(payload) {
     if (last.errors && last.errors.length) {
       rows.push(["Errors", last.errors.join(" | ")]);
     }
+    if (last.cursor_incomplete_queries && last.cursor_incomplete_queries.length) {
+      rows.push(["Catch-up pending", last.cursor_incomplete_queries.join(", ")]);
+    }
   } else {
     rows.push(["Last", "No fetch yet"]);
   }
@@ -2949,7 +2952,7 @@ function renderStatus(payload) {
     rows.push([
       "Plan",
       plan.entries
-        .map((entry) => `${entry.query || "recent"}${entry.cursor_caught_up === false ? " [catch-up pending]" : ""}`)
+        .map((entry) => `${entry.query || "recent"}${entry.cursor_resumable ? " [resume pending]" : entry.cursor_caught_up === false ? " [catch-up pending]" : ""}`)
         .join(", "),
     ]);
     rows.push(["Scope", `${plan.pages} initial page(s), +${plan.stale_fetch_extra_pages || 0} cursor catch-up, ${plan.detail_fetch_limit} details`]);

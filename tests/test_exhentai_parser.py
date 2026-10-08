@@ -319,15 +319,21 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["gallery_count"], 1)
 
-    def test_fetch_galleries_supports_start_page_offset(self):
-        html = '<a class="glink" href="https://exhentai.org/g/1/abcdef/">Visible Gallery</a>'
-        with patch("exh_rec.exhentai.fetch_page", return_value=html) as fetch:
+    def test_fetch_galleries_supports_start_page_offset_using_next_links(self):
+        pages = [
+            f'<a class="glink" href="https://exhentai.org/g/{100-index}/abcdef/">Gallery</a>'
+            + (f'<a id="unext" href="/?f_search=artist%3Atest&amp;next={99-index}">Next</a>' if index < 6 else "")
+            for index in range(7)
+        ]
+        with patch("exh_rec.exhentai.fetch_page", side_effect=pages) as fetch:
             galleries = fetch_galleries("ipb_member_id=1", query="artist:test", pages=2, start_page=5, delay=0)
 
-        self.assertEqual(len(galleries), 1)
+        self.assertEqual([g.gid for g in galleries], ["95", "94"])
         fetched_urls = [call.args[1] for call in fetch.call_args_list]
-        self.assertIn("page=5", fetched_urls[0])
-        self.assertIn("page=6", fetched_urls[1])
+        self.assertEqual(len(fetched_urls), 7)
+        self.assertTrue(all("page=" not in url for url in fetched_urls))
+        self.assertIn("next=95", fetched_urls[5])
+        self.assertIsNone(galleries.next_url)
 
     def test_fetch_page_detects_temporary_rate_ban_body(self):
         class Headers:

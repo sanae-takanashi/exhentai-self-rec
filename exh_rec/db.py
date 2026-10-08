@@ -271,6 +271,7 @@ CREATE TABLE IF NOT EXISTS fetch_runs (
     stored_count INTEGER NOT NULL DEFAULT 0,
     enriched_count INTEGER NOT NULL DEFAULT 0,
     errors_json TEXT NOT NULL DEFAULT '[]',
+    cursor_incomplete_queries_json TEXT NOT NULL DEFAULT '[]',
     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
 );
@@ -283,6 +284,10 @@ CREATE TABLE IF NOT EXISTS fetch_query_state (
     caught_up INTEGER NOT NULL DEFAULT 1,
     last_page_count INTEGER NOT NULL DEFAULT 0,
     last_success_at TEXT,
+    resume_url TEXT,
+    pending_anchor_urls_json TEXT NOT NULL DEFAULT '[]',
+    matched_anchor_urls_json TEXT NOT NULL DEFAULT '[]',
+    last_page_digest TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -391,6 +396,11 @@ def init_db() -> None:
             "TEXT NOT NULL DEFAULT 'legacy-unknown'",
         )
         ensure_column(conn, "fetch_runs", "enriched_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "fetch_runs", "cursor_incomplete_queries_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "fetch_query_state", "resume_url", "TEXT")
+        ensure_column(conn, "fetch_query_state", "pending_anchor_urls_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "fetch_query_state", "matched_anchor_urls_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column(conn, "fetch_query_state", "last_page_digest", "TEXT")
         conn.execute(
             """
             UPDATE hath_downloads

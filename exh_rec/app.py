@@ -1485,6 +1485,7 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
         state = get_fetch_query_state(conn, entry)
         entry["cursor_initialized"] = bool(state and state["anchors"])
         entry["cursor_caught_up"] = None if state is None else state["caught_up"]
+        entry["cursor_resumable"] = bool(state and state["resume_url"])
     return {
         "queries": [entry["query"] for entry in entries],
         "entries": entries,
@@ -1660,7 +1661,8 @@ def get_fetch_query_state(conn, entry: dict) -> dict | None:
     row = conn.execute(
         """
         SELECT query_key, query_text, source, anchor_urls_json, caught_up,
-               last_page_count, last_success_at, updated_at
+               last_page_count, last_success_at, updated_at, resume_url,
+               pending_anchor_urls_json, matched_anchor_urls_json, last_page_digest
         FROM fetch_query_state
         WHERE query_key = ?
         """,
@@ -1670,6 +1672,8 @@ def get_fetch_query_state(conn, entry: dict) -> dict | None:
         return None
     state = dict(row)
     state["anchors"] = decode_cursor_anchors(state.pop("anchor_urls_json", "[]"))
+    state["pending_anchors"] = decode_cursor_anchors(state.pop("pending_anchor_urls_json", "[]"))
+    state["matched_anchors"] = decode_cursor_anchors(state.pop("matched_anchor_urls_json", "[]"))
     state["caught_up"] = bool(state["caught_up"])
     return state
 
@@ -1680,6 +1684,10 @@ def save_fetch_query_state(
     anchors: list[str],
     caught_up: bool,
     page_count: int,
+    resume_url: str | None = None,
+    pending_anchors: list[str] | None = None,
+    matched_anchors: list[str] | None = None,
+    last_page_digest: str | None = None,
 ) -> None:
     if not cursor_enabled_for(entry):
         return
@@ -1687,16 +1695,23 @@ def save_fetch_query_state(
         """
         INSERT INTO fetch_query_state(
             query_key, query_text, source, anchor_urls_json, caught_up,
-            last_page_count, last_success_at, updated_at
+            last_page_count, last_success_at, updated_at, resume_url,
+            pending_anchor_urls_json, matched_anchor_urls_json, last_page_digest
         )
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+                CURRENT_TIMESTAMP, ?, ?, ?, ?)
         ON CONFLICT(query_key) DO UPDATE SET
             query_text = excluded.query_text,
             source = excluded.source,
             anchor_urls_json = excluded.anchor_urls_json,
             caught_up = excluded.caught_up,
             last_page_count = excluded.last_page_count,
-            last_success_at = CURRENT_TIMESTAMP,
+            last_success_at = CASE WHEN excluded.caught_up THEN excluded.last_success_at
+                                   ELSE fetch_query_state.last_success_at END,
+            resume_url = excluded.resume_url,
+            pending_anchor_urls_json = excluded.pending_anchor_urls_json,
+            matched_anchor_urls_json = excluded.matched_anchor_urls_json,
+            last_page_digest = excluded.last_page_digest,
             updated_at = CURRENT_TIMESTAMP
         """,
         (
@@ -1706,6 +1721,11 @@ def save_fetch_query_state(
             json.dumps(normalize_cursor_anchors(anchors), ensure_ascii=True),
             1 if caught_up else 0,
             max(0, int(page_count)),
+            1 if caught_up else 0,
+            None if caught_up else resume_url,
+            json.dumps(normalize_cursor_anchors(pending_anchors or []) if not caught_up else []),
+            json.dumps(normalize_cursor_anchors(matched_anchors or []) if not caught_up else []),
+            None if caught_up else last_page_digest,
         ),
     )
 
@@ -1789,14 +1809,17 @@ def fetch_and_store(
                 old_anchor_list = cursor_state["anchors"] if cursor_state else []
                 old_anchors = set(old_anchor_list)
                 cursor_active = cursor_enabled_for(entry) and bool(old_anchors)
+                next_url = cursor_state.get("resume_url") if cursor_state else None
                 page_limit = pages + stale_extra_pages if cursor_active else pages
                 page_limit = max(1, page_limit)
-                matched_anchors: set[str] = set()
+                matched_anchors: set[str] = set(cursor_state["matched_anchors"]) if next_url else set()
                 query_galleries: list[Gallery] = []
                 query_seen: set[str] = set()
-                head_anchors: list[str] = []
+                head_anchors: list[str] = list(cursor_state["pending_anchors"]) if next_url else []
                 pages_fetched = 0
-                cursor_caught_up = not cursor_active
+                cursor_caught_up = False
+                seen_page_digests = {cursor_state["last_page_digest"]} if next_url else set()
+                batch_stored = 0
                 anchor_match_target = min(FETCH_CURSOR_MATCH_COUNT, len(old_anchors))
                 update_fetch_progress(
                     "query started",
@@ -1806,6 +1829,7 @@ def fetch_and_store(
                     query_total=len(queries),
                     query_source=entry.get("source"),
                     cursor_active=cursor_active,
+                    cursor_resuming=bool(next_url),
                     cursor_caught_up=cursor_caught_up,
                     page_start=0,
                     page_count=page_limit,
@@ -1825,16 +1849,27 @@ def fetch_and_store(
                         cursor_match_target=anchor_match_target,
                         remaining_extra_pages=max(0, page_limit - page_number - 1),
                     )
-                    page_galleries = fetch_galleries(
-                        cookie,
-                        query=query,
-                        pages=1,
-                        start_page=page_number,
-                        proxy_url=proxy_url,
-                    )
+                    try:
+                        page_galleries = fetch_galleries(
+                            cookie,
+                            query=query,
+                            pages=1,
+                            proxy_url=proxy_url,
+                            next_url=next_url,
+                        )
+                        page_digest = hashlib.sha256(
+                            json.dumps(sorted(gallery.url for gallery in page_galleries)).encode("utf-8")
+                        ).hexdigest()
+                        if page_galleries and page_digest in seen_page_digests:
+                            raise RuntimeError("Gallery pagination repeated a result page")
+                    except Exception as exc:
+                        errors.append(f"query {display_query(query)}: {exc}")
+                        update_fetch_progress("query page failed", stage="error", error=str(exc), errors=list(errors))
+                        break
+                    seen_page_digests.add(page_digest)
                     pages_fetched += 1
                     fetched += len(page_galleries)
-                    if page_number == 0:
+                    if not head_anchors:
                         head_anchors = [gallery.url for gallery in page_galleries[:FETCH_CURSOR_ANCHOR_LIMIT]]
                     for gallery in page_galleries:
                         if gallery.url not in query_seen:
@@ -1842,20 +1877,36 @@ def fetch_and_store(
                             query_seen.add(gallery.url)
                         if gallery.url in old_anchors:
                             matched_anchors.add(gallery.url)
+                    next_url = getattr(page_galleries, "next_url", None)
+                    cursor_caught_up = (
+                        not next_url
+                        or (cursor_active and len(matched_anchors) >= anchor_match_target)
+                        or (not cursor_active and page_number + 1 == page_limit)
+                    )
+                    # Commit the listing and its continuation atomically before requesting another page.
+                    with db.connect() as conn:
+                        page_stored = store_galleries(conn, page_galleries)
+                        if cursor_enabled_for(entry) and (head_anchors or old_anchor_list):
+                            save_fetch_query_state(
+                                conn, entry,
+                                head_anchors if cursor_caught_up and head_anchors else old_anchor_list,
+                                caught_up=cursor_caught_up, page_count=pages_fetched,
+                                resume_url=next_url, pending_anchors=head_anchors,
+                                matched_anchors=sorted(matched_anchors), last_page_digest=page_digest,
+                            )
+                    stored += page_stored
+                    batch_stored += page_stored
                     update_fetch_progress(
                         "query page fetched",
                         stage="fetching_pages",
                         current_query=display_query(query),
                         fetched_batch=len(page_galleries),
                         fetched=fetched,
+                        stored=stored,
                         cursor_matches=len(matched_anchors),
                         cursor_match_target=anchor_match_target,
                     )
-                    if not page_galleries:
-                        cursor_caught_up = True
-                        break
-                    if cursor_active and len(matched_anchors) >= anchor_match_target:
-                        cursor_caught_up = True
+                    if cursor_caught_up:
                         break
 
                 try:
@@ -1876,22 +1927,12 @@ def fetch_and_store(
                         errors=list(errors),
                     )
                 with db.connect() as conn:
-                    batch_stored = store_galleries(conn, query_galleries)
-                    stored += batch_stored
+                    store_galleries(conn, query_galleries)
                     candidates = select_detail_candidates(
                         conn,
                         query_galleries,
                         detail_limit - len(selected_for_detail),
                     )
-                    if cursor_enabled_for(entry) and (head_anchors or old_anchor_list):
-                        anchors_to_save = head_anchors if cursor_caught_up and head_anchors else old_anchor_list
-                        save_fetch_query_state(
-                            conn,
-                            entry,
-                            anchors_to_save,
-                            caught_up=cursor_caught_up,
-                            page_count=pages_fetched,
-                        )
                 for gallery in candidates:
                     if gallery.url not in selected_urls:
                         selected_for_detail.append(gallery)
@@ -1910,10 +1951,12 @@ def fetch_and_store(
                     cursor_match_target=anchor_match_target,
                     pages_fetched=pages_fetched,
                 )
-                if cursor_active and not cursor_caught_up:
+                if cursor_enabled_for(entry) and not cursor_caught_up:
                     cursor_incomplete_queries.append(display_query(query))
             except Exception as exc:
                 errors.append(str(exc))
+                if cursor_enabled_for(entry) and display_query(query) not in cursor_incomplete_queries:
+                    cursor_incomplete_queries.append(display_query(query))
                 update_fetch_progress(
                     "query failed",
                     stage="error",
@@ -1985,7 +2028,7 @@ def fetch_and_store(
             errors.append(empty_fetch_error(queries))
             update_fetch_progress("fetch returned no galleries", stage="failed", errors=list(errors))
 
-        status = "failed" if errors and fetched == 0 else "partial" if errors else "success"
+        status = "failed" if errors and fetched == 0 else "partial" if errors or cursor_incomplete_queries else "success"
         with db.connect() as conn:
             clear_shared_thumbnail_metadata(conn)
             if enriched:
@@ -1995,10 +2038,12 @@ def fetch_and_store(
             conn.execute(
                 """
                 UPDATE fetch_runs
-                SET status = ?, fetched_count = ?, stored_count = ?, enriched_count = ?, errors_json = ?, finished_at = CURRENT_TIMESTAMP
+                SET status = ?, fetched_count = ?, stored_count = ?, enriched_count = ?, errors_json = ?,
+                    cursor_incomplete_queries_json = ?, finished_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (status, fetched, stored, enriched, json.dumps(errors, ensure_ascii=True), run_id),
+                (status, fetched, stored, enriched, json.dumps(errors, ensure_ascii=True),
+                 json.dumps(cursor_incomplete_queries, ensure_ascii=True), run_id),
             )
             last_fetch = last_fetch_run(conn)
             page = recommend_page(
@@ -2022,7 +2067,7 @@ def fetch_and_store(
             cursor_incomplete_queries=list(cursor_incomplete_queries),
         )
         return {
-            "ok": not errors,
+            "ok": not errors and not cursor_incomplete_queries,
             "status": status,
             "queries": queries,
             "fetched": fetched,
@@ -4184,7 +4229,8 @@ def fetch_runs(conn, limit: int = 10) -> list[dict]:
     limit = max(1, min(100, int(limit)))
     rows = conn.execute(
         """
-        SELECT id, trigger, status, queries_json, fetched_count, stored_count, enriched_count, errors_json, started_at, finished_at
+        SELECT id, trigger, status, queries_json, fetched_count, stored_count, enriched_count,
+               errors_json, cursor_incomplete_queries_json, started_at, finished_at
         FROM fetch_runs
         ORDER BY started_at DESC, id DESC
         LIMIT ?
@@ -4196,6 +4242,7 @@ def fetch_runs(conn, limit: int = 10) -> list[dict]:
         data = dict(row)
         data["queries"] = safe_json_list(data.pop("queries_json"))
         data["errors"] = safe_json_list(data.pop("errors_json"))
+        data["cursor_incomplete_queries"] = safe_json_list(data.pop("cursor_incomplete_queries_json"))
         history.append(data)
     return history
 

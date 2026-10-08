@@ -220,7 +220,28 @@ In the settings panel:
 
 The refresh panel shows the current fetch plan. Typing an optional one-off search query and leaving the field updates the plan preview to that manual query.
 
-Automatic query cursors are keyed by the normalized remote query, so stable bootstrap searches avoid repeatedly scanning a fixed five-page window while still following new results back to the previous scan. A cursor advances only after its old anchors are reached or the search reaches the end. If the catch-up limit is reached first, the old cursor is preserved and the plan reports `catch-up pending`; increasing `Catch-up` allows a later refresh to continue safely without treating the partial scan as complete.
+Automatic query cursors are keyed by the normalized remote query. Result pages
+follow the site's actual `next` links, not numeric `page` parameters. Each
+successful page and its continuation are committed together, so a later response
+failure does not discard previously fetched pages. Incomplete HTTP bodies receive
+up to three rate-limited attempts.
+
+A cursor advances only after its old anchors are reached or the search reaches
+the end. If the catch-up limit is reached first, the run is `partial`, its old
+anchors are preserved, and the plan reports `resume pending`. The next normal
+`Fetch` continues from the saved next page, rather than rescanning the head. The
+head captured when that catch-up started remains frozen until completion; newer
+uploads are collected by the following normal fetch. Queries keep independent
+continuations, including after restarting the app.
+
+To recover missed history after a pagination repair, restart the app, leave the
+one-off query blank, and use normal `Fetch` repeatedly until all planned queries
+have no pending catch-up and the run is successful. Existing anchors from the old
+database are preserved automatically. The first repaired run starts at the head;
+subsequent partial runs resume deeper into history. Keep the existing request
+delay and ban pause; increasing `Catch-up` changes only the bounded batch size.
+Run one additional normal fetch after completing the backlog to collect uploads
+that arrived during catch-up. Do not reset data or clear cursors for this recovery.
 
 Detail enrichment and parent metadata updates also follow missing parent links and store ancestor metadata locally, up to 12 levels. Ancestors fetched only for this purpose are excluded from Review and short-repeat candidates; if a later normal query discovers one, it becomes reviewable like any other fetched gallery.
 

@@ -89,7 +89,7 @@ from exh_rec.app import (
     continuing_update_payload,
     thumbnail_referer,
 )
-from exh_rec.exhentai import Gallery
+from exh_rec.exhentai import Gallery, GalleryBatch
 from exh_rec.recommender import (
     learned_query_tags,
     parse_bootstrap_tags,
@@ -2316,12 +2316,11 @@ class AppTest(unittest.TestCase):
                         page_count=1,
                     )
 
-                def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
-                    if start_page == 0:
-                        return [new_gallery]
-                    if start_page == 1:
-                        return [old_gallery]
-                    return []
+                def fake_fetch(_cookie, query=None, pages=1, next_url=None, **_kwargs):
+                    if next_url is None:
+                        return GalleryBatch([new_gallery], next_url="https://exhentai.org/?next=80")
+                    self.assertEqual(next_url, "https://exhentai.org/?next=80")
+                    return GalleryBatch([old_gallery])
 
                 with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch, patch(
                     "exh_rec.app.enrich_covers_via_api", return_value=0
@@ -2330,8 +2329,8 @@ class AppTest(unittest.TestCase):
 
                 self.assertEqual(result["stored"], 1)
                 self.assertIn(new_gallery.url, [item["url"] for item in result["items"]])
-                starts = [call.kwargs.get("start_page", 0) for call in fetch.call_args_list]
-                self.assertEqual(starts[:2], [0, 1])
+                starts = [call.kwargs.get("next_url") for call in fetch.call_args_list]
+                self.assertEqual(starts[:2], [None, "https://exhentai.org/?next=80"])
                 with db.connect() as conn:
                     state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
                 self.assertEqual(state["anchors"], [new_gallery.url])
@@ -2431,9 +2430,12 @@ class AppTest(unittest.TestCase):
                         page_count=1,
                     )
 
-                def fake_fetch(_cookie, query=None, pages=1, start_page=0, **_kwargs):
-                    gid = 200 + start_page
-                    return [Gallery(url=f"https://exhentai.org/g/{gid}/a/", gid=str(gid), token="a", title=f"New {gid}")]
+                def fake_fetch(_cookie, query=None, pages=1, next_url=None, **_kwargs):
+                    gid = 200 if next_url is None else int(next_url.split("=")[-1])
+                    return GalleryBatch(
+                        [Gallery(url=f"https://exhentai.org/g/{gid}/a/", gid=str(gid), token="a", title=f"New {gid}")],
+                        next_url=f"https://exhentai.org/?next={gid-1}",
+                    )
 
                 with patch("exh_rec.app.fetch_galleries", side_effect=fake_fetch) as fetch, patch(
                     "exh_rec.app.enrich_covers_via_api", return_value=0
@@ -2447,6 +2449,9 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(state["anchors"], [old_gallery.url])
                 self.assertFalse(state["caught_up"])
                 self.assertEqual(state["last_page_count"], 3)
+                self.assertEqual(state["resume_url"], "https://exhentai.org/?next=197")
+                self.assertEqual(result["status"], "partial")
+                self.assertFalse(result["ok"])
 
     def test_fetch_and_store_logs_detailed_progress(self):
         with tempfile.TemporaryDirectory() as tmpdir:
