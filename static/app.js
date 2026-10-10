@@ -1620,19 +1620,29 @@ function formatHathBytes(value) {
 }
 
 async function loadReactionHistory(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/reactions?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
 
 async function loadShortRepeats(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/short-repeats?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
@@ -1706,10 +1716,15 @@ async function backfillHistoryParents() {
 }
 
 async function loadMarkedGalleries(kind, offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/marks?kind=${encodeURIComponent(kind)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
@@ -1881,7 +1896,7 @@ async function clearCookie() {
 }
 
 async function vote(galleryUrl, voteValue) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus(voteValue > 0 ? "Recording upvote" : "Recording downvote");
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -1897,13 +1912,13 @@ async function vote(galleryUrl, voteValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload, galleryUrl);
+    await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Vote recorded", payload));
   });
 }
 
 async function score(galleryUrl, scoreValue) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus(`Recording score ${scoreValue}`);
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -1919,13 +1934,13 @@ async function score(galleryUrl, scoreValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload, galleryUrl);
+    await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Score recorded", payload));
   });
 }
 
 async function skip(galleryUrl) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus("Skipping gallery");
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -1940,13 +1955,13 @@ async function skip(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload, galleryUrl);
+    await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Gallery skipped", payload));
   });
 }
 
 async function markGallery(galleryUrl, kind) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     const label = kind === "ban" ? "Banning gallery" : "Adding favorite";
     setStatus(label);
     const payload = await api("/api/mark", {
@@ -1960,13 +1975,13 @@ async function markGallery(galleryUrl, kind) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload, galleryUrl);
+    await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(markStatusMessage(kind === "ban" ? "Gallery banned" : "Favorite saved", payload));
   });
 }
 
 async function clearMark(galleryUrl) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus("Clearing bookmark");
     const payload = await api("/api/mark/clear", {
       method: "POST",
@@ -1978,13 +1993,13 @@ async function clearMark(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload, galleryUrl);
+    await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(markStatusMessage(payload.removed ? "Bookmark cleared" : "No bookmark to clear", payload));
   });
 }
 
 async function clearRating(galleryUrl) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus("Clearing rating");
     const payload = await api("/api/feedback/clear", {
       method: "POST",
@@ -1996,12 +2011,18 @@ async function clearRating(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    await applyFeedbackResult(payload);
+    await applyFeedbackResult(payload, undefined, requestedView);
     setStatus(payload.removed ? "Rating cleared" : "No rating to clear");
   });
 }
 
-async function applyFeedbackResult(payload, galleryUrl) {
+async function applyFeedbackResult(payload, galleryUrl, requestedView = currentView) {
+  ++recommendationRequestId;
+  if (currentView !== requestedView) {
+    await loadCurrentPage();
+    refreshQueueCounts();
+    return;
+  }
   if (currentView === "history") {
     await loadReactionHistory();
   } else if (Array.isArray(payload.items)) {
@@ -2017,7 +2038,7 @@ async function applyFeedbackResult(payload, galleryUrl) {
 }
 
 async function copyContinuingFeedback(galleryUrl) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     setStatus("Copying previous series rating");
     const payload = await api("/api/feedback/copy-continuing", {
       method: "POST",
@@ -2026,14 +2047,19 @@ async function copyContinuingFeedback(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
-    applyGalleryPage(payload);
+    ++recommendationRequestId;
+    if (currentView === requestedView) {
+      applyGalleryPage(payload);
+    } else {
+      await loadCurrentPage();
+    }
     refreshQueueCounts();
     setStatus(`Copied ${feedbackLabel(payload.copied_from)} from previous ${payload.copied_from.is_parent ? "parent" : "series version"}`);
   });
 }
 
 async function classifyGallery(galleryUrl, classification) {
-  await withPendingFeedback(galleryUrl, async () => {
+  await withPendingFeedback(galleryUrl, async (requestedView) => {
     const label = classification === "updates" ? "Updates" : classification === "review" ? "Review" : "Auto";
     setStatus(`Classifying gallery as ${label}`);
     const payload = await api("/api/classification", {
@@ -2045,7 +2071,12 @@ async function classifyGallery(galleryUrl, classification) {
         interest_band: currentView === "low-interest" ? "low" : "primary",
       }),
     });
-    applyGalleryPage(currentView === "continuing-updates" ? payload.updates : payload.review);
+    ++recommendationRequestId;
+    if (currentView === requestedView) {
+      applyGalleryPage(currentView === "continuing-updates" ? payload.updates : payload.review);
+    } else {
+      await loadCurrentPage();
+    }
     refreshQueueCounts();
     setStatus(`Classification saved as ${label}`);
   });
@@ -2070,11 +2101,16 @@ function feedbackSurface(galleryUrl) {
 }
 
 async function loadDiscovery(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const languageFilter = languageFilterEl.value.trim();
   const payload = await api(
     `/api/discovery?language_filter=${encodeURIComponent(languageFilter)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   recordPageImpressions(payload, "discovery", offset);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -2139,10 +2175,15 @@ function recordPageImpressions(payload, surface, offset = 0) {
 }
 
 async function loadContinuingUpdates(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/continuing-updates?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
@@ -2165,10 +2206,15 @@ function renderClassifierSummary(payload) {
 }
 
 async function loadClassificationSamples(offset = 0, append = false) {
+  const requestedView = currentView;
+  const requestId = ++recommendationRequestId;
   const localFilter = localFilterEl.value.trim();
   const payload = await api(
     `/api/classification-samples?limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
   );
+  if (requestId !== recommendationRequestId || currentView !== requestedView) {
+    return;
+  }
   applyGalleryPage(payload, append);
   renderClassifierSummary(payload);
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
@@ -2573,6 +2619,9 @@ function renderGalleryCards(items, append = false) {
       </div>
     `;
     recommendationsEl.appendChild(card);
+    if (pendingFeedbackUrls.has(item.url)) {
+      setGalleryFeedbackButtonsDisabled(item.url, true);
+    }
     if (["review", "low-interest", "discovery", "short-repeats"].includes(mode)) {
       queueVisualEmbedding(item);
     }
@@ -2665,10 +2714,14 @@ async function withPendingFeedback(galleryUrl, action) {
     return;
   }
   pendingFeedbackUrls.add(galleryUrl);
+  const requestedView = currentView;
+  // Lists started before or during a submission may contain pre-commit feedback.
+  ++recommendationRequestId;
   setGalleryFeedbackButtonsDisabled(galleryUrl, true);
   try {
-    await action();
+    await action(requestedView);
   } finally {
+    ++recommendationRequestId;
     pendingFeedbackUrls.delete(galleryUrl);
     setGalleryFeedbackButtonsDisabled(galleryUrl, false);
   }
@@ -2686,6 +2739,8 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
       button.dataset.clear ||
       button.dataset.mark ||
       button.dataset.clearMark ||
+      button.dataset.classification ||
+      button.dataset.copyContinuing ||
       button.dataset.refreshGallery
     ) {
       button.disabled = disabled;
