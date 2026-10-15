@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 
+def normalize_ssh_host(ssh_host: str) -> str:
+    # A copied shell continuation backslash is not part of the SSH alias.
+    normalized = ssh_host.strip().rstrip("\\").strip()
+    if not normalized:
+        raise RuntimeError("H@H SSH host must not be empty")
+    return normalized
+
+
 def read_token(path: Path) -> str:
     try:
         token = path.read_text(encoding="utf-8").strip()
@@ -92,6 +100,10 @@ def supervise(
     reconnect_seconds: float,
     ssh_executable: str,
 ) -> int:
+    normalized_host = normalize_ssh_host(ssh_host)
+    if normalized_host != ssh_host:
+        print("H@H SSH host normalized: removed surrounding whitespace or trailing backslashes", file=sys.stderr)
+    ssh_host = normalized_host
     token = read_token(token_file)
     if not ssh_config.is_file():
         raise RuntimeError(f"SSH config does not exist: {ssh_config}")

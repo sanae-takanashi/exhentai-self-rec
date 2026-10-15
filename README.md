@@ -88,6 +88,11 @@ forwards to local rec port `18787`. When both file variables are configured,
 the normal `run.ps1` entry point uses the H@H launcher automatically; pass
 `-NoHath` for an intentional rec-only start.
 
+Use `-HathSshHost exh-rec-hath` without a trailing `\`: PowerShell does not
+use backslashes for line continuation. The launcher removes surrounding
+whitespace and accidental trailing backslashes from the SSH host, and rejects
+an empty result before reading credentials or starting processes.
+
 The same supervised launcher also gives the rec process the existing SSH
 executable, config, and host alias for configurable remote archive jobs. The
 H@H page scans gallery directories and existing ZIP files, shows the active
