@@ -917,6 +917,7 @@ function renderHathPackInventory(payload) {
   hathPackMegaAccountEl.title = mega.remote_cwd ? `Current MEGA folder: ${mega.remote_cwd}` : (mega.error || "");
   if (!mega.available) {
     hathPackUploadEl.checked = false;
+    hathPackTrashArchiveEl.checked = false;
   }
   hathPackUploadEl.disabled = !mega.available;
   hathPackSummaryEl.textContent = `${candidates.length} archive candidate${candidates.length === 1 ? "" : "s"} on ${payload.download_dir || "the H@H host"} · trash ${formatHathBytes(trash.size_bytes || 0)}`;
