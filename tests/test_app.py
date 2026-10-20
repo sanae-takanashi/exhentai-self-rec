@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 import sqlite3
+import socket
 import threading
 import time
 import tempfile
@@ -65,6 +66,7 @@ from exh_rec.app import (
     parse_bool,
     parse_feedback_request,
     parse_mark_kind,
+    port_already_served,
     query_float,
     query_int,
     queue_counts_payload,
@@ -2940,6 +2942,52 @@ class AppTest(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["imported"]["bootstrap_tags"], 1)
                 self.assertIn("model", result)
+
+    def test_port_already_served_detects_existing_listener(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+
+            self.assertTrue(port_already_served(port))
+
+        self.assertFalse(port_already_served(port))
+
+    def test_main_rejects_occupied_loopback_before_database_initialization(self) -> None:
+        from exh_rec import app
+
+        for host in ("", "0.0.0.0", "::", "127.0.0.1"):
+            with self.subTest(host=host), patch.object(app, "HOST", host), patch.object(
+                app, "PORT", 18787
+            ), patch.object(app, "port_already_served", return_value=True) as probe, patch.object(
+                db, "init_db"
+            ) as initialize:
+                with self.assertRaisesRegex(SystemExit, "port 18787 is already served"):
+                    app.main()
+                probe.assert_called_once_with(18787)
+                initialize.assert_not_called()
+
+    def test_main_continues_initialization_when_loopback_port_is_free(self) -> None:
+        from exh_rec import app
+
+        with patch.object(app, "HOST", "0.0.0.0"), patch.object(
+            app, "port_already_served", return_value=False
+        ) as probe, patch.object(db, "init_db", side_effect=RuntimeError("test startup boundary")) as initialize:
+            with self.assertRaisesRegex(RuntimeError, "test startup boundary"):
+                app.main()
+        probe.assert_called_once_with(app.PORT)
+        initialize.assert_called_once_with()
+
+    def test_main_does_not_probe_loopback_for_an_explicit_network_interface(self) -> None:
+        from exh_rec import app
+
+        with patch.object(app, "HOST", "192.0.2.10"), patch.object(
+            app, "port_already_served", return_value=True
+        ) as probe, patch.object(db, "init_db", side_effect=RuntimeError("test startup boundary")) as initialize:
+            with self.assertRaisesRegex(RuntimeError, "test startup boundary"):
+                app.main()
+        probe.assert_not_called()
+        initialize.assert_called_once_with()
 
 
 if __name__ == "__main__":

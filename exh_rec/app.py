@@ -9,6 +9,7 @@ import mimetypes
 import os
 import queue
 import random
+import socket
 import threading
 import time
 import urllib.error
@@ -4402,7 +4403,26 @@ def server_display_url(host: str, port: int) -> str:
     return f"http://{display_host}:{port}"
 
 
+def port_already_served(port: int) -> bool:
+    """True when another process already answers on 127.0.0.1:port.
+
+    A successful ``bind()`` does not prove the port is ours: on Windows a
+    wildcard bind (0.0.0.0:port) succeeds even while a different process listens
+    on 127.0.0.1:port, and loopback connections are then delivered to that other
+    socket.  Probing first turns that silent hijack into a loud failure.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 def main() -> None:
+    if HOST in {"", "0.0.0.0", "::", "127.0.0.1"} and port_already_served(PORT):
+        raise SystemExit(
+            f"port {PORT} is already served on 127.0.0.1 by another process: stop it, "
+            "or start with EXH_REC_PORT=<free port>. Refusing to bind because on Windows "
+            "the wildcard bind would succeed while loopback traffic kept going elsewhere."
+        )
     db.init_db()
     with db.connect() as conn:
         apply_proxy_environment(network_proxy(conn))
