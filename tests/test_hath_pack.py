@@ -132,6 +132,20 @@ class HathPackTest(unittest.TestCase):
         with self.assertRaisesRegex(HathPackConflict, "Preview is missing or stale"):
             runner.start("missing")
 
+    def test_runner_preserves_cleanup_operation_and_snapshot(self):
+        request = {"operation": "cleanup-only", "selected": [], "archives": ["old.zip"],
+                   "cleanup_mode": "trash"}
+        normalized = dict(request, snapshot={"archives/old.zip": "fingerprint"})
+        runner = HathPackRunner()
+        with patch("exh_rec.hath_pack.run_remote_json", return_value={
+            "kind": "cleanup-only", "request": normalized,
+        }) as remote, patch("exh_rec.hath_pack.threading.Thread") as thread:
+            preview = runner.preview(request)
+            runner.start(preview["preview_id"])
+        remote.assert_called_once_with("plan", request)
+        self.assertEqual(thread.call_args[1]["args"], (1, "run", normalized))
+        thread.return_value.start.assert_called_once_with()
+
     def test_runner_binds_trash_preview_to_trash_run(self):
         request = {"selected": ["job-one"]}
         plan = {

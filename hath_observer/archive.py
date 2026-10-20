@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -207,6 +208,26 @@ def scan_candidates(download_dir):
     return candidates
 
 
+def scan_archives(archive_dir):
+    if not os.path.exists(archive_dir):
+        return []
+    if os.path.islink(archive_dir) or not os.path.isdir(archive_dir):
+        raise ArchiveError("Archive directory must be a real directory")
+    archives = []
+    with os.scandir(archive_dir) as entries:
+        for entry in entries:
+            if (entry.name.startswith(".") or not entry.name.lower().endswith(".zip")
+                    or not entry.is_file(follow_symlinks=False)):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            archives.append({
+                "name": entry.name, "kind": "archive", "size_bytes": info.st_size,
+                "file_count": 1,
+                "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info.st_mtime)),
+            })
+    return sorted(archives, key=lambda item: (item["modified_at"], item["name"]), reverse=True)
+
+
 def safe_leaf_name(value, field):
     text = str(value or "").strip()
     if (
@@ -285,6 +306,8 @@ def archive_member_name(candidate):
 
 
 def build_plan(request, download_dir, archive_dir):
+    if request.get("operation") == "cleanup-only":
+        return build_cleanup_plan(request, download_dir, archive_dir)
     normalized = normalize_request(request)
     candidate_map = {item["name"]: item for item in scan_candidates(download_dir)}
     missing = [name for name in normalized["selected"] if name not in candidate_map]
@@ -367,6 +390,112 @@ def build_plan(request, download_dir, archive_dir):
         ),
         "actions": actions,
     }
+
+
+def cleanup_fingerprint(path):
+    if os.path.realpath(path) != os.path.abspath(path):
+        raise ArchiveError("Cleanup does not allow symbolic links")
+    digest = hashlib.sha256()
+
+    def record(item):
+        info = os.lstat(item)
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise ArchiveError("Cleanup does not allow links or special files")
+        values = [os.path.relpath(item, path), info.st_dev, info.st_ino,
+                  info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+        digest.update(json.dumps(values, ensure_ascii=True).encode("utf-8") + b"\n")
+
+    def walk_error(error):
+        raise ArchiveError("Cannot inspect every selected cleanup file")
+
+    record(path)
+    if os.path.isdir(path):
+        for root, directories, files in os.walk(path, followlinks=False, onerror=walk_error):
+            directories.sort()
+            for name in sorted(directories + files):
+                record(os.path.join(root, name))
+    return digest.hexdigest()
+
+
+def build_cleanup_plan(request, download_dir, archive_dir):
+    normalized = {"operation": "cleanup-only"}
+    for field in ("selected", "archives"):
+        names = request.get(field, [])
+        if not isinstance(names, list):
+            raise ArchiveError("{0} must be a list".format(field))
+        normalized[field] = []
+        for raw_name in names:
+            name = safe_leaf_name(raw_name, field)
+            if name not in normalized[field]:
+                normalized[field].append(name)
+    count = len(normalized["selected"]) + len(normalized["archives"])
+    if not count or count > MAX_SELECTIONS:
+        raise ArchiveError("Select between 1 and {0} cleanup items".format(MAX_SELECTIONS))
+    mode = str(request.get("cleanup_mode") or "trash").strip().lower()
+    if mode not in ("trash", "delete"):
+        raise ArchiveError("cleanup_mode must be trash or delete")
+    normalized["cleanup_mode"] = mode
+    selected = []
+    snapshot = {}
+    paths = set()
+    for field, scope, root, candidates in (
+        ("selected", "sources", download_dir,
+         scan_candidates(download_dir) if normalized["selected"] else []),
+        ("archives", "archives", archive_dir,
+         scan_archives(archive_dir) if normalized["archives"] else []),
+    ):
+        candidate_map = {item["name"]: item for item in candidates}
+        for name in normalized[field]:
+            if name not in candidate_map:
+                raise ArchiveError("Cleanup item is missing or unsupported: {0}".format(name))
+            path = os.path.join(root, name)
+            if os.path.realpath(path) in paths:
+                raise ArchiveError("Cleanup items must have distinct paths")
+            paths.add(os.path.realpath(path))
+            item = dict(candidate_map[name], scope=scope, path=path)
+            selected.append(item)
+            snapshot[scope + "/" + name] = cleanup_fingerprint(path)
+    if "snapshot" in request and request["snapshot"] != snapshot:
+        raise ArchiveError("Cleanup selection changed; generate a new dry run")
+    normalized["snapshot"] = snapshot
+    return {
+        "schema": SCHEMA, "dry_run": True, "kind": "cleanup-only", "request": normalized,
+        "selected": selected, "selected_count": count,
+        "source_count": len(normalized["selected"]), "archive_count": len(normalized["archives"]),
+        "input_bytes": sum(item["size_bytes"] for item in selected),
+        "input_files": sum(item["file_count"] for item in selected),
+        "actions": [{
+            "kind": "delete" if mode == "delete" else "trash",
+            "message": ("Permanently delete " if mode == "delete" else "Move to recoverable trash: ") + item["path"],
+        } for item in selected],
+    }
+
+
+def execute_cleanup_plan(plan, download_dir, archive_dir):
+    if not plan["request"].get("snapshot"):
+        raise ArchiveError("Cleanup requires a preview snapshot")
+    # Revalidate the entire selection under the archive lock before changing any file.
+    plan = build_cleanup_plan(plan["request"], download_dir, archive_dir)
+    request = plan["request"]
+    trash_root = os.path.join(archive_dir, ".trash", job_identifier(request))
+    deleted = []
+    trashed = []
+    for index, item in enumerate(plan["selected"]):
+        if cleanup_fingerprint(item["path"]) != request["snapshot"][item["scope"] + "/" + item["name"]]:
+            raise ArchiveError("Cleanup selection changed; generate a new dry run")
+        emit("progress", stage="cleaning", completed=index, total=plan["selected_count"],
+             message="Cleaning {0}".format(item["path"]))
+        if request["cleanup_mode"] == "delete":
+            permanently_delete(item["path"])
+            deleted.append(item["path"])
+        else:
+            trashed.append(move_without_clobber(item["path"], os.path.join(trash_root, item["scope"])))
+    emit("result", state="succeeded", message="Cleanup-only job completed", result={
+        "operation": "cleanup-only", "deleted": deleted, "trashed": trashed,
+        "cleaned_count": plan["selected_count"],
+        "freed_bytes": plan["input_bytes"] if request["cleanup_mode"] == "delete" else 0,
+        "trash_root": trash_root if trashed else None,
+    })
 
 
 def normalize_trash_request(value):
@@ -490,6 +619,8 @@ def stage_existing_zip(source, destination):
 
 
 def execute_plan(plan, download_dir, archive_dir):
+    if plan["request"].get("operation") == "cleanup-only":
+        return execute_cleanup_plan(plan, download_dir, archive_dir)
     request = plan["request"]
     job_id = job_identifier(request)
     trash_root = os.path.join(archive_dir, ".trash", job_id)
@@ -697,8 +828,10 @@ def main():
                 json.dumps(
                     {
                         "schema": SCHEMA,
+                        "capabilities": ["cleanup-only-v1"],
                         "download_dir": args.download_dir,
                         "archive_dir": args.archive_dir,
+                        "archives": scan_archives(args.archive_dir),
                         "trash": trash_stats(args.archive_dir),
                         "mega": mega_identity(),
                         "candidates": candidates,

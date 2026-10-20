@@ -114,7 +114,17 @@ archive `.zip` file name. Cleanup moves items under
 `/srv/hath/archive/.trash/<job-id>` by default. For space-constrained hosts,
 the cleanup method can permanently delete the selected sources and uploaded
 local archive instead. Permanent cleanup only starts after archive creation and
-any requested upload succeed.
+any requested upload succeed in Archive & Upload mode.
+
+`Clean Up Only` uses the same source selection plus a separate list of existing
+local archive ZIPs. Select either or both, choose recoverable trash (the default)
+or permanent deletion, preview the exact paths and size, then confirm cleanup.
+This mode does not create ZIPs, upload files, or require a MEGA copy to exist;
+it also works after you have downloaded and removed the MEGA copy yourself.
+The preview stores a file metadata fingerprint and execution revalidates the
+selection under the shared archive lock. Missing or changed items require a new
+preview. Active downloads cannot be selected. Deploy the current remote helper
+before using this mode; the UI checks its `cleanup-only-v1` capability.
 
 Existing recoverable trash still consumes local disk. After deploying the
 current helper, the H@H page lists each trash job with its file count, size,

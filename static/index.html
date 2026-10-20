@@ -300,21 +300,25 @@
           <section class="hath-section hath-pack-section">
             <div class="hath-section-heading">
               <div>
-                <h3>Archive &amp; Upload</h3>
+                <h3>Files &amp; Archives</h3>
                 <span id="hathPackSummary">Loading remote archive inventory</span>
               </div>
               <button id="hathPackRefreshBtn" type="button">Refresh</button>
             </div>
+            <div class="hath-file-modes" role="group" aria-label="File operation">
+              <label class="check inline"><input type="radio" name="hathFileMode" value="archive" checked> Archive &amp; Upload</label>
+              <label class="check inline"><input type="radio" name="hathFileMode" value="cleanup"> Clean Up Only</label>
+            </div>
             <div class="hath-pack-options">
-              <label>
+              <label data-hath-archive-only>
                 Archive name
                 <input id="hathPackArchiveName" type="text" maxlength="240" autocomplete="off">
               </label>
-              <label>
+              <label data-hath-archive-only>
                 MEGA account
                 <output id="hathPackMegaAccount" class="hath-pack-output">Not connected</output>
               </label>
-              <label>
+              <label data-hath-archive-only>
                 MEGA destination
                 <input id="hathPackMegaDestination" type="text" maxlength="500" value="/H@H Archives" autocomplete="off">
               </label>
@@ -326,7 +330,7 @@
                 </select>
               </label>
             </div>
-            <div class="hath-pack-toggles">
+            <div class="hath-pack-toggles" data-hath-archive-only>
               <label class="check inline"><input id="hathPackUpload" type="checkbox" checked> Upload to MEGA</label>
               <label class="check inline"><input id="hathPackTrashSources" type="checkbox" checked> Clean up selected sources after success</label>
               <label class="check inline"><input id="hathPackTrashArchive" type="checkbox" checked> Clean up local archive after upload</label>
@@ -343,6 +347,19 @@
             </div>
             <div id="hathPackCandidates" class="hath-pack-candidates">
               <div class="hath-empty">Loading archive candidates.</div>
+            </div>
+            <div id="hathCleanupArchives" class="hidden">
+              <div class="hath-pack-selection-heading">
+                <div>
+                  <strong>Local archives</strong>
+                  <span id="hathCleanupArchiveSummary">No archives selected</span>
+                </div>
+                <div>
+                  <button id="hathCleanupArchiveAllBtn" type="button">Select all</button>
+                  <button id="hathCleanupArchiveNoneBtn" type="button">Clear</button>
+                </div>
+              </div>
+              <div id="hathCleanupArchiveCandidates" class="hath-pack-candidates"></div>
             </div>
             <div class="hath-pack-actions">
               <button id="hathPackPreviewBtn" type="button" disabled>Dry Run</button>

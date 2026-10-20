@@ -588,6 +588,21 @@ button.danger:hover {
   gap: 12px;
 }
 
+.hath-file-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+}
+
+[data-hath-archive-only].hidden {
+  display: none;
+}
+
+#hathCleanupArchives:not(.hidden) {
+  display: grid;
+  gap: 10px;
+}
+
 .hath-pack-output {
   display: flex;
   align-items: center;
@@ -710,6 +725,12 @@ button.danger:hover {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px 12px;
+}
+
+.hath-pack-plan ol {
+  max-height: 280px;
+  overflow: auto;
+  overflow-wrap: anywhere;
 }
 
 .hath-pack-plan-summary > span:not(.hath-badge),

@@ -86,6 +86,11 @@ const hathPackTrashSourcesEl = document.querySelector("#hathPackTrashSources");
 const hathPackTrashArchiveEl = document.querySelector("#hathPackTrashArchive");
 const hathPackSelectionSummaryEl = document.querySelector("#hathPackSelectionSummary");
 const hathPackCandidatesEl = document.querySelector("#hathPackCandidates");
+const hathCleanupArchivesEl = document.querySelector("#hathCleanupArchives");
+const hathCleanupArchiveCandidatesEl = document.querySelector("#hathCleanupArchiveCandidates");
+const hathCleanupArchiveSummaryEl = document.querySelector("#hathCleanupArchiveSummary");
+const hathCleanupArchiveAllBtn = document.querySelector("#hathCleanupArchiveAllBtn");
+const hathCleanupArchiveNoneBtn = document.querySelector("#hathCleanupArchiveNoneBtn");
 const hathPackPlanEl = document.querySelector("#hathPackPlan");
 const hathPackSummaryEl = document.querySelector("#hathPackSummary");
 const hathPackBadgeEl = document.querySelector("#hathPackBadge");
@@ -123,6 +128,8 @@ let hathPackInventory = null;
 let hathPackPreview = null;
 let hathTrashPreview = null;
 let hathPackStatusPayload = null;
+let hathCleanupOnly = false;
+let hathPackPreviewVersion = 0;
 let lastRenderedFetchId = null;
 let currentView = "review";
 let reviewExploreSeed = "";
@@ -939,8 +946,28 @@ function renderHathPackInventory(payload) {
     `
     : '<div class="hath-empty">No gallery directories or ZIP files are available.</div>';
   renderHathTrashInventory(trash);
+  renderHathCleanupArchives(payload.archives || []);
   invalidateHathPackPreview();
   updateHathPackSelection();
+}
+
+function renderHathCleanupArchives(archives) {
+  hathCleanupArchiveCandidatesEl.innerHTML = archives.length
+    ? archives.map((item) => `
+        <label class="hath-pack-candidate">
+          <input type="checkbox" data-hath-cleanup-archive value="${escapeAttr(item.name)}">
+          <span title="${escapeAttr(item.name)}">${escapeHtml(item.name)}</span>
+          <span>Archive</span><span>1</span>
+          <span>${escapeHtml(formatHathBytes(item.size_bytes || 0))}</span>
+          <span>${escapeHtml(relativeHathTime(item.modified_at))}</span>
+        </label>
+      `).join("")
+    : '<div class="hath-empty">No local archives.</div>';
+}
+
+function selectedHathCleanupArchives() {
+  return [...hathCleanupArchiveCandidatesEl.querySelectorAll("input[data-hath-cleanup-archive]:checked")]
+    .map((input) => input.value);
 }
 
 function renderHathTrashInventory(trash) {
@@ -1007,21 +1034,35 @@ function updateHathPackSelection() {
   const selected = candidates.filter((candidate) => selectedNames.has(candidate.name));
   const selectedBytes = selected.reduce((sum, candidate) => sum + Number(candidate.size_bytes || 0), 0);
   hathPackSelectionSummaryEl.textContent = `${selected.length} selected · ${formatHathBytes(selectedBytes)}`;
+  const archiveNames = new Set(selectedHathCleanupArchives());
+  const archives = (hathPackInventory?.archives || []).filter((item) => archiveNames.has(item.name));
+  const archiveBytes = archives.reduce((sum, item) => sum + Number(item.size_bytes || 0), 0);
+  hathCleanupArchiveSummaryEl.textContent = `${archives.length} selected · ${formatHathBytes(archiveBytes)}`;
   updateHathPackControls();
 }
 
 function updateHathPackControls() {
   const running = hathPackStatusPayload?.state === "running";
-  const hasSelection = selectedHathPackNames().length > 0;
+  const hasSelection = selectedHathPackNames().length > 0 || (hathCleanupOnly && selectedHathCleanupArchives().length > 0);
   const configured = hathPackStatusPayload?.configured === true;
-  hathPackPreviewBtn.disabled = running || !configured || !hasSelection;
-  hathPackBtn.disabled = running || !configured || !hathPackPreview;
+  const supported = !hathCleanupOnly || (hathPackInventory?.capabilities || []).includes("cleanup-only-v1");
+  hathPackPreviewBtn.disabled = running || !configured || !hasSelection || !supported;
+  hathPackBtn.disabled = running || !configured || !hathPackPreview || !supported;
+  hathPackPreviewBtn.textContent = hathCleanupOnly ? "Preview Cleanup" : "Dry Run";
+  hathPackBtn.textContent = hathCleanupOnly ? "Clean Up Selected" : "Run Plan";
+  hathPackBtn.title = hathCleanupOnly ? "Execute only the previewed cleanup selection." : staticTooltips.hathPackBtn;
+  hathPackPreviewBtn.title = hathCleanupOnly ? "Preview cleanup paths and size without changing files." : staticTooltips.hathPackPreviewBtn;
+  hathCleanupArchivesEl.classList.toggle("hidden", !hathCleanupOnly);
+  for (const element of document.querySelectorAll("[data-hath-archive-only]")) {
+    element.classList.toggle("hidden", hathCleanupOnly);
+  }
   hathPackMegaDestinationEl.disabled = !hathPackUploadEl.checked;
   hathPackTrashArchiveEl.disabled = !hathPackUploadEl.checked;
   updateHathTrashControls();
 }
 
 function invalidateHathPackPreview() {
+  hathPackPreviewVersion++;
   hathPackPreview = null;
   hathPackPlanEl.classList.add("hidden");
   hathPackPlanEl.innerHTML = "";
@@ -1029,6 +1070,14 @@ function invalidateHathPackPreview() {
 }
 
 function hathPackRequest() {
+  if (hathCleanupOnly) {
+    return {
+      operation: "cleanup-only",
+      selected: selectedHathPackNames(),
+      archives: selectedHathCleanupArchives(),
+      cleanup_mode: hathPackCleanupModeEl.value,
+    };
+  }
   return {
     selected: selectedHathPackNames(),
     archive_name: hathPackArchiveNameEl.value.trim(),
@@ -1042,16 +1091,21 @@ function hathPackRequest() {
 
 async function previewHathPack() {
   invalidateHathPackPreview();
+  const version = hathPackPreviewVersion;
   hathPackPreviewBtn.disabled = true;
-  setStatus("Generating H@H archive dry run");
+  setStatus(hathCleanupOnly ? "Generating cleanup-only dry run" : "Generating H@H archive dry run");
   const payload = await api("/api/integrations/hath/pack/preview", {
     method: "POST",
     body: JSON.stringify(hathPackRequest()),
   });
+  if (version !== hathPackPreviewVersion) return;
+  if (hathCleanupOnly && (payload.kind !== "cleanup-only" || payload.request?.operation !== "cleanup-only")) {
+    throw new Error("The remote helper does not support cleanup-only plans; refresh the file inventory.");
+  }
   hathPackPreview = payload;
   renderHathPackPlan(payload);
   updateHathPackControls();
-  setStatus(`Dry run ready for ${payload.selected_count || 0} archive sources`);
+  setStatus(`Dry run ready for ${payload.selected_count || 0} ${hathCleanupOnly ? "cleanup items" : "archive sources"}`);
 }
 
 function renderHathPackPlan(plan) {
@@ -1060,8 +1114,8 @@ function renderHathPackPlan(plan) {
   hathPackPlanEl.innerHTML = `
     <div class="hath-pack-plan-summary">
       <span class="hath-badge hath-tone-good">Dry Run</span>
-      <strong>${escapeHtml(request.archive_name || "Archive")}</strong>
-      <span>${escapeHtml(Number(plan.selected_count || 0).toLocaleString())} sources</span>
+      <strong>${escapeHtml(plan.kind === "cleanup-only" ? "Clean Up Only" : request.archive_name || "Archive")}</strong>
+      <span>${escapeHtml(Number(plan.selected_count || 0).toLocaleString())} items</span>
       <span>${escapeHtml(Number(plan.input_files || 0).toLocaleString())} files</span>
       <span>${escapeHtml(formatHathBytes(plan.input_bytes || 0))}</span>
     </div>
@@ -1165,7 +1219,24 @@ function renderHathPackStatus(payload) {
 
 async function startHathPack() {
   if (!hathPackPreview) return;
+  const preview = hathPackPreview;
   const request = hathPackPreview.request || {};
+  if (request.operation === "cleanup-only") {
+    const permanent = request.cleanup_mode === "delete";
+    if (!confirm(
+      `${permanent ? "PERMANENTLY DELETE" : "Move to recoverable trash"} the previewed selection?\n\nSources: ${preview.source_count || 0}\nLocal archives: ${preview.archive_count || 0}\nFiles: ${Number(preview.input_files || 0).toLocaleString()}\nSize: ${formatHathBytes(preview.input_bytes || 0)}\n\nNo archive creation, upload, or MEGA verification.`
+      + (permanent ? "\n\nThis cannot be undone." : "")
+    )) return;
+    hathPackPreview = null;
+    updateHathPackControls();
+    setStatus("Starting cleanup-only job");
+    const payload = await api("/api/integrations/hath/pack/start", {
+      method: "POST", body: JSON.stringify({ preview_id: preview.preview_id }),
+    });
+    renderHathPackStatus(payload);
+    setStatus("Cleanup-only job started");
+    return;
+  }
   const cleanup = [];
   if (request.trash_sources) cleanup.push("selected sources");
   if (request.trash_archive_after_upload) cleanup.push("the local archive");
@@ -3125,6 +3196,26 @@ hathPackPreviewBtn.addEventListener("click", () => previewHathPack().catch((erro
   updateHathPackControls();
 }));
 hathPackRefreshBtn.addEventListener("click", () => loadHathPackInventory().catch((error) => setStatus(error.message, true)));
+for (const input of document.querySelectorAll('input[name="hathFileMode"]')) {
+  input.addEventListener("change", () => {
+    hathCleanupOnly = input.value === "cleanup";
+    invalidateHathPackPreview();
+    updateHathPackSelection();
+  });
+}
+for (const [button, checked] of [[hathCleanupArchiveAllBtn, true], [hathCleanupArchiveNoneBtn, false]]) {
+  button.addEventListener("click", () => {
+    for (const input of hathCleanupArchiveCandidatesEl.querySelectorAll("input[data-hath-cleanup-archive]")) {
+      input.checked = checked;
+    }
+    invalidateHathPackPreview();
+    updateHathPackSelection();
+  });
+}
+hathCleanupArchiveCandidatesEl.addEventListener("change", () => {
+  invalidateHathPackPreview();
+  updateHathPackSelection();
+});
 hathTrashPreviewBtn.addEventListener("click", () => previewHathTrash().catch((error) => {
   setStatus(error.message, true);
   updateHathTrashControls();
