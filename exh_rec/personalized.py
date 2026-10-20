@@ -1033,10 +1033,12 @@ def score_personalized_galleries(
     else:
         uncertainty = modules["np"].zeros(len(galleries))
     results = []
+    names = _feature_names(artifact)
+    numeric_end = len(names) - int(artifact["visual_dims"])
     for index, gallery in enumerate(decoded):
         probability = float(probabilities[index])
         spread = float(uncertainty[index])
-        positive, negative = _explain_row(matrix[index], artifact, modules)
+        positive, negative = _explain_row(matrix[index], artifact, modules, names=names)
         results.append(
             {
                 "like_probability": round(probability, 6),
@@ -1046,7 +1048,9 @@ def score_personalized_galleries(
                 "model_version": artifact["model_version"],
                 "score_scale": artifact.get("score_scale", "probability"),
                 "reason_details": {"positive": positive, "negative": negative},
-                "text_visual_disagreement": round(_modality_disagreement(matrix[index], artifact, modules), 6),
+                "text_visual_disagreement": round(_modality_disagreement(
+                    matrix[index], artifact, modules, numeric_end=numeric_end,
+                ), 6),
             }
         )
     return results, artifact
@@ -1093,9 +1097,9 @@ def _feature_names(artifact: dict) -> list[str]:
     return [*metadata, *title, *numeric, *visual]
 
 
-def _explain_row(row, artifact: dict, modules: dict[str, Any]) -> tuple[list[dict], list[dict]]:
+def _explain_row(row, artifact: dict, modules: dict[str, Any], names: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     coefficients = artifact["classifier"].coef_[0]
-    names = _feature_names(artifact)
+    names = _feature_names(artifact) if names is None else names
     contributions: dict[str, float] = {}
     for index, value in zip(row.indices, row.data):
         contribution = float(value) * float(coefficients[index])
@@ -1111,11 +1115,12 @@ def _explain_row(row, artifact: dict, modules: dict[str, Any]) -> tuple[list[dic
     return positive, negative
 
 
-def _modality_disagreement(row, artifact: dict, modules: dict[str, Any]) -> float:
+def _modality_disagreement(row, artifact: dict, modules: dict[str, Any], numeric_end: int | None = None) -> float:
     coefficients = artifact["classifier"].coef_[0]
-    metadata_end = len(artifact["dict_vectorizer"].get_feature_names_out())
-    title_end = metadata_end + (0 if artifact["title_vectorizer"] is None else len(artifact["title_vectorizer"].get_feature_names_out()))
-    numeric_end = title_end + len(artifact["numeric_names"])
+    if numeric_end is None:
+        metadata_end = len(artifact["dict_vectorizer"].get_feature_names_out())
+        title_end = metadata_end + (0 if artifact["title_vectorizer"] is None else len(artifact["title_vectorizer"].get_feature_names_out()))
+        numeric_end = title_end + len(artifact["numeric_names"])
     content_logit = float(row[:, :numeric_end].dot(coefficients[:numeric_end]).item())
     visual_logit = float(row[:, numeric_end:].dot(coefficients[numeric_end:]).item()) if artifact["visual_dims"] else 0.0
     return min(1.0, abs(content_logit - visual_logit) / 6.0)

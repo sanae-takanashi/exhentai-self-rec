@@ -345,6 +345,49 @@ END;
 """
 
 
+CACHE_TABLES = (
+    "galleries", "feedback", "gallery_marks", "bootstrap_tags", "feature_weights",
+    "gallery_classification_overrides", "gallery_classification_samples",
+    "hath_downloads", "gallery_visual_images", "gallery_feature_snapshots", "settings",
+)
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS cache_revisions (
+    name TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO cache_revisions(name, revision) VALUES ('__identity__', random());
+"""
+for _table in CACHE_TABLES:
+    SCHEMA += f"INSERT OR IGNORE INTO cache_revisions(name) VALUES ('{_table}');\n"
+    for _operation in ("INSERT", "UPDATE", "DELETE"):
+        SCHEMA += f"""
+CREATE TRIGGER IF NOT EXISTS cache_{_table}_{_operation.lower()}
+AFTER {_operation} ON {_table}
+BEGIN
+    UPDATE cache_revisions SET revision = revision + 1 WHERE name = '{_table}';
+END;
+"""
+
+
+def cache_revision(conn: sqlite3.Connection, tables: tuple[str, ...]) -> tuple | None:
+    # Uncommitted versions can be reused after rollback, so never share them.
+    if conn.in_transaction:
+        return None
+    names = ("__identity__", *tables)
+    placeholders = ",".join("?" for _ in names)
+    try:
+        versions = dict(conn.execute(
+            f"SELECT name, revision FROM cache_revisions WHERE name IN ({placeholders})", names,
+        ))
+    except sqlite3.OperationalError as exc:
+        if "no such table: cache_revisions" not in str(exc):
+            raise
+        return None
+    if any(name not in versions for name in names):
+        return None
+    return tuple(versions[name] for name in names)
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

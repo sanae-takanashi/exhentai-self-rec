@@ -300,6 +300,16 @@ Use `Load More` below the recommendation grid to page through additional scored 
 
 Use the local filter field to narrow recommendations already stored in SQLite by title, tag, category, or uploader. Filtered views search the full bounded local pool, even when the normal recommendation pool is smaller. This does not fetch a new ExHentai search; use the one-off search field and `Fetch Query` for that.
 
+Review pages and queue counts share a bounded 30-second candidate-score snapshot.
+SQLite revision triggers invalidate it immediately after committed changes to
+galleries, feedback, marks, downloads, settings, or other scoring inputs; model
+and evaluation file changes also invalidate it. Uncommitted transactions and
+databases without the revision schema bypass shared caches. Low Interest
+retention, threshold validation, and daily audits still run for every request.
+Unfiltered History scores only the requested page instead of the full history.
+Restart the backend to activate these changes; normal database initialization
+adds the revision table and triggers without rebuilding gallery data.
+
 Use `Enrich` to open detail pages for the best currently recommended galleries that still have only list metadata. This uses the same `Details` limit and saved cookie, but does not fetch new result pages.
 
 Use `Refresh Thumbs` to re-fetch the cover thumbnail for the galleries currently shown on the page (`POST /api/refresh-thumbs` with their `gallery_urls`, capped at 60 per request). This is handy for galleries that were stored before a parser fix and show `No thumbnail`: it opens each gallery's detail page, reads the cover (falling back to the first page image), and updates only `thumb_url` without marking the gallery as fully enriched or retraining the model. It shares the fetch lock, so it is refused while a fetch or enrichment is running.

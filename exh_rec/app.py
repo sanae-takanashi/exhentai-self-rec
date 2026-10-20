@@ -70,6 +70,7 @@ from .recommender import (
     normalize_posted_after,
     parse_bootstrap_tags,
     reaction_history_page,
+    related_queue_counts,
     recommend_page,
     record_gallery_mark,
     record_feedback,
@@ -130,9 +131,6 @@ FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
 FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
 FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
 FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
-QUEUE_COUNTS_CACHE_LOCK = threading.Lock()
-QUEUE_COUNTS_CACHE_TTL_SECONDS = 5.0
-QUEUE_COUNTS_CACHE: dict[str, tuple[tuple, float, dict[str, int]]] = {}
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
@@ -3597,35 +3595,12 @@ def classification_sample_payload(
 
 
 def queue_counts_payload(conn) -> dict[str, int]:
-    database_row = next((row for row in conn.execute("PRAGMA database_list") if row[1] == "main"), None)
-    database_key = str(database_row[2] or "") if database_row else ""
-    database_key = database_key or f"memory:{id(conn)}"
-    fingerprint_row = conn.execute(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM galleries) AS gallery_count,
-            (SELECT COALESCE(MAX(last_seen_at), '') FROM galleries) AS gallery_version,
-            (SELECT COALESCE(MAX(id), 0) FROM feedback) AS feedback_version,
-            (SELECT COALESCE(MAX(updated_at), '') FROM gallery_marks) AS mark_version,
-            (SELECT COALESCE(MAX(updated_at), '') FROM gallery_classification_overrides) AS classification_version,
-            (SELECT COUNT(*) FROM gallery_classification_samples
-             WHERE sampling_frame = 'full-library' AND classification IS NULL) AS classifier_pending,
-            (SELECT COALESCE(GROUP_CONCAT(key || '=' || value, '|'), '') FROM settings
-             WHERE key IN ('recommend_candidate_limit', 'recommend_language_filter',
-                           'recommend_model_mode', 'review_require_bootstrap_match',
-                           'review_low_interest_percent',
-                           'review_low_interest_auto_threshold', 'review_low_interest_max_percent',
-                           'review_low_interest_audit_enabled', 'review_low_interest_audit_daily_count',
-                           'updates_shortlist_limit', 'updates_min_new_pages')) AS settings_version
-        """
-    ).fetchone()
-    fingerprint = tuple(fingerprint_row)
-    with QUEUE_COUNTS_CACHE_LOCK:
-        cached = QUEUE_COUNTS_CACHE.get(database_key)
-        if cached and cached[0] == fingerprint and time.monotonic() - cached[1] < QUEUE_COUNTS_CACHE_TTL_SECONDS:
-            return dict(cached[2])
     candidate_limit = recommend_candidate_limit(conn)
-    continuing_updates = continuing_update_series_index(conn)
+    # Read-only queues run before Review prepares memberships and audit slots.
+    related_counts = related_queue_counts(
+        conn, candidate_limit=candidate_limit,
+        shortlist_limit=updates_shortlist_limit(conn), min_new_pages=updates_min_new_pages(conn),
+    )
     review = recommend_page(
         conn,
         limit=1,
@@ -3634,38 +3609,25 @@ def queue_counts_payload(conn) -> dict[str, int]:
         language_filter=configured_language_filter(conn),
         model_mode=configured_model_mode(conn),
         require_bootstrap_match=configured_review_require_bootstrap_match(conn),
-        continuing_updates=continuing_updates,
         low_interest_percent=review_low_interest_percent(conn),
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),
         low_interest_audit_daily_count=(
             review_low_interest_audit_daily_count(conn)
-            if review_low_interest_audit_enabled(conn)
-            else 0
+            if review_low_interest_audit_enabled(conn) else 0
         ),
         require_prospective_threshold_validation=True,
+        count_only=True,
     )
-    short_repeats = short_repeat_page(
-        conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates
-    )
-    update_page = continuing_update_page(
-        conn,
-        limit=1,
-        candidate_limit=candidate_limit,
-        continuing_updates=continuing_updates,
-        shortlist_limit=updates_shortlist_limit(conn),
-        min_new_pages=updates_min_new_pages(conn),
-    )
-    result = {
+    return {
         "review": int(review["primary_total"]),
         "low_interest": int(review["low_interest_total"]),
-        "short_repeats": int(short_repeats["total"]),
-        "continuing_updates": int(update_page["total"]),
-        "classification_samples": int(fingerprint_row[5]),
+        **related_counts,
+        "classification_samples": int(conn.execute(
+            "SELECT COUNT(*) FROM gallery_classification_samples "
+            "WHERE sampling_frame = 'full-library' AND classification IS NULL"
+        ).fetchone()[0]),
     }
-    with QUEUE_COUNTS_CACHE_LOCK:
-        QUEUE_COUNTS_CACHE[database_key] = (fingerprint, time.monotonic(), result)
-    return dict(result)
 
 
 def response_page_payload(conn, payload: dict[str, Any], require_bootstrap_match: bool = False) -> dict:

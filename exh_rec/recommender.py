@@ -9,15 +9,17 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+from copy import deepcopy
 from dataclasses import asdict
 
+from . import classification as classification_module, personalized as personalized_module
 from .audit import (
     complete_low_interest_audit,
     low_interest_audit_report,
     mark_low_interest_audit_exposed,
     prepare_daily_low_interest_audits,
 )
-from .db import snapshot_gallery_features, visual_embedding_digest
+from .db import cache_revision, snapshot_gallery_features, visual_embedding_digest
 from .exhentai import Gallery
 from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
 from .personalized import (
@@ -99,6 +101,12 @@ RETRAIN_LOCK = threading.RLock()
 SCAN_CACHE_LOCK = threading.RLock()
 SCAN_CACHE_TTL_SECONDS = 30.0
 SCAN_CACHE: dict[tuple[str, str], tuple[tuple, float, object]] = {}
+SCORE_CACHE_LOCK = threading.RLock()
+SCORE_TABLES = (
+    "galleries", "feedback", "gallery_marks", "bootstrap_tags", "feature_weights",
+    "gallery_classification_overrides", "gallery_classification_samples",
+    "hath_downloads", "gallery_visual_images", "gallery_feature_snapshots", "settings",
+)
 MODEL_MODES = {MODEL_MODE_HYBRID, MODEL_MODE_VISUAL, MODEL_MODE_LEGACY}
 INTEREST_BANDS = {INTEREST_BAND_ALL, INTEREST_BAND_PRIMARY, INTEREST_BAND_LOW}
 SHORT_REPEAT_PAGE_LIMIT = 10
@@ -130,17 +138,32 @@ def _database_identity(conn: sqlite3.Connection) -> str:
     return path or f"memory:{id(conn)}"
 
 
-def _cached_scan(conn: sqlite3.Connection, name: str, fingerprint: tuple, builder):
+def _model_file_versions() -> tuple:
+    versions = []
+    for path in (personalized_module.MODEL_PATH, personalized_module.EVALUATION_PATH, classification_module.MODEL_PATH):
+        try:
+            stat = path.stat()
+            versions.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            versions.append((str(path), None, None))
+    return tuple(versions)
+
+
+def _cached_scan(conn: sqlite3.Connection, name: str, fingerprint: tuple | None, builder):
     identity = _database_identity(conn)
-    if identity.startswith("memory:"):
+    if identity.startswith("memory:") or fingerprint is None or conn.in_transaction:
         return builder()
     key = (name, identity)
     with SCAN_CACHE_LOCK:
         cached = SCAN_CACHE.get(key)
-        if cached and cached[0] == fingerprint and time.monotonic() - cached[1] < SCAN_CACHE_TTL_SECONDS:
+        if cached and cached[0] == fingerprint and (
+            name != "recommendation-scores" or time.monotonic() - cached[1] < SCAN_CACHE_TTL_SECONDS
+        ):
             return cached[2]
     value = builder()
     with SCAN_CACHE_LOCK:
+        if len(SCAN_CACHE) >= 32 and key not in SCAN_CACHE:
+            SCAN_CACHE.pop(next(iter(SCAN_CACHE)))
         SCAN_CACHE[key] = (fingerprint, time.monotonic(), value)
     return value
 
@@ -1114,6 +1137,14 @@ def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -
 
 
 def visual_preference_model(conn: sqlite3.Connection) -> dict | None:
+    return _cached_scan(
+        conn, "visual-preference",
+        cache_revision(conn, ("galleries", "feedback", "gallery_marks", "hath_downloads", "settings")),
+        lambda: _build_visual_preference_model(conn),
+    )
+
+
+def _build_visual_preference_model(conn: sqlite3.Connection) -> dict | None:
     confidence_by_id = feedback_confidence_index(conn)
     feedback_rows = conn.execute(
         """
@@ -1262,10 +1293,7 @@ def feedback_confidence(conn: sqlite3.Connection, gallery_url: str, feedback_id:
 
 
 def feedback_confidence_index(conn: sqlite3.Connection) -> dict[int, float]:
-    fingerprint_row = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM feedback"
-    ).fetchone()
-    fingerprint = (int(fingerprint_row["count"]), int(fingerprint_row["max_id"]))
+    fingerprint = cache_revision(conn, ("feedback",))
 
     def build() -> dict[int, float]:
         rows = conn.execute(
@@ -1349,18 +1377,7 @@ def is_identity_feature(feature: str) -> bool:
 
 
 def tag_corpus_strengths(conn: sqlite3.Connection) -> dict[str, float]:
-    fingerprint_row = conn.execute(
-        """
-        SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(tags_json)), 0) AS tag_bytes,
-               COALESCE(MAX(last_seen_at), '') AS last_seen
-        FROM galleries
-        """
-    ).fetchone()
-    fingerprint = (
-        int(fingerprint_row["count"]),
-        int(fingerprint_row["tag_bytes"]),
-        str(fingerprint_row["last_seen"]),
-    )
+    fingerprint = cache_revision(conn, ("galleries",))
     return _cached_scan(conn, "tag-corpus-strengths", fingerprint, lambda: _build_tag_corpus_strengths(conn))
 
 
@@ -1461,49 +1478,11 @@ def recommend(
     )["items"]
 
 
-def recommend_page(
-    conn: sqlite3.Connection,
-    limit: int = 40,
-    include_rated: bool = False,
-    offset: int = 0,
-    filter_text: str | None = None,
-    candidate_limit: int = 2000,
-    freshness_weight: float = 1.0,
-    bootstrap_explore_count: int = 0,
-    explore_seed: str | None = None,
-    language_filter: list[str] | str | None = None,
-    model_mode: str = MODEL_MODE_HYBRID,
-    require_bootstrap_match: bool = False,
-    posted_after: str | None = None,
-    exclude_short_repeats: bool = True,
-    continuing_updates: dict[str, dict] | None = None,
-    personalized_artifact: dict | None = None,
-    low_interest_percent: int = 20,
-    low_interest_auto_threshold: bool = True,
-    low_interest_max_percent: int = DEFAULT_LOW_INTEREST_MAX_PERCENT,
-    interest_band: str = INTEREST_BAND_ALL,
-    low_interest_audit_daily_count: int = 0,
-    require_prospective_threshold_validation: bool = False,
-) -> dict:
-    limit = max(1, min(10000, int(limit)))
-    offset = max(0, int(offset))
-    filter_text = (filter_text or "").strip().lower()
-    candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
-    candidate_limit = max(limit + offset, candidate_limit)
-    freshness_weight = max(0.0, min(50.0, float(freshness_weight)))
-    bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
-    language_filter_values = normalize_language_filter(language_filter)
-    model_mode = normalize_model_mode(model_mode)
-    posted_after = normalize_posted_after(posted_after)
-    low_interest_percent = max(0, min(50, int(low_interest_percent)))
-    low_interest_max_percent = max(
-        low_interest_percent,
-        min(90, max(0, int(low_interest_max_percent))),
-    )
-    interest_band = normalize_interest_band(interest_band)
-    if model_mode == MODEL_MODE_VISUAL:
-        bootstrap_explore_count = 0
-        require_bootstrap_match = False
+def _score_recommendation_candidates(
+    conn, candidate_limit, include_rated, filter_text, model_mode,
+    language_filter_values, freshness_weight, require_bootstrap_match, posted_after,
+    exclude_short_repeats, continuing_updates, personalized_artifact,
+):
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -1692,6 +1671,86 @@ def recommend_page(
             if model_mode == MODEL_MODE_VISUAL
             else "legacy"
         )
+    # Per-request triage needs policy metadata, not the fitted estimators.
+    threshold_artifact = {
+        key: deepcopy(active_personalized_artifact[key])
+        for key in ("ready", "accepted", "score_scale", "calibration", "low_interest_threshold", "model_version")
+        if key in active_personalized_artifact
+    }
+    return scored, personalized_status, threshold_artifact, classifier_status
+
+
+def recommend_page(
+    conn: sqlite3.Connection,
+    limit: int = 40,
+    include_rated: bool = False,
+    offset: int = 0,
+    filter_text: str | None = None,
+    candidate_limit: int = 2000,
+    freshness_weight: float = 1.0,
+    bootstrap_explore_count: int = 0,
+    explore_seed: str | None = None,
+    language_filter: list[str] | str | None = None,
+    model_mode: str = MODEL_MODE_HYBRID,
+    require_bootstrap_match: bool = False,
+    posted_after: str | None = None,
+    exclude_short_repeats: bool = True,
+    continuing_updates: dict[str, dict] | None = None,
+    personalized_artifact: dict | None = None,
+    low_interest_percent: int = 20,
+    low_interest_auto_threshold: bool = True,
+    low_interest_max_percent: int = DEFAULT_LOW_INTEREST_MAX_PERCENT,
+    interest_band: str = INTEREST_BAND_ALL,
+    low_interest_audit_daily_count: int = 0,
+    require_prospective_threshold_validation: bool = False,
+    count_only: bool = False,
+) -> dict:
+    limit = max(1, min(10000, int(limit)))
+    offset = max(0, int(offset))
+    filter_text = (filter_text or "").strip().lower()
+    candidate_limit = 10000 if filter_text else min(10000, max(100, int(candidate_limit)))
+    candidate_limit = max(limit + offset, candidate_limit)
+    freshness_weight = max(0.0, min(50.0, float(freshness_weight)))
+    bootstrap_explore_count = max(0, min(limit - 1, int(bootstrap_explore_count)))
+    language_filter_values = normalize_language_filter(language_filter)
+    model_mode = normalize_model_mode(model_mode)
+    posted_after = normalize_posted_after(posted_after)
+    low_interest_percent = max(0, min(50, int(low_interest_percent)))
+    low_interest_max_percent = max(
+        low_interest_percent,
+        min(90, max(0, int(low_interest_max_percent))),
+    )
+    interest_band = normalize_interest_band(interest_band)
+    if model_mode == MODEL_MODE_VISUAL:
+        bootstrap_explore_count = 0
+        require_bootstrap_match = False
+
+    def build_scores():
+        return _score_recommendation_candidates(
+            conn, candidate_limit, include_rated, filter_text, model_mode,
+            language_filter_values, freshness_weight, require_bootstrap_match, posted_after,
+            exclude_short_repeats, continuing_updates, personalized_artifact,
+        )
+
+    revision = cache_revision(conn, SCORE_TABLES)
+    cacheable = continuing_updates is None and personalized_artifact is None and revision is not None
+    if cacheable:
+        fingerprint = (
+            revision, _model_file_versions(), candidate_limit, include_rated, filter_text, model_mode,
+            tuple(sorted(language_filter_values)), freshness_weight,
+            require_bootstrap_match, posted_after, exclude_short_repeats,
+        )
+        # Only one score snapshot per database; serialize misses across list/count requests.
+        with SCORE_CACHE_LOCK:
+            snapshot = _cached_scan(conn, "recommendation-scores", fingerprint, build_scores)
+        scored, personalized_status, active_personalized_artifact, classifier_status = snapshot
+        scored = deepcopy(scored)
+        personalized_status = deepcopy(personalized_status)
+        active_personalized_artifact = deepcopy(active_personalized_artifact)
+        classifier_status = deepcopy(classifier_status)
+    else:
+        scored, personalized_status, active_personalized_artifact, classifier_status = build_scores()
+
     prospective_validation = (
         low_interest_audit_report(conn) if require_prospective_threshold_validation else None
     )
@@ -1759,18 +1818,19 @@ def recommend_page(
         scored = [item for item in scored if not item["low_interest"]]
     elif interest_band == INTEREST_BAND_LOW:
         scored = [item for item in scored if item["low_interest"]]
-    scored = diversify_ranked_galleries(scored)
+    if not count_only:
+        scored = diversify_ranked_galleries(scored)
     if interest_band == INTEREST_BAND_PRIMARY:
         scored.sort(key=lambda item: (not bool(item.get("audit_id")), int(item.get("audit_id") or 0)))
-    if bootstrap_explore_count and not include_rated and scored:
+    if not count_only and bootstrap_explore_count and not include_rated and scored:
         scored = mix_bootstrap_exploration(
             scored,
             limit=limit,
             count=bootstrap_explore_count,
-            bootstrap_queries=bootstrap_source_queries(bootstrap),
+            bootstrap_queries=bootstrap_source_queries({row["tag"]: row["weight"] for row in get_bootstrap_tags(conn)}),
             seed=explore_seed,
         )
-    items = scored[offset : offset + limit]
+    items = [] if count_only else scored[offset : offset + limit]
     next_offset = offset + len(items)
     return {
         "items": items,
@@ -2457,25 +2517,8 @@ def continuing_series_title_key(gallery: dict) -> str:
     return ""
 
 
-def _relationship_fingerprint(conn: sqlite3.Connection) -> tuple:
-    galleries = conn.execute(
-        """
-        SELECT COUNT(*) AS count, COALESCE(MAX(last_seen_at), '') AS last_seen,
-               COALESCE(SUM(LENGTH(COALESCE(parent_url, '')) + LENGTH(title) + LENGTH(tags_json)), 0) AS bytes
-        FROM galleries
-        """
-    ).fetchone()
-    feedback = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM feedback"
-    ).fetchone()
-    marks = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS updated_at FROM gallery_marks"
-    ).fetchone()
-    return (
-        int(galleries["count"]), str(galleries["last_seen"]), int(galleries["bytes"]),
-        int(feedback["count"]), int(feedback["max_id"]),
-        int(marks["count"]), str(marks["updated_at"]),
-    )
+def _relationship_fingerprint(conn: sqlite3.Connection) -> tuple | None:
+    return cache_revision(conn, ("galleries", "feedback", "gallery_marks"))
 
 
 def continuing_update_series_index(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -2842,6 +2885,31 @@ def short_repeat_related_references(
 
 def is_short_repeat_gallery(gallery: dict, reference_index: dict[str, list[dict]]) -> bool:
     return bool(short_repeat_related_references(gallery, reference_index, limit=1))
+
+
+def related_queue_counts(
+    conn: sqlite3.Connection,
+    candidate_limit: int = 2000,
+    shortlist_limit: int = 40,
+    min_new_pages: int = 50,
+) -> dict[str, int]:
+    revision = cache_revision(conn, SCORE_TABLES)
+    fingerprint = None if revision is None else (
+        revision, _model_file_versions(), candidate_limit, shortlist_limit, min_new_pages,
+    )
+
+    def build():
+        continuing_updates = continuing_update_series_index(conn)
+        repeats = short_repeat_page(
+            conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates,
+        )
+        updates = continuing_update_page(
+            conn, limit=1, candidate_limit=candidate_limit, continuing_updates=continuing_updates,
+            shortlist_limit=shortlist_limit, min_new_pages=min_new_pages,
+        )
+        return {"short_repeats": int(repeats["total"]), "continuing_updates": int(updates["total"])}
+
+    return dict(_cached_scan(conn, "related-queue-counts", fingerprint, build))
 
 
 def short_repeat_page(
@@ -3258,6 +3326,12 @@ def reaction_history_page(
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
+    sql_total = None
+    if not filter_text:
+        sql_total = min(10000, int(conn.execute(
+            "SELECT COUNT(*) FROM (SELECT f.gallery_url FROM feedback f "
+            "JOIN galleries g ON g.url = f.gallery_url GROUP BY f.gallery_url)"
+        ).fetchone()[0]))
     bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
     weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
     visual_model = visual_preference_model(conn)
@@ -3276,8 +3350,9 @@ def reaction_history_page(
         JOIN galleries g ON g.url = f.gallery_url
         LEFT JOIN gallery_marks m ON m.gallery_url = g.url
         ORDER BY f.id DESC
-        LIMIT 10000
-        """
+        LIMIT ? OFFSET ?
+        """,
+        (10000 if filter_text else max(0, min(limit, sql_total - offset)), 0 if filter_text else offset),
     ).fetchall()
 
     items = []
@@ -3313,15 +3388,15 @@ def reaction_history_page(
         gallery["reasons"] = reasons[:5]
         items.append(gallery)
 
-    page_items = items[offset : offset + limit]
+    page_items = items[offset : offset + limit] if filter_text else items
     next_offset = offset + len(page_items)
     return {
         "items": page_items,
         "limit": limit,
         "offset": offset,
         "next_offset": next_offset,
-        "total": len(items),
-        "has_more": next_offset < len(items),
+        "total": len(items) if sql_total is None else sql_total,
+        "has_more": next_offset < (len(items) if sql_total is None else sql_total),
     }
 
 
@@ -3407,6 +3482,7 @@ def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if all(item.get("score_scale") in {"probability", "similarity"} for item in scored):
         return diversify_probability_ranked_galleries(scored)
     remaining = list(scored)
+    cached_keys = {id(item): diversity_keys(item) for item in scored}
     selected: list[dict] = []
     seen: dict[str, int] = {}
     while remaining:
@@ -3414,25 +3490,27 @@ def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
         best_score = None
         best_penalty = 0.0
         for index, item in enumerate(remaining):
-            penalty = diversity_penalty(item, seen)
+            penalty = diversity_penalty(item, seen, keys=cached_keys[id(item)])
             adjusted = float(item["score"]) - penalty
             if best_score is None or adjusted > best_score:
                 best_index = index
                 best_score = adjusted
                 best_penalty = penalty
         item = remaining.pop(best_index)
+        item_keys = cached_keys[id(item)]
         if best_penalty:
             item = dict(item)
             item["score"] = round(float(item["score"]) - best_penalty, 3)
             item["reasons"] = [*item.get("reasons", []), f"diversity -{best_penalty:.2f}"][:5]
         selected.append(item)
-        for key in diversity_keys(item):
+        for key in item_keys:
             seen[key] = seen.get(key, 0) + 1
     return selected
 
 
 def diversify_probability_ranked_galleries(scored: list[dict], probability_window: float = 0.08) -> list[dict]:
     remaining = list(scored)
+    cached_keys = {id(item): diversity_keys(item) for item in scored}
     selected: list[dict] = []
     seen: dict[str, int] = {}
     while remaining:
@@ -3445,18 +3523,19 @@ def diversify_probability_ranked_galleries(scored: list[dict], probability_windo
         best_index, best_item = max(
             eligible,
             key=lambda pair: (
-                diversity_rank_score(pair[1]) - diversity_penalty(pair[1], seen) * 0.03,
+                diversity_rank_score(pair[1]) - diversity_penalty(pair[1], seen, keys=cached_keys[id(pair[1])]) * 0.03,
                 float(pair[1].get("confidence") or 0.0),
                 -pair[0],
             ),
         )
         item = remaining.pop(best_index)
-        penalty = diversity_penalty(item, seen)
+        item_keys = cached_keys[id(item)]
+        penalty = diversity_penalty(item, seen, keys=item_keys)
         if penalty:
             item = dict(item)
             item["reasons"] = [*item.get("reasons", []), "near-score diversity"][:5]
         selected.append(item)
-        for key in diversity_keys(item):
+        for key in item_keys:
             seen[key] = seen.get(key, 0) + 1
     return selected
 
@@ -3469,8 +3548,8 @@ def diversity_rank_score(item: dict) -> float:
     return float(item.get("score") or 0.0)
 
 
-def diversity_penalty(item: dict, seen: dict[str, int]) -> float:
-    repeats = sum(seen.get(key, 0) for key in diversity_keys(item))
+def diversity_penalty(item: dict, seen: dict[str, int], keys: list[str] | None = None) -> float:
+    repeats = sum(seen.get(key, 0) for key in (diversity_keys(item) if keys is None else keys))
     return min(1.5, repeats * DIVERSITY_PENALTY)
 
 
