@@ -83,16 +83,34 @@ No thresholds, automatic-expansion permissions or visibility semantics changed.
   on 1,515 examples with 1,212 classifier-fit and 303 calibration examples.
   It remained unaccepted, and all 40 sampled serving results used legacy fallback.
   The production model artifact hash remained unchanged.
-- Production has not been restarted or migrated by this review. Its HTTP service
-  was healthy, but its exact original launcher arguments/environment were not
-  recoverable. Preserve that launch window and H@H reverse-tunnel configuration.
-  Publication is not live deployment.
+- Initial publication did not restart production: its exact original launcher
+  arguments/environment were not recoverable, so the original launch window and
+  H@H reverse-tunnel configuration were preserved for an owner-controlled restart.
 
-Restart from the original launch window using its existing command. Independently
-read back `/api/status` runtime versions, database schema-2 baseline coverage,
-model acceptance/fallback and the established H@H receiver/tunnel health before
-calling deployment complete. Do not replace the original launcher with guessed
-defaults or launch a second instance against the production database.
+### Verified Production Deployment
+
+The owner restarted the original launcher on 2026-10-23. Independent HTTP and
+read-only database verification completed at 18:53 Singapore time:
+
+- `/api/status` reports `personalized-content-v5`, `content-features-v6`,
+  `temporal-serving-v2` and snapshot schema 2.
+- All 15,206 galleries have schema-2 snapshots. Migration baselines were captured
+  at 18:50:19 Singapore time, not backdated. All 26,080 pre-existing snapshots
+  match the pre-deployment database copy by count and a digest over every old
+  column. Strict historical training remains at 481 examples.
+- `/api/model` reports the trained v5 candidate with 1,515 examples and 303
+  independent calibration examples; calibration slope is positive (1.2899).
+  Acceptance remains false. All 40 items returned by the actual recommendation
+  endpoint use `legacy-linear-v1` and expose no calibrated likelihood.
+- An actual H@H observer heartbeat arrived after migration, at 18:52:12 Singapore
+  time, less than a minute before verification. This verifies the existing event
+  receiver path after restart without injecting synthetic integration events.
+- Feedback and impression totals remain 2,176 and 36,918. Verification did not
+  manufacture preference labels or exposure events.
+
+Deployment verification passed. The current work is complete; retain the gates
+and collect new prospective data before another model iteration. Private
+allowlisted evidence is `data/reassessment-deployed-20261023.json`.
 
 ## Next Review
 
@@ -112,4 +130,4 @@ Run the read-only evaluator with the ML-enabled environment:
 Keep populated databases, models, gallery-level reports and execution evidence
 local under ignored `data/`. Final private evidence for this review includes
 `reassessment-v5-final-20261023.json`, `reassessment-tests-20261023.json` and
-`reassessment-sandbox-20261023.json`.
+`reassessment-sandbox-20261023.json` and `reassessment-deployed-20261023.json`.
