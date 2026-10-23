@@ -2,7 +2,10 @@ import sqlite3
 import unittest
 
 from exh_rec import db
-from scripts.evaluate_recommender import confidence_interval, non_overlapping_starts, restrict_temporal_training_data
+from scripts.evaluate_recommender import (
+    confidence_interval, gallery_payload, materialize_history, non_overlapping_starts,
+    restrict_temporal_training_data,
+)
 
 
 class TemporalEvaluationTest(unittest.TestCase):
@@ -99,6 +102,44 @@ class TemporalEvaluationTest(unittest.TestCase):
         self.assertIsNotNone(interval)
         self.assertLess(interval[0], 0.8)
         self.assertGreater(interval[1], 0.8)
+
+    def test_single_fold_cannot_claim_zero_uncertainty(self):
+        self.assertIsNone(confidence_interval([0.8]))
+
+    def test_prefix_preserves_old_votes_and_neutral_resets(self):
+        url = "https://exhentai.org/g/1/token/"
+        self.conn.execute("INSERT INTO feedback(gallery_url, vote, created_at) VALUES (?, 0, ?)",
+                          (url, "2026-01-20 00:00:00"))
+        restrict_temporal_training_data(self.conn, [], "2026-02-01 00:00:00")
+        self.assertEqual([row[0] for row in self.conn.execute("SELECT vote FROM feedback ORDER BY id")], [1, 0])
+
+    def test_future_classification_sample_labels_are_excluded(self):
+        for labeled_at in ("2026-01-20 00:00:00", "2026-03-01 00:00:00", None):
+            self.conn.execute("""INSERT INTO gallery_classification_samples(
+                gallery_url, sampling_strategy, selection_probability, classification, sampled_at, labeled_at)
+                VALUES (?, 'uncertainty', 1, 'updates', '2026-01-01 00:00:00', ?)""",
+                ("https://exhentai.org/g/1/token/", labeled_at))
+        restrict_temporal_training_data(self.conn, [], "2026-02-01 00:00:00")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM gallery_classification_samples").fetchone()[0], 1)
+
+    def test_historical_serving_materializes_snapshot_not_current_gallery(self):
+        url = "https://exhentai.org/g/1/token/"
+        self.conn.execute("UPDATE galleries SET first_seen_at='2026-01-01', last_seen_at='2026-01-01' WHERE url=?", (url,))
+        db.snapshot_gallery_features(self.conn, url, "test", "2026-01-01 00:00:00")
+        self.conn.execute("UPDATE galleries SET title='Future', parent_url='future', rating=5, review_excluded=1 WHERE url=?", (url,))
+        history = materialize_history(self.conn, "2026-02-01 00:00:00")
+        row = self.conn.execute("SELECT title, parent_url, rating, review_excluded FROM galleries WHERE url=?", (url,)).fetchone()
+        self.assertEqual(tuple(row), ("Gallery 1", None, None, 0))
+        self.assertEqual(history["historical_galleries"], 1)
+        self.assertEqual(history["complete_galleries"], 1)
+
+    def test_v1_snapshot_does_not_inherit_future_structural_metadata(self):
+        url = "https://exhentai.org/g/1/token/"
+        self.conn.execute("INSERT INTO gallery_feature_snapshots(gallery_url, title, captured_at) VALUES (?, 'Past', '2026-01-01')", (url,))
+        self.conn.execute("UPDATE galleries SET parent_url='future' WHERE url=?", (url,))
+        payload = gallery_payload(self.conn, url, "2026-02-01", strict_snapshot=True)
+        self.assertIsNone(payload["parent_url"])
+        self.assertEqual(payload["snapshot_schema"], 1)
 
 
 if __name__ == "__main__":

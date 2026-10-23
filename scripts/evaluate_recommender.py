@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from exh_rec import db  # noqa: E402
 from exh_rec.personalized import (  # noqa: E402
+    EVALUATION_PROTOCOL,
     FEATURE_SCHEMA,
     MODEL_SCHEMA,
     PersonalizedModelUnavailable,
@@ -29,9 +31,6 @@ from exh_rec.recommender import (  # noqa: E402
     parse_visual_embedding,
     recommend_page,
     retrain_model,
-    score_gallery,
-    tag_corpus_strengths,
-    visual_preference_model,
 )
 
 
@@ -63,7 +62,8 @@ def gallery_payload(
         if snapshot is None and strict_snapshot:
             return None
         if snapshot:
-            gallery.update(snapshot)
+            # Never fill a historical snapshot's missing fields with today's state.
+            gallery = {"url": gallery_url, **snapshot}
     gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
     gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json") or "{}")
     gallery["visual_embedding"] = parse_visual_embedding(gallery.get("visual_embedding_json"))
@@ -87,7 +87,7 @@ def baseline_scores(galleries: list[dict]) -> dict[str, list[float]]:
         / float(16**12)
         for item in galleries
     ]
-    recency_values = [str(item.get("feature_snapshot_at") or item.get("first_seen_at") or "") for item in galleries]
+    recency_values = [str(item.get("first_seen_at") or "") for item in galleries]
     recency_order = {value: index for index, value in enumerate(sorted(set(recency_values)))}
     recency_scores = [float(recency_order[value]) for value in recency_values]
     site_rating = [float(item.get("rating") or 0.0) for item in galleries]
@@ -99,11 +99,21 @@ def restrict_temporal_training_data(
     training_ids: list[int],
     test_start: str,
 ) -> None:
-    if training_ids:
-        placeholders = ",".join("?" for _ in training_ids)
-        conn.execute(f"DELETE FROM feedback WHERE id NOT IN ({placeholders})", training_ids)
-    else:
-        conn.execute("DELETE FROM feedback")
+    # Retain the full prefix, including old votes and neutral resets. The globally
+    # latest label IDs are not the history that was available at this cutoff.
+    conn.execute(
+        "DELETE FROM feedback WHERE julianday(created_at) IS NULL OR julianday(created_at) >= julianday(?)",
+        (test_start,),
+    )
+    conn.execute(
+        """
+        DELETE FROM gallery_classification_samples
+        WHERE julianday(sampled_at) IS NULL OR julianday(sampled_at) >= julianday(?)
+           OR (classification IS NOT NULL AND
+               (julianday(labeled_at) IS NULL OR julianday(labeled_at) >= julianday(?)))
+        """,
+        (test_start, test_start),
+    )
     conn.execute(
         """
         DELETE FROM gallery_marks
@@ -132,20 +142,22 @@ def restrict_temporal_training_data(
 
 
 def metric_set(
-    labels: list[int], probabilities: list[float], modules: dict, ranking_scores: list[float] | None = None
+    labels: list[int], probabilities: list[float] | None, modules: dict, ranking_scores: list[float] | None = None
 ) -> dict:
     np = modules["np"]
     y = np.asarray(labels, dtype="int8")
-    p = np.asarray(probabilities, dtype="float64")
+    p = None if probabilities is None else np.asarray(probabilities, dtype="float64")
     ranking = p if ranking_scores is None else np.asarray(ranking_scores, dtype="float64")
+    if ranking is None or len(ranking) != len(labels) or not len(labels):
+        raise ValueError("metrics require aligned nonempty labels and scores")
     order = np.argsort(-ranking)
     result = {
         "count": len(labels),
         "positive_count": int(y.sum()),
         "roc_auc": None,
         "pr_auc": None,
-        "brier": round(float(modules["brier_score_loss"](y, p)), 6),
-        "ece": round(expected_calibration_error(y, p), 6),
+        "brier": None if p is None else round(float(modules["brier_score_loss"](y, p)), 6),
+        "ece": None if p is None else round(expected_calibration_error(y, p), 6),
     }
     if len(set(labels)) > 1:
         result["roc_auc"] = round(float(modules["roc_auc_score"](y, ranking)), 6)
@@ -154,8 +166,8 @@ def metric_set(
         selected = order[: min(cutoff, len(order))]
         result[f"precision_at_{cutoff}"] = round(float(y[selected].mean()), 6) if len(selected) else None
         result[f"ndcg_at_{cutoff}"] = round(ndcg_at(y, ranking, cutoff), 6)
-    high = p >= 0.8
-    low = p <= 0.2
+    high = np.zeros(len(y), dtype=bool) if p is None else p >= 0.8
+    low = np.zeros(len(y), dtype=bool) if p is None else p <= 0.2
     result["high_confidence_false_positive_rate"] = (
         round(float((1 - y[high]).mean()), 6) if int(high.sum()) else None
     )
@@ -185,15 +197,82 @@ def ndcg_at(labels, probabilities, cutoff: int) -> float:
     return dcg / idcg if idcg else 0.0
 
 
+def materialize_snapshot(conn: sqlite3.Connection, gallery_url: str, snapshot: dict) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(galleries)")}
+    values = {key: value for key, value in snapshot.items() if key in columns and key != "url"}
+    for key, default in (("first_seen_at", ""), ("last_seen_at", ""), ("review_excluded", 0),
+                         ("samples_json", "[]"), ("tags_json", "[]"), ("tag_weights_json", "{}")):
+        values[key] = values.get(key) if values.get(key) is not None else default
+    for key in ("posted_at", "parent_url", "source_query", "samples_fetched_at"):
+        values.setdefault(key, None)
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    conn.execute(f"UPDATE galleries SET {assignments} WHERE url = ?", [*values.values(), gallery_url])
+
+
+def materialize_history(conn: sqlite3.Connection, cutoff: str) -> dict:
+    total = known = complete = 0
+    for row in conn.execute("SELECT url FROM galleries").fetchall():
+        total += 1
+        snapshot = gallery_feature_snapshot(conn, row["url"], cutoff)
+        if snapshot is None:
+            # This is an isolated in-memory replay, never the production database.
+            conn.execute("DELETE FROM galleries WHERE url = ?", (row["url"],))
+            continue
+        known += 1
+        complete += snapshot.get("snapshot_schema", 1) >= 2
+        materialize_snapshot(conn, row["url"], snapshot)
+    return {"source_galleries": total, "historical_galleries": known, "complete_galleries": complete}
+
+
+def paired_serving_metrics(conn, galleries, labels, artifact, modules, training_conn=None) -> dict:
+    urls = [gallery["url"] for gallery in galleries]
+    conn.execute("UPDATE galleries SET review_excluded = 1")
+    for gallery in galleries:
+        snapshot = {key: gallery[key] for key in db.SNAPSHOT_FIELDS if key in gallery}
+        snapshot["tags_json"] = json.dumps(gallery["tags"])
+        snapshot["tag_weights_json"] = json.dumps(gallery["tag_weights"])
+        materialize_snapshot(conn, gallery["url"], snapshot)
+    candidate = deepcopy(artifact)
+    # Exercise the challenger serving path only inside this private replay.
+    # This flag never reaches production or the persisted artifact.
+    candidate["accepted"] = bool((candidate.get("calibration") or {}).get("ready"))
+    common = dict(limit=len(urls), candidate_limit=max(100, len(urls)), freshness_weight=1.0,
+                  model_mode=MODEL_MODE_HYBRID, low_interest_percent=0, low_interest_auto_threshold=False,
+                  training_conn=training_conn)
+    challenger = recommend_page(conn, personalized_artifact=candidate, **common)["items"]
+    baseline = recommend_page(conn, personalized_artifact={"ready": False, "status": "replay-baseline"}, **common)["items"]
+    left = {item["url"]: (index, item) for index, item in enumerate(challenger)}
+    right = {item["url"]: (index, item) for index, item in enumerate(baseline)}
+    indices = [index for index, url in enumerate(urls) if url in left and url in right]
+    result = {"requested": len(urls), "paired": len(indices), "filtered": len(urls) - len(indices),
+              "challenger_count": len(left), "legacy_count": len(right), "personalized": None, "legacy": None,
+              "baselines": {}}
+    if not indices:
+        return result
+    paired_labels = [labels[index] for index in indices]
+    probabilities = [left[urls[index]][1].get("like_probability") for index in indices]
+    calibrated = probabilities if all(value is not None for value in probabilities) else None
+    result["personalized"] = metric_set(paired_labels, calibrated, modules,
+        ranking_scores=[float(-left[urls[index]][0]) for index in indices])
+    result["legacy"] = metric_set(paired_labels, None, modules,
+        ranking_scores=[float(-right[urls[index]][0]) for index in indices])
+    result["baselines"] = {name: metric_set(paired_labels, None, modules, ranking_scores=scores)
+        for name, scores in baseline_scores([galleries[index] for index in indices]).items()}
+    return result
+
+
 def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) -> dict:
     modules = sklearn_modules()
-    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    source = sqlite3.connect(":memory:")
     source.row_factory = sqlite3.Row
+    with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as live:
+        live.backup(source)
     feedback = latest_feedback(source)
     starts = non_overlapping_starts(len(feedback), window)
     folds = []
     eligible_test_count = 0
     requested_test_count = 0
+    skipped_folds = []
     for start in starts:
         test = feedback[start : start + window]
         if not test:
@@ -203,6 +282,7 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
         source.backup(conn)
         training_ids = [int(row["id"]) for row in feedback[:start]]
         restrict_temporal_training_data(conn, training_ids, str(test[0]["created_at"]))
+        history = materialize_history(conn, str(test[0]["created_at"]))
         retrain_model(conn)
         artifact = train_personalized_model(
             conn,
@@ -210,15 +290,11 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
             strict_temporal=strict_snapshots,
         )
 
-        bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
-        weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
-        visual = visual_preference_model(conn)
-        strengths = tag_corpus_strengths(conn)
         requested_test_count += len(test)
         paired = []
         for row in test:
             gallery = gallery_payload(
-                conn,
+                source,
                 row["gallery_url"],
                 at=str(row["created_at"]),
                 strict_snapshot=strict_snapshots,
@@ -227,73 +303,51 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
                 paired.append((row, gallery))
         eligible_test_count += len(paired)
         if len(paired) < 20 or not artifact.get("ready"):
+            skipped_folds.append({"test_start": test[0]["created_at"], "snapshot_count": len(paired),
+                                  "model_status": artifact.get("status"), "train_count": artifact.get("sample_count")})
             conn.close()
             continue
         test = [row for row, _gallery in paired]
         galleries = [gallery for _row, gallery in paired]
         labels = [1 if float(row["vote"]) > 0 else 0 for row in test]
-        legacy = []
-        legacy_scores = []
-        for gallery in galleries:
-            score, _ = score_gallery(gallery, bootstrap, weights, visual_model=visual, tag_strengths=strengths)
-            legacy_scores.append(score)
-            legacy.append(1.0 / (1.0 + math.exp(-max(-12.0, min(12.0, score)))))
         predictions, _ = score_personalized_galleries(conn, galleries, artifact=artifact)
-        personalized = [float(item["like_probability"]) for item in predictions]
-        personalized_model = list(personalized)
-        served_scores = None
-        if personalized:
-            test_urls = [str(row["gallery_url"]) for row in test]
-            conn.execute("UPDATE galleries SET review_excluded = 1")
-            placeholders = ",".join("?" for _ in test_urls)
-            conn.execute(f"UPDATE galleries SET review_excluded = 0 WHERE url IN ({placeholders})", test_urls)
-            served = recommend_page(
-                conn,
-                limit=len(test_urls),
-                candidate_limit=max(100, len(test_urls)),
-                freshness_weight=1.0,
-                model_mode=MODEL_MODE_HYBRID,
-                personalized_artifact=artifact,
-            )["items"]
-            served_positions = {item["url"]: index for index, item in enumerate(served)}
-            served_probabilities = {
-                item["url"]: float(item["like_probability"])
-                for item in served
-                if item.get("like_probability") is not None
-            }
-            personalized = [
-                served_probabilities.get(gallery["url"], probability)
-                for gallery, probability in zip(galleries, personalized)
-            ]
-            served_scores = [
-                float(len(test_urls) - served_positions[gallery["url"]])
-                if gallery["url"] in served_positions
-                else float(-1 - index)
-                for index, gallery in enumerate(galleries)
-            ]
+        probabilities = [item["like_probability"] for item in predictions]
+        calibrated = probabilities if all(value is not None for value in probabilities) else None
+        # Freeze every learned component (including the continuation classifier and
+        # visual preference baseline) before materializing later candidate features.
+        training = sqlite3.connect(":memory:")
+        training.row_factory = sqlite3.Row
+        conn.commit()
+        conn.backup(training)
+        # Newly observed test galleries are not necessarily in the cutoff corpus.
+        for gallery in galleries:
+            if conn.execute("SELECT 1 FROM galleries WHERE url = ?", (gallery["url"],)).fetchone() is None:
+                conn.execute("INSERT INTO galleries(url, title) VALUES (?, ?)", (gallery["url"], gallery["title"]))
+        replay = paired_serving_metrics(conn, galleries, labels, artifact, modules, training_conn=training)
+        training.close()
         fold = {
             "train_count": start,
             "test_count": len(test),
             "test_start": test[0]["created_at"],
             "test_end": test[-1]["created_at"],
-            "legacy": metric_set(labels, legacy, modules, ranking_scores=legacy_scores),
-            "baselines": {
-                name: metric_set(labels, [1.0 / (1.0 + math.exp(-score)) for score in scores], modules, ranking_scores=scores)
-                for name, scores in baseline_scores(galleries).items()
-            },
-            "personalized": (
-                metric_set(labels, personalized, modules, ranking_scores=served_scores)
-                if personalized else None
+            "legacy": replay["legacy"],
+            "baselines": replay["baselines"],
+            "personalized": replay["personalized"],
+            "personalized_model": metric_set(labels, calibrated, modules,
+                ranking_scores=[item["rank_score"] for item in predictions]),
+            "served_count": replay["paired"],
+            "serving_coverage": {key: replay[key] for key in ("requested", "paired", "filtered", "challenger_count", "legacy_count")},
+            "history": history,
+            "historical_serving_state_complete": (
+                history["historical_galleries"] > 0
+                and history["complete_galleries"] == history["historical_galleries"]
+                and all(item.get("snapshot_schema", 1) >= 2 for item in galleries)
             ),
-            "personalized_model": (
-                metric_set(labels, personalized_model, modules) if personalized_model else None
-            ),
-            "served_count": 0 if served_scores is None else sum(score > 0 for score in served_scores),
             "model": {
                 key: artifact.get(key)
-                for key in ("status", "selected_c", "sample_count", "calibration")
+                for key in ("status", "selected_c", "sample_count", "classifier_fit_count", "calibration")
             },
-            "segments": segment_metrics(galleries, labels, personalized, modules) if personalized else {},
+            "segments": segment_metrics(galleries, labels, calibrated, modules) if calibrated else {},
         }
         folds.append(fold)
         conn.close()
@@ -305,11 +359,20 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
     summary["acceptance"] = acceptance(summary, folds)
     return {
         "model_schema": MODEL_SCHEMA,
+        "evaluation_protocol": EVALUATION_PROTOCOL,
+        "diagnostic_only": not strict_snapshots or not all(
+            fold.get("historical_serving_state_complete") is True for fold in folds
+        ) or not folds,
         "feature_schema": FEATURE_SCHEMA,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "sample_count": len(feedback),
         "database": str(db_path),
         "folds": folds,
+        "skipped_folds": skipped_folds,
+        "scope": "conditional labeled replay under current policy; not full-library recall or a randomized online trial",
+        "limitations": ["bootstrap/settings policy has no historical event log",
+                        "mutable marks and classification overrides have only last-write timestamps",
+                        "v1 snapshots lack historical structural eligibility and recency fields"],
         "summary": summary,
     }
 
@@ -356,8 +419,13 @@ def confidence_interval(values: list[float]) -> list[float] | None:
         return None
     mean = statistics.mean(values)
     if len(values) == 1:
-        return [round(mean, 6), round(mean, 6)]
-    margin = 1.96 * statistics.stdev(values) / math.sqrt(len(values))
+        return None
+    # Two-sided Student t critical values, conservatively rounded up by df band.
+    critical_values = {1: 12.707, 2: 4.303, 3: 3.183, 4: 2.777, 5: 2.571,
+                       10: 2.229, 20: 2.087, 30: 2.043}
+    df = len(values) - 1
+    critical = critical_values[max(key for key in critical_values if key <= df)]
+    margin = critical * statistics.stdev(values) / math.sqrt(len(values))
     return [round(mean - margin, 6), round(mean + margin, 6)]
 
 
@@ -395,6 +463,16 @@ def acceptance(summary: dict, folds: list[dict]) -> dict:
         "strict_snapshot_coverage_at_least_0_80": (
             bool(summary.get("strict_snapshots"))
             and float(summary.get("snapshot_coverage") or 0.0) >= 0.80
+        ),
+        "historical_serving_state_complete": bool(folds) and all(
+            fold.get("historical_serving_state_complete") is True for fold in folds
+        ),
+        "paired_serving_candidates_complete": bool(folds) and all(
+            (fold.get("serving_coverage") or {}).get("paired", 0) >= 20
+            and (fold.get("serving_coverage") or {}).get("challenger_count")
+                == (fold.get("serving_coverage") or {}).get("legacy_count")
+                == (fold.get("serving_coverage") or {}).get("paired")
+            for fold in folds
         ),
         "independent_calibration_ready_in_all_folds": calibration_ready,
         "ndcg_at_20_beats_best_baseline": (

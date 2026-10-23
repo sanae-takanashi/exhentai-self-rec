@@ -1481,18 +1481,19 @@ def recommend(
 def _score_recommendation_candidates(
     conn, candidate_limit, include_rated, filter_text, model_mode,
     language_filter_values, freshness_weight, require_bootstrap_match, posted_after,
-    exclude_short_repeats, continuing_updates, personalized_artifact,
+    exclude_short_repeats, continuing_updates, personalized_artifact, training_conn=None,
 ):
-    bootstrap = {row["tag"]: row["weight"] for row in conn.execute("SELECT tag, weight FROM bootstrap_tags")}
-    weights = {row["feature"]: row["weight"] for row in conn.execute("SELECT feature, weight FROM feature_weights")}
-    visual_model = visual_preference_model(conn)
-    tag_strengths = tag_corpus_strengths(conn)
+    training_conn = conn if training_conn is None else training_conn
+    bootstrap = {row["tag"]: row["weight"] for row in training_conn.execute("SELECT tag, weight FROM bootstrap_tags")}
+    weights = {row["feature"]: row["weight"] for row in training_conn.execute("SELECT feature, weight FROM feature_weights")}
+    visual_model = visual_preference_model(training_conn)
+    tag_strengths = tag_corpus_strengths(training_conn)
     short_repeat_reference_index = (
-        related_feedback_reference_index(conn) if exclude_short_repeats and not include_rated else {}
+        related_feedback_reference_index(training_conn) if exclude_short_repeats and not include_rated else {}
     )
     if continuing_updates is None:
-        continuing_updates = continuing_update_series_index(conn) if exclude_short_repeats and not include_rated else {}
-    overrides = classification_overrides(conn)
+        continuing_updates = continuing_update_series_index(training_conn) if exclude_short_repeats and not include_rated else {}
+    overrides = classification_overrides(training_conn)
     unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL AND hd.gallery_url IS NULL" if not include_rated else ""
     rows = conn.execute(
         f"""
@@ -1527,7 +1528,7 @@ def _score_recommendation_candidates(
     scored = []
     personalized_inputs: list[dict] = []
     classifier_inputs = [gallery_item_from_row(row) for row in rows]
-    classifier_decisions, classifier_status = continuing_classifier_decisions(conn, classifier_inputs)
+    classifier_decisions, classifier_status = continuing_classifier_decisions(training_conn, classifier_inputs)
     for idx, row in enumerate(rows):
         gallery = dict(row)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
@@ -1623,14 +1624,17 @@ def _score_recommendation_candidates(
             )
         personalized_status = model_public_status(active_personalized_artifact)
         predictions_ready = active_personalized_artifact.get("ready") and len(predictions) == len(scored)
+        serving_ready = predictions_ready and active_personalized_artifact.get("accepted") and all(
+            prediction.get("like_probability") is not None for prediction in predictions
+        )
         if predictions_ready:
             for gallery, prediction in zip(scored, predictions):
-                probability = float(prediction["like_probability"])
+                probability = optional_float(prediction.get("like_probability"))
                 prior_rank_score = apply_bootstrap_probability_prior(
-                    float(prediction["like_probability"]), gallery, bootstrap
+                    float(prediction["rank_score"]), gallery, bootstrap
                 )
                 freshness_offset = min(0.5, max(0.0, float(gallery.get("freshness_bonus") or 0.0)) * 0.1)
-                prediction["like_probability"] = round(probability, 6)
+                prediction["like_probability"] = None if probability is None else round(probability, 6)
                 prediction["rank_score"] = round(
                     apply_probability_logit_offset(prior_rank_score, freshness_offset),
                     6,
@@ -1639,11 +1643,11 @@ def _score_recommendation_candidates(
                 gallery["personalized_like_probability"] = prediction["like_probability"]
                 gallery["personalized_rank_score"] = prediction["rank_score"]
                 gallery["personalized_uncertainty"] = prediction.get("uncertainty")
-                if active_personalized_artifact.get("accepted"):
+                if serving_ready:
                     gallery.update(prediction)
                     gallery["score"] = gallery["rank_score"]
                     gallery["reasons"] = personalized_reasons(gallery, prediction, bootstrap)
-        if not (predictions_ready and active_personalized_artifact.get("accepted")):
+        if not serving_ready:
             for gallery in scored:
                 gallery.update(legacy_prediction_fields(gallery, personalized_status))
     elif model_mode != MODEL_MODE_VISUAL:
@@ -1704,7 +1708,9 @@ def recommend_page(
     low_interest_audit_daily_count: int = 0,
     require_prospective_threshold_validation: bool = False,
     count_only: bool = False,
+    training_conn: sqlite3.Connection | None = None,
 ) -> dict:
+    # Temporal replay can freeze learned preferences independently of candidate features.
     limit = max(1, min(10000, int(limit)))
     offset = max(0, int(offset))
     filter_text = (filter_text or "").strip().lower()
@@ -1730,10 +1736,11 @@ def recommend_page(
             conn, candidate_limit, include_rated, filter_text, model_mode,
             language_filter_values, freshness_weight, require_bootstrap_match, posted_after,
             exclude_short_repeats, continuing_updates, personalized_artifact,
+            training_conn,
         )
 
     revision = cache_revision(conn, SCORE_TABLES)
-    cacheable = continuing_updates is None and personalized_artifact is None and revision is not None
+    cacheable = training_conn is None and continuing_updates is None and personalized_artifact is None and revision is not None
     if cacheable:
         fingerprint = (
             revision, _model_file_versions(), candidate_limit, include_rated, filter_text, model_mode,

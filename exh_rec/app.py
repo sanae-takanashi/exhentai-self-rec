@@ -52,7 +52,7 @@ from .classification import (
     load_continuing_classifier,
     public_classifier_status,
 )
-from .personalized import hath_download_signal_weight
+from .personalized import EVALUATION_PROTOCOL, FEATURE_SCHEMA, MODEL_SCHEMA, hath_download_signal_weight
 from .recommender import (
     clear_feedback,
     clear_gallery_mark,
@@ -848,6 +848,12 @@ def get_status() -> dict:
         dinov2_device = configured_dinov2_device(conn)
         visual_encoder = configured_visual_encoder(conn)
         return {
+            "recommendation_runtime": {
+                "model_schema": MODEL_SCHEMA,
+                "feature_schema": FEATURE_SCHEMA,
+                "evaluation_protocol": EVALUATION_PROTOCOL,
+                "snapshot_schema": 2,
+            },
             "fetch": dict(FETCH_STATE),
             "parent_update": parent_update_status(),
             "last_fetch": last_fetch_run(conn),

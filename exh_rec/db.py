@@ -188,7 +188,16 @@ CREATE TABLE IF NOT EXISTS gallery_feature_snapshots (
     visual_embedding_json TEXT,
     visual_embedding_digest TEXT,
     visual_embedding_version TEXT,
-    visual_embedding_at TEXT
+    visual_embedding_at TEXT,
+    snapshot_schema INTEGER NOT NULL DEFAULT 1,
+    posted_at TEXT,
+    parent_url TEXT,
+    review_excluded INTEGER,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    source_query TEXT,
+    samples_json TEXT,
+    samples_fetched_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS gallery_marks (
@@ -432,6 +441,11 @@ def init_db() -> None:
         ensure_column(conn, "galleries", "visual_embedding_version", "TEXT")
         ensure_column(conn, "galleries", "visual_embedding_at", "TEXT")
         ensure_column(conn, "gallery_feature_snapshots", "visual_embedding_digest", "TEXT")
+        ensure_column(conn, "gallery_feature_snapshots", "snapshot_schema", "INTEGER NOT NULL DEFAULT 1")
+        for name in ("posted_at", "parent_url", "first_seen_at", "last_seen_at", "source_query",
+                     "samples_json", "samples_fetched_at"):
+            ensure_column(conn, "gallery_feature_snapshots", name, "TEXT")
+        ensure_column(conn, "gallery_feature_snapshots", "review_excluded", "INTEGER")
         ensure_column(
             conn,
             "gallery_classification_samples",
@@ -505,22 +519,15 @@ def init_db() -> None:
               AND EXISTS (SELECT 1 FROM galleries g WHERE g.gid = hath_downloads.gid)
             """
         )
+        columns = ", ".join(SNAPSHOT_FIELDS)
+        selected = ", ".join(f"g.{key}" for key in SNAPSHOT_FIELDS)
         conn.execute(
-            """
-            INSERT INTO gallery_feature_snapshots(
-                gallery_url, captured_at, source, title, title_jpn, category, uploader,
-                rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
-                visual_embedding_json, visual_embedding_digest,
-                visual_embedding_version, visual_embedding_at
-            )
-            SELECT g.url, CURRENT_TIMESTAMP, 'migration-current', g.title, g.title_jpn,
-                   g.category, g.uploader, g.rating, g.tags_json, g.tag_weights_json,
-                   g.page_count, g.detail_fetched_at, g.visual_embedding_json,
-                   g.visual_embedding_digest,
-                   g.visual_embedding_version, g.visual_embedding_at
+            f"""
+            INSERT INTO gallery_feature_snapshots(gallery_url, captured_at, source, snapshot_schema, {columns})
+            SELECT g.url, CURRENT_TIMESTAMP, 'migration-current-v2', 2, {selected}
             FROM galleries g
             WHERE NOT EXISTS (
-                SELECT 1 FROM gallery_feature_snapshots s WHERE s.gallery_url = g.url
+                SELECT 1 FROM gallery_feature_snapshots s WHERE s.gallery_url = g.url AND s.snapshot_schema >= 2
             )
             """
         )
@@ -591,6 +598,15 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return data
 
 
+SNAPSHOT_FIELDS = (
+    "title", "title_jpn", "category", "uploader", "rating", "tags_json", "tag_weights_json",
+    "page_count", "detail_fetched_at", "visual_embedding_json", "visual_embedding_digest",
+    "visual_embedding_version", "visual_embedding_at", "posted_at", "parent_url",
+    "review_excluded", "first_seen_at", "last_seen_at", "source_query", "samples_json",
+    "samples_fetched_at",
+)
+
+
 def snapshot_gallery_features(
     conn: sqlite3.Connection,
     gallery_url: str,
@@ -599,23 +615,13 @@ def snapshot_gallery_features(
     *,
     force: bool = False,
 ) -> int | None:
-    row = conn.execute(
-        """
-        SELECT title, title_jpn, category, uploader, rating, tags_json, tag_weights_json,
-               page_count, detail_fetched_at, visual_embedding_json, visual_embedding_digest,
-               visual_embedding_version, visual_embedding_at
-        FROM galleries
-        WHERE url = ?
-        """,
-        (gallery_url,),
-    ).fetchone()
+    columns = ", ".join(SNAPSHOT_FIELDS)
+    row = conn.execute(f"SELECT {columns} FROM galleries WHERE url = ?", (gallery_url,)).fetchone()
     if row is None:
         return None
     previous = conn.execute(
-        """
-        SELECT title, title_jpn, category, uploader, rating, tags_json, tag_weights_json,
-               page_count, detail_fetched_at, visual_embedding_json, visual_embedding_digest,
-               visual_embedding_version, visual_embedding_at
+        f"""
+        SELECT {columns}, snapshot_schema
         FROM gallery_feature_snapshots
         WHERE gallery_url = ?
           AND (? IS NULL OR (
@@ -627,34 +633,20 @@ def snapshot_gallery_features(
         """,
         (gallery_url, captured_at, captured_at),
     ).fetchone()
-    if not force and previous is not None and tuple(previous) == tuple(row):
+    if (not force and previous is not None and previous["snapshot_schema"] == 2
+            and tuple(previous)[:-1] == tuple(row)):
         return None
+    placeholders = ", ".join("?" for _ in SNAPSHOT_FIELDS)
     cursor = conn.execute(
-        """
-        INSERT INTO gallery_feature_snapshots(
-            gallery_url, captured_at, source, title, title_jpn, category, uploader,
-            rating, tags_json, tag_weights_json, page_count, detail_fetched_at,
-            visual_embedding_json, visual_embedding_digest,
-            visual_embedding_version, visual_embedding_at
-        ) VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        f"""
+        INSERT INTO gallery_feature_snapshots(gallery_url, captured_at, source, snapshot_schema, {columns})
+        VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, 2, {placeholders})
         """,
         (
             gallery_url,
             captured_at,
             str(source or "metadata")[:40],
-            row["title"],
-            row["title_jpn"],
-            row["category"],
-            row["uploader"],
-            row["rating"],
-            row["tags_json"],
-            row["tag_weights_json"],
-            row["page_count"],
-            row["detail_fetched_at"],
-            row["visual_embedding_json"],
-            row["visual_embedding_digest"],
-            row["visual_embedding_version"],
-            row["visual_embedding_at"],
+            *tuple(row),
         ),
     )
     return int(cursor.lastrowid)

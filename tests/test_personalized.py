@@ -9,6 +9,8 @@ from unittest.mock import patch
 from exh_rec import db
 from exh_rec.exhentai import Gallery
 from exh_rec.personalized import (
+    EVALUATION_CHECKS,
+    EVALUATION_PROTOCOL,
     FEATURE_SCHEMA,
     MIN_CLASS,
     MIN_LABELED,
@@ -244,7 +246,10 @@ class PersonalizedTest(unittest.TestCase):
             "feature_schema": FEATURE_SCHEMA,
             "generated_at": generated_at,
             "sample_count": 100,
-            "summary": {"acceptance": {"passed": True, "checks": {"example": True}}},
+            "evaluation_protocol": EVALUATION_PROTOCOL,
+            "diagnostic_only": False,
+            "summary": {"strict_snapshots": True, "snapshot_coverage": 1.0, "fold_count": 3,
+                        "acceptance": {"passed": True, "checks": dict.fromkeys(EVALUATION_CHECKS, True)}},
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "evaluation.json"

@@ -12,9 +12,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .db import SNAPSHOT_FIELDS
 
-MODEL_SCHEMA = "personalized-content-v4"
+
+MODEL_SCHEMA = "personalized-content-v5"
 FEATURE_SCHEMA = "content-features-v6"
+EVALUATION_PROTOCOL = "temporal-serving-v2"
+EVALUATION_CHECKS = (
+    "at_least_3_non_overlapping_folds", "strict_snapshot_coverage_at_least_0_80",
+    "historical_serving_state_complete", "paired_serving_candidates_complete",
+    "independent_calibration_ready_in_all_folds", "ndcg_at_20_beats_best_baseline",
+    "precision_at_10_not_worse_than_best_baseline", "ece_at_most_0_10",
+)
 MIN_LABELED = 50
 MIN_CLASS = 15
 MIN_CALIBRATION_SAMPLES = 20
@@ -121,6 +130,7 @@ def model_data_signature(conn: sqlite3.Connection, examples: list[dict] | None =
         compact["visual_embedding_length"] = len(raw_embedding)
         compact_examples.append(compact)
     payload = {
+        "model_schema": MODEL_SCHEMA,
         "feature_schema": FEATURE_SCHEMA,
         "examples": compact_examples,
     }
@@ -152,11 +162,7 @@ def gallery_feature_snapshot(
 ) -> dict | None:
     row = conn.execute(
         """
-        SELECT id AS feature_snapshot_id, captured_at AS feature_snapshot_at,
-               title, title_jpn, category, uploader, rating, tags_json,
-               tag_weights_json, page_count, detail_fetched_at,
-               visual_embedding_json, visual_embedding_digest,
-               visual_embedding_version, visual_embedding_at
+        SELECT *
         FROM gallery_feature_snapshots
         WHERE gallery_url = ?
           AND julianday(captured_at) IS NOT NULL
@@ -166,7 +172,17 @@ def gallery_feature_snapshot(
         """,
         (gallery_url, at),
     ).fetchone()
-    return dict(row) if row else None
+    return _snapshot_payload(row) if row else None
+
+
+def _snapshot_payload(row) -> dict:
+    item = dict(row)
+    return {
+        **{key: item[key] for key in SNAPSHOT_FIELDS if key in item},
+        "snapshot_schema": int(item.get("snapshot_schema") or 1),
+        "feature_snapshot_id": item["id"],
+        "feature_snapshot_at": item["captured_at"],
+    }
 
 
 def gallery_feature_snapshot_map(
@@ -184,12 +200,7 @@ def gallery_feature_snapshot_map(
         rows = conn.execute(
             f"""
             WITH targets(target_index, gallery_url, target_at) AS (VALUES {values})
-            SELECT t.target_index,
-                   s.id AS feature_snapshot_id, s.captured_at AS feature_snapshot_at,
-                   s.title, s.title_jpn, s.category, s.uploader, s.rating, s.tags_json,
-                   s.tag_weights_json, s.page_count, s.detail_fetched_at,
-                   s.visual_embedding_json, s.visual_embedding_digest,
-                   s.visual_embedding_version, s.visual_embedding_at
+            SELECT t.target_index, s.*
             FROM targets t
             JOIN gallery_feature_snapshots s ON s.id = (
                 SELECT candidate.id
@@ -205,9 +216,7 @@ def gallery_feature_snapshot_map(
         ).fetchall()
         for row in rows:
             key = chunk[int(row["target_index"])]
-            snapshot = dict(row)
-            snapshot.pop("target_index", None)
-            snapshots[key] = snapshot
+            snapshots[key] = _snapshot_payload(row)
     return snapshots
 
 
@@ -568,20 +577,31 @@ def _rolling_splits(count: int) -> list[tuple[int, int]]:
     return [(start, min(count, start + window)) for start in starts if start < count]
 
 
-def _select_c(matrix, labels, weights, modules: dict[str, Any]) -> tuple[float, list[dict]]:
+def _select_c(matrix, labels, weights, modules: dict[str, Any], examples: list[dict] | None = None) -> tuple[float, list[dict]]:
     reports: list[dict] = []
     best_c = 0.2
     best_auc: float | None = None
+    splits = []
+    for start, end in _rolling_splits(len(labels)):
+        if len(set(labels[:start])) < 2 or len(set(labels[start:end])) < 2:
+            continue
+        if examples is None:
+            train_matrix, test_matrix = matrix[:start], matrix[start:end]
+        else:
+            fitted = _fit_vectorizers(examples[:start], modules)
+            train_matrix = fitted["matrix"]
+            test_matrix = _transform(examples[start:end], fitted, modules)
+        splits.append((start, end, train_matrix, test_matrix))
     for c_value in (0.05, 0.2, 1.0, 4.0):
         aucs = []
-        for start, end in _rolling_splits(len(labels)):
+        for start, end, train_matrix, test_matrix in splits:
             train_labels = labels[:start]
             test_labels = labels[start:end]
             if len(set(train_labels)) < 2 or len(set(test_labels)) < 2:
                 continue
             model = _classifier(modules, c_value)
-            model.fit(matrix[:start], train_labels, sample_weight=weights[:start])
-            probabilities = model.predict_proba(matrix[start:end])[:, 1]
+            model.fit(train_matrix, train_labels, sample_weight=weights[:start])
+            probabilities = model.predict_proba(test_matrix)[:, 1]
             aucs.append(float(modules["roc_auc_score"](test_labels, probabilities)))
         mean_auc = sum(aucs) / len(aucs) if aucs else None
         reports.append({"c": c_value, "mean_auc": None if mean_auc is None else round(mean_auc, 6), "folds": len(aucs)})
@@ -601,11 +621,13 @@ def _calibration_start(labels) -> int | None:
     return start
 
 
-def _fit_calibrator(matrix, labels, weights, c_value: float, modules: dict[str, Any], start: int | None):
+def _fit_calibrator(matrix, labels, weights, c_value: float, modules: dict[str, Any], start: int | None, classifier=None):
     if start is None:
         return None
-    model = _classifier(modules, c_value)
-    model.fit(matrix[:start], labels[:start], sample_weight=weights[:start])
+    model = classifier
+    if model is None:
+        model = _classifier(modules, c_value)
+        model.fit(matrix[:start], labels[:start], sample_weight=weights[:start])
     logits = [float(value) for value in model.decision_function(matrix[start:])]
     targets = [int(value) for value in labels[start:]]
     calibration_weights = []
@@ -626,7 +648,35 @@ def _fit_calibrator(matrix, labels, weights, c_value: float, modules: dict[str, 
         targets,
         sample_weight=calibration_weights,
     )
-    return calibrator
+    return calibrator if _valid_calibrator(calibrator) else None
+
+
+def _valid_calibrator(calibrator) -> bool:
+    if calibrator is None:
+        return False
+    try:
+        slope = float(calibrator.coef_[0][0])
+        intercept = float(calibrator.intercept_[0])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    return math.isfinite(slope) and slope > 0.0 and math.isfinite(intercept)
+
+
+def _fit_temporal_classifier(examples: list[dict], selected_c: float, modules: dict[str, Any]):
+    labels = modules["np"].asarray([int(item["label"]) for item in examples], dtype="int8")
+    weights = modules["np"].asarray([float(item["sample_weight"]) for item in examples], dtype="float32")
+    calibration_start = _calibration_start(labels)
+    fit_end = calibration_start if calibration_start is not None else len(examples)
+    # Freeze preprocessing and the base classifier before observing calibration labels.
+    fitted = _fit_vectorizers(examples[:fit_end], modules)
+    matrix = _transform(examples, fitted, modules)
+    classifier = _classifier(modules, selected_c)
+    classifier.fit(matrix[:fit_end], labels[:fit_end], sample_weight=weights[:fit_end])
+    calibrator = _fit_calibrator(
+        matrix, labels, weights, selected_c, modules, calibration_start, classifier=classifier
+    )
+    fitted["matrix"] = matrix
+    return fitted, classifier, calibrator, calibration_start, fit_end
 
 
 def _bootstrap_classifiers(matrix, labels, weights, c_value: float, modules: dict[str, Any]) -> list[Any]:
@@ -644,7 +694,7 @@ def _bootstrap_classifiers(matrix, labels, weights, c_value: float, modules: dic
 
 
 def _calibrated(logits, calibrator, modules: dict[str, Any]):
-    if calibrator is not None:
+    if _valid_calibrator(calibrator):
         return calibrator.predict_proba(modules["np"].asarray(logits).reshape(-1, 1))[:, 1]
     values = modules["np"].clip(logits, -20, 20)
     return 1.0 / (1.0 + modules["np"].exp(-values))
@@ -687,21 +737,19 @@ def _temporal_oof_probabilities(
         test_labels = modules["np"].asarray([int(item["label"]) for item in test], dtype="int8")
         if len(set(train_labels)) < 2 or not test:
             continue
-        fitted = _fit_vectorizers(train, modules)
-        train_weights = modules["np"].asarray(
-            [float(item["sample_weight"]) for item in train], dtype="float32"
-        )
-        calibration_start = _calibration_start(train_labels)
-        calibrator = _fit_calibrator(
-            fitted["matrix"], train_labels, train_weights, selected_c, modules, calibration_start
-        )
+        selection_end = _calibration_start(train_labels)
+        selection_end = len(train) if selection_end is None else selection_end
+        train_weights = modules["np"].asarray([float(item["sample_weight"]) for item in train])
+        fold_c, _ = _select_c(None, train_labels[:selection_end], train_weights[:selection_end],
+                              modules, examples=train[:selection_end])
+        fitted, classifier, calibrator, calibration_start, fit_end = _fit_temporal_classifier(train, fold_c, modules)
         calibration_ready = calibrator is not None
         all_calibrated = all_calibrated and calibration_ready
-        classifier = _classifier(modules, selected_c)
-        classifier.fit(fitted["matrix"], train_labels, sample_weight=train_weights)
         test_matrix = _transform(test, fitted, modules)
         probabilities = _calibrated(classifier.decision_function(test_matrix), calibrator, modules)
         for relative_index, probability in enumerate(probabilities):
+            if not calibration_ready:
+                continue
             absolute_index = start + relative_index
             predictions_by_index.setdefault(
                 absolute_index,
@@ -716,6 +764,8 @@ def _temporal_oof_probabilities(
                 "train_count": start,
                 "test_count": end - start,
                 "calibration_ready": calibration_ready,
+                "classifier_fit_count": fit_end,
+                "selected_c": fold_c,
             }
         )
     return list(predictions_by_index.values()), folds, bool(folds) and all_calibrated
@@ -824,20 +874,19 @@ def _train_personalized_model(
         return status
     try:
         modules = sklearn_modules()
-        fitted = _fit_vectorizers(examples, modules)
         labels = modules["np"].asarray([int(item["label"]) for item in examples], dtype="int8")
         weights = modules["np"].asarray([float(item["sample_weight"]) for item in examples], dtype="float32")
         calibration_start = _calibration_start(labels)
         selection_end = calibration_start if calibration_start is not None else len(labels)
         selected_c, validation = _select_c(
-            fitted["matrix"][:selection_end], labels[:selection_end], weights[:selection_end], modules
+            None, labels[:selection_end], weights[:selection_end], modules, examples=examples[:selection_end]
         )
-        calibrator = _fit_calibrator(
-            fitted["matrix"], labels, weights, selected_c, modules, calibration_start
+        fitted, classifier, calibrator, calibration_start, fit_end = _fit_temporal_classifier(
+            examples, selected_c, modules
         )
-        classifier = _classifier(modules, selected_c)
-        classifier.fit(fitted["matrix"], labels, sample_weight=weights)
-        bootstrap_models = _bootstrap_classifiers(fitted["matrix"], labels, weights, selected_c, modules)
+        bootstrap_models = _bootstrap_classifiers(
+            fitted["matrix"][:fit_end], labels[:fit_end], weights[:fit_end], selected_c, modules
+        )
         version = f"{MODEL_SCHEMA}-{signature}"
         trained_at = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         low_interest_threshold = learn_low_interest_threshold(
@@ -850,6 +899,9 @@ def _train_personalized_model(
         accepted, acceptance = (
             evaluation_acceptance(len(examples)) if _is_file_database(conn) else (True, {"source": "test"})
         )
+        if calibrator is None:
+            accepted = False
+            acceptance = {"passed": False, "reason": "independent monotone calibration unavailable"}
         artifact = {
             **base,
             "ready": True,
@@ -857,14 +909,21 @@ def _train_personalized_model(
             "accepted": accepted,
             "acceptance": acceptance,
             "model_version": version,
-            "score_scale": "probability",
+            "score_scale": "probability" if calibrator is not None else "uncalibrated",
             "selected_c": selected_c,
+            "classifier_fit_count": fit_end,
             "validation": validation,
             "calibration": {
-                "method": "independent-temporal-holdout",
+                "method": "frozen-classifier-temporal-holdout",
                 "start": calibration_start,
                 "sample_count": 0 if calibration_start is None else len(labels) - calibration_start,
                 "ready": calibrator is not None,
+                "status": (
+                    "ready" if calibrator is not None else
+                    "non-increasing-or-invalid-fit" if calibration_start is not None else
+                    "insufficient-holdout"
+                ),
+                "slope": None if calibrator is None else float(calibrator.coef_[0][0]),
             },
             "low_interest_threshold": low_interest_threshold,
             "trained_at": trained_at,
@@ -933,6 +992,15 @@ def _record_training_run(conn: sqlite3.Connection, artifact: dict) -> None:
         pass
 
 
+def _refresh_acceptance(artifact: dict) -> dict:
+    if not _valid_calibrator(artifact.get("calibrator")) or not (artifact.get("calibration") or {}).get("ready"):
+        artifact["accepted"] = False
+        artifact["acceptance"] = {"passed": False, "reason": "independent monotone calibration unavailable"}
+    else:
+        artifact["accepted"], artifact["acceptance"] = evaluation_acceptance(int(artifact.get("sample_count") or 0))
+    return artifact
+
+
 def load_personalized_model(
     conn: sqlite3.Connection,
     train_if_needed: bool = True,
@@ -952,7 +1020,7 @@ def load_personalized_model(
                     and artifact.get("ready")
                     and artifact.get("signature") == active_signature
                 ):
-                    return artifact
+                    return _refresh_acceptance(artifact)
             except Exception:
                 pass
     with _MODEL_LOCK:
@@ -961,18 +1029,14 @@ def load_personalized_model(
         cached = _MODEL_CACHE.get(signature)
         if cached is not None:
             if _is_file_database(conn) and cached.get("ready"):
-                accepted, acceptance = evaluation_acceptance(int(cached.get("sample_count") or 0))
-                cached["accepted"] = accepted
-                cached["acceptance"] = acceptance
+                _refresh_acceptance(cached)
             return cached
         if _is_file_database(conn) and MODEL_PATH.exists():
             try:
                 modules = sklearn_modules()
                 artifact = modules["joblib"].load(MODEL_PATH)
                 if artifact.get("schema") == MODEL_SCHEMA and artifact.get("signature") == signature:
-                    accepted, acceptance = evaluation_acceptance(int(artifact.get("sample_count") or 0))
-                    artifact["accepted"] = accepted
-                    artifact["acceptance"] = acceptance
+                    _refresh_acceptance(artifact)
                     _MODEL_CACHE[signature] = artifact
                     return artifact
                 active_row = conn.execute(
@@ -988,7 +1052,7 @@ def load_personalized_model(
                     stale = dict(artifact)
                     stale["stale"] = True
                     stale["pending_signature"] = signature
-                    return stale
+                    return _refresh_acceptance(stale)
             except Exception:
                 pass
         if train_if_needed:
@@ -1025,6 +1089,12 @@ def score_personalized_galleries(
     matrix = _transform(decoded, artifact, modules)
     logits = artifact["classifier"].decision_function(matrix)
     probabilities = _calibrated(logits, artifact.get("calibrator"), modules)
+    probability_ready = _valid_calibrator(artifact.get("calibrator")) and bool(
+        (artifact.get("calibration") or {}).get("ready")
+    )
+    if not probability_ready:
+        artifact = {**artifact, "accepted": False, "score_scale": "uncalibrated",
+                    "acceptance": {"passed": False, "reason": "independent monotone calibration unavailable"}}
     bootstrap_probabilities = []
     for model in artifact.get("bootstrap_models") or []:
         bootstrap_probabilities.append(_calibrated(model.decision_function(matrix), artifact.get("calibrator"), modules))
@@ -1041,12 +1111,12 @@ def score_personalized_galleries(
         positive, negative = _explain_row(matrix[index], artifact, modules, names=names)
         results.append(
             {
-                "like_probability": round(probability, 6),
+                "like_probability": round(probability, 6) if probability_ready else None,
                 "uncertainty": round(spread, 6),
                 "confidence": round(max(0.0, min(1.0, 1.0 - spread * 4.0)), 6),
                 "rank_score": round(probability, 6),
                 "model_version": artifact["model_version"],
-                "score_scale": artifact.get("score_scale", "probability"),
+                "score_scale": artifact.get("score_scale", "probability") if probability_ready else "uncalibrated",
                 "reason_details": {"positive": positive, "negative": negative},
                 "text_visual_disagreement": round(_modality_disagreement(
                     matrix[index], artifact, modules, numeric_end=numeric_end,
@@ -1063,6 +1133,13 @@ def evaluation_acceptance(current_sample_count: int | None = None) -> tuple[bool
             return False, {"passed": False, "reason": "evaluation report targets a different model schema"}
         if report.get("feature_schema") != FEATURE_SCHEMA:
             return False, {"passed": False, "reason": "evaluation report targets a different feature schema"}
+        if report.get("evaluation_protocol") != EVALUATION_PROTOCOL:
+            return False, {"passed": False, "reason": "evaluation report uses an obsolete replay protocol"}
+        summary = report.get("summary") or {}
+        if (report.get("diagnostic_only") is not False or summary.get("strict_snapshots") is not True
+                or float(summary.get("snapshot_coverage") or 0.0) < 0.8
+                or int(summary.get("fold_count") or 0) < 3):
+            return False, {"passed": False, "reason": "evaluation report lacks strict non-diagnostic replay evidence"}
         generated_at = str(report.get("generated_at") or "")
         try:
             generated = datetime.strptime(generated_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -1081,9 +1158,13 @@ def evaluation_acceptance(current_sample_count: int | None = None) -> tuple[bool
                 "minimum_samples": minimum_samples,
             }
         acceptance = dict((report.get("summary") or {}).get("acceptance") or report.get("acceptance") or {})
+        checks = acceptance.get("checks") or {}
+        if not all(checks.get(key) is True for key in EVALUATION_CHECKS):
+            acceptance["passed"] = False
+            acceptance["reason"] = "required temporal serving checks did not all pass"
         acceptance.update({"generated_at": generated_at, "sample_count": evaluated_samples})
-        return bool(acceptance.get("passed")), acceptance
-    except (OSError, json.JSONDecodeError):
+        return acceptance.get("passed") is True, acceptance
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
         return False, {"passed": False, "reason": "no passing temporal evaluation report"}
 
 
@@ -1131,6 +1212,7 @@ def model_public_status(artifact: dict) -> dict:
         key: artifact.get(key)
         for key in (
             "ready", "status", "model_version", "trained_at", "sample_count", "positive_count",
+            "classifier_fit_count",
             "negative_count", "selected_c", "validation", "multi_interest_enabled", "error",
             "accepted", "acceptance",
             "score_scale", "calibration", "low_interest_threshold",
