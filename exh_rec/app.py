@@ -75,6 +75,7 @@ from .recommender import (
     recommend_page,
     record_gallery_mark,
     record_feedback,
+    undo_feedback,
     reset_library,
     retrain_model,
     clear_shared_thumbnail_metadata,
@@ -508,8 +509,22 @@ class Handler(BaseHTTPRequestHandler):
                         "removed_gallery_url": gallery_url,
                         "feedback_update": feedback_update,
                         "feedback_enrichment": feedback_enrichment,
+                        "feedback_undo_supported": True,
                     }
                 )
+            elif path == "/api/feedback/undo":
+                payload = self.read_json()
+                gallery_url = str(payload.get("gallery_url") or "").strip()
+                feedback_id = payload.get("feedback_id")
+                if not gallery_url or type(feedback_id) is not int or not 0 < feedback_id < 2**63:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "gallery_url and a positive integer feedback_id are required")
+                with db.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if not undo_feedback(conn, gallery_url, feedback_id):
+                        raise ApiError(HTTPStatus.CONFLICT, "Rating changed; refresh before reviewing again")
+                    retrain_status = mark_model_retrain_pending(conn)
+                MODEL_RETRAIN_WAKE.set()
+                self.send_json({"ok": True, "gallery_url": gallery_url, "model_retrain": retrain_status})
             elif path == "/api/feedback/copy-continuing":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "").strip()

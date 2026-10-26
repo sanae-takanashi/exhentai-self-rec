@@ -611,6 +611,25 @@ def record_feedback(
     return model_invalidated
 
 
+def undo_feedback(conn: sqlite3.Connection, gallery_url: str, feedback_id: int) -> bool:
+    """Remove one exact latest event. The caller must hold a write transaction."""
+    latest = conn.execute(
+        "SELECT id FROM feedback WHERE gallery_url = ? ORDER BY id DESC LIMIT 1",
+        (gallery_url,),
+    ).fetchone()
+    if latest is None or latest["id"] != feedback_id:
+        return False
+    conn.execute("DELETE FROM feedback WHERE gallery_url = ? AND id = ?", (gallery_url, feedback_id))
+    # Retain the original sampling and exposure facts, but never substitute a label.
+    conn.execute(
+        """UPDATE low_interest_audits SET status = 'incomplete', completed_at = NULL,
+           outcome_source = NULL, outcome_positive = NULL, feedback_id = NULL
+           WHERE gallery_url = ? AND feedback_id = ? AND outcome_source = 'feedback'""",
+        (gallery_url, feedback_id),
+    )
+    return True
+
+
 def clear_feedback(conn: sqlite3.Connection, gallery_url: str, retrain: bool = True) -> int:
     cursor = conn.execute("DELETE FROM feedback WHERE gallery_url = ?", (gallery_url,))
     if cursor.rowcount and retrain:

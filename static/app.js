@@ -139,6 +139,169 @@ const pendingFeedbackUrls = new Set();
 const pendingClassificationSampleIds = new Set();
 let renderedGalleryUrls = [];
 let renderedGalleryItems = [];
+let reviewLayout = "grid";
+let reviewCurrentUrl = "";
+let reviewQueueEpoch = 0;
+let reviewUndo = null;
+let reviewLoading = false;
+let reviewLoadSequence = 0;
+let reviewUndoPending = false;
+let reviewReloadQueued = false;
+let reviewUpdatesAvailable = false;
+const reviewOpenedUrls = new Set();
+const impressionContexts = new Map();
+let disposeGalleryVisibility = () => {};
+try {
+  reviewLayout = sessionStorage.getItem("review-layout") === "focus" ? "focus" : "grid";
+  reviewCurrentUrl = sessionStorage.getItem("review-current") || "";
+} catch (_) { /* Storage may be unavailable in private browser contexts. */ }
+
+function isFocusReview() {
+  return currentView === "review" && reviewLayout === "focus";
+}
+
+function reviewBusy() {
+  return reviewLoading || reviewUndoPending || pendingFeedbackUrls.size > 0 || pendingGalleryRefreshUrls.size > 0;
+}
+
+function currentReviewItem() {
+  return renderedGalleryItems.find((item) => item.url === reviewCurrentUrl) || renderedGalleryItems[0];
+}
+
+function saveReviewPosition() {
+  try {
+    sessionStorage.setItem("review-layout", reviewLayout);
+    sessionStorage.setItem("review-current", reviewCurrentUrl);
+  } catch (_) { /* The review queue does not depend on browser storage. */ }
+}
+
+function updateReviewControls() {
+  const focus = isFocusReview();
+  document.body?.classList.toggle("focus-review", focus);
+  document.querySelector("#reviewModeControls")?.classList.toggle("hidden", currentView !== "review");
+  document.querySelector("#reviewSessionToolbar")?.classList.toggle("hidden", !focus);
+  document.querySelector("#reviewGridMode").checked = reviewLayout === "grid";
+  document.querySelector("#reviewFocusMode").checked = reviewLayout === "focus";
+  for (const id of ["reviewGridMode", "reviewFocusMode"]) document.querySelector(`#${id}`).disabled = reviewBusy();
+  const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
+  document.querySelector("#reviewPosition").textContent = `${index < 0 ? 0 : index + 1} / ${renderedGalleryItems.length}`;
+  document.querySelector("#reviewPrevBtn").disabled = reviewBusy() || index <= 0;
+  document.querySelector("#reviewNextBtn").disabled = reviewBusy() || (index >= renderedGalleryItems.length - 1 && !hasMoreRecommendations);
+  document.querySelector("#reviewUndoBtn").disabled = reviewBusy() || !reviewUndo;
+  const refresh = document.querySelector("#reviewRefreshBtn");
+  refresh.disabled = reviewBusy();
+  refresh.classList.toggle("updates-available", reviewUpdatesAvailable);
+  refresh.title = reviewUpdatesAvailable ? "New updates available; refresh review queue" : "Refresh review queue";
+  if (focus) {
+    for (const button of recommendationsEl.querySelectorAll("button[data-url]")) button.disabled = reviewBusy();
+  }
+  if (focus && recommendationsEl.getBoundingClientRect) {
+    const top = recommendationsEl.getBoundingClientRect().top + window.scrollY;
+    const footerHeight = recommendationsEl.querySelector(".focus-rating")?.getBoundingClientRect().height || 118;
+    recommendationsEl.style.setProperty("--review-work-height", `${Math.max(120, window.innerHeight - top - footerHeight - 24)}px`);
+  }
+}
+
+function setReviewLayout(layout) {
+  if (reviewBusy()) {
+    updateReviewControls();
+    return;
+  }
+  reviewLayout = layout === "focus" ? "focus" : "grid";
+  saveReviewPosition();
+  renderGalleryCards(renderedGalleryItems);
+}
+
+async function navigateReview(delta) {
+  if (!isFocusReview() || reviewBusy()) return;
+  const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
+  const target = index + delta;
+  if (target >= renderedGalleryItems.length && hasMoreRecommendations) {
+    const previousLength = renderedGalleryItems.length;
+    await loadCurrentPage(nextRecommendationOffset, true);
+    if (!isFocusReview() || renderedGalleryItems.length <= previousLength) return;
+  }
+  if (target < 0 || target >= renderedGalleryItems.length) return;
+  reviewCurrentUrl = renderedGalleryItems[target].url;
+  renderGalleryCards(renderedGalleryItems);
+}
+
+function deferFocusRefresh() {
+  if (!isFocusReview()) return false;
+  reviewUpdatesAvailable = true;
+  updateReviewControls();
+  return true;
+}
+
+function rememberReviewRating(payload, context) {
+  if (!context?.item || context.epoch !== reviewQueueEpoch || currentView !== "review") return;
+  const id = payload.feedback_update?.latest_feedback_id;
+  reviewUndo = payload.feedback_undo_supported === true && Number.isInteger(id) && id > 0
+    ? { ...context, feedbackId: id } : null;
+}
+
+async function undoReviewRating() {
+  if (!isFocusReview() || reviewBusy() || !reviewUndo) return;
+  const undo = reviewUndo;
+  reviewUndoPending = true;
+  ++recommendationRequestId;
+  updateReviewControls();
+  try {
+    await api("/api/feedback/undo", {
+      method: "POST",
+      body: JSON.stringify({ gallery_url: undo.item.url, feedback_id: undo.feedbackId }),
+    });
+    if (undo.epoch !== reviewQueueEpoch || currentView !== "review") {
+      reviewUndoPending = false;
+      await loadCurrentPage();
+      return;
+    }
+    reviewUndo = null;
+    renderedGalleryItems = renderedGalleryItems.filter((item) => item.url !== undo.item.url);
+    renderedGalleryItems.splice(Math.min(undo.index, renderedGalleryItems.length), 0, undo.item);
+    ++nextRecommendationOffset;
+    reviewCurrentUrl = undo.item.url;
+    renderGalleryCards(renderedGalleryItems);
+    refreshQueueCounts();
+    setStatus("Last rating undone");
+  } catch (error) {
+    if (error.status === 409) reviewUndo = null;
+    throw error;
+  } finally {
+    ++recommendationRequestId;
+    reviewUndoPending = false;
+    for (const item of renderedGalleryItems) setGalleryFeedbackButtonsDisabled(item.url, false);
+    updateReviewControls();
+    await flushDeferredReviewReload();
+  }
+}
+
+async function flushDeferredReviewReload() {
+  if (currentView === "review" && reviewReloadQueued && !reviewBusy()) {
+    reviewReloadQueued = false;
+    await loadCurrentPage();
+  }
+}
+
+function reviewKeydown(event) {
+  if (!isFocusReview() || reviewBusy() || event.defaultPrevented || event.repeat || event.isComposing ||
+      event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
+      event.target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])") ||
+      document.querySelector("dialog[open], [role='dialog'][aria-modal='true']")) return;
+  const item = currentReviewItem();
+  const key = event.key.toLowerCase();
+  let action;
+  if (key === "z") action = () => undoReviewRating();
+  else if (key === "arrowleft") action = () => navigateReview(-1);
+  else if (key === "arrowright") action = () => navigateReview(1);
+  else if (item && /^[1-5]$/.test(key)) action = () => score(item.url, Number(key));
+  else if (item && key === "s") action = () => skip(item.url);
+  else if (item && key === "o") action = () => recommendationsEl.querySelector("a.title")?.click();
+  if (action) {
+    event.preventDefault();
+    Promise.resolve(action()).catch((error) => setStatus(error.message, true));
+  }
+}
 let parentProgressVisible = false;
 let parentProgressPollTimer = null;
 const pendingGalleryRefreshUrls = new Set();
@@ -255,7 +418,9 @@ async function api(path, options = {}) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -452,7 +617,7 @@ function scheduleVisualRefresh() {
   visualRefreshTimer = setTimeout(() => {
     visualRefreshTimer = null;
     if (currentView !== "preview") {
-      loadCurrentPage().catch(() => {});
+      if (!deferFocusRefresh()) loadCurrentPage().catch(() => {});
     }
   }, 5000);
 }
@@ -796,6 +961,12 @@ function updateCurrentQueueCount(payload) {
 }
 
 function setActiveView(view) {
+  ++recommendationRequestId;
+  ++reviewQueueEpoch;
+  reviewUndo = null;
+  ++reviewLoadSequence;
+  reviewLoading = false;
+  disposeGalleryVisibility();
   currentView = view;
   for (const tab of viewTabs) {
     const active = tab.dataset.view === view;
@@ -824,6 +995,7 @@ function setActiveView(view) {
     : classifierView
       ? "Filter classifier samples by title, tag, category, uploader"
       : defaultLocalFilterPlaceholder;
+  updateReviewControls();
 }
 
 async function loadCurrentPage(offset = 0, append = false) {
@@ -1802,8 +1974,23 @@ async function loadMarkedGalleries(kind, offset = 0, append = false) {
 }
 
 async function loadRecommendations(offset = 0, append = false) {
+  if (isFocusReview() && (reviewUndoPending || pendingFeedbackUrls.size || pendingGalleryRefreshUrls.size)) {
+    reviewReloadQueued = true;
+    return;
+  }
   const requestedView = currentView;
   const requestId = ++recommendationRequestId;
+  const reviewLoadId = requestedView === "review" ? ++reviewLoadSequence : null;
+  if (requestedView === "review") {
+    reviewReloadQueued = false;
+    reviewLoading = true;
+    if (!append) {
+      ++reviewQueueEpoch;
+      reviewUndo = null;
+      reviewUpdatesAvailable = false;
+    }
+    updateReviewControls();
+  }
   const localFilter = localFilterEl.value.trim();
   const includeRated = requestedView === "preview" ? "1" : "0";
   const freshnessWeight = requestedView === "preview" ? previewFreshnessWeightEl.value || "8" : "1";
@@ -1817,9 +2004,17 @@ async function loadRecommendations(offset = 0, append = false) {
   if (requestedView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
-  const payload = await api(
-    `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
-  );
+  let payload;
+  try {
+    payload = await api(
+      `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+    );
+  } finally {
+    if (requestedView === "review" && reviewLoadId === reviewLoadSequence) {
+      reviewLoading = false;
+      updateReviewControls();
+    }
+  }
   if (requestId !== recommendationRequestId || currentView !== requestedView) {
     return;
   }
@@ -1905,7 +2100,9 @@ async function refreshGalleryMetadata(galleryUrl) {
     return;
   }
   pendingGalleryRefreshUrls.add(galleryUrl);
+  reviewUndo = null;
   setGalleryFeedbackButtonsDisabled(galleryUrl, true);
+  updateReviewControls();
   setStatus("Refreshing gallery metadata");
   try {
     const payload = await api("/api/gallery/refresh", {
@@ -1923,6 +2120,8 @@ async function refreshGalleryMetadata(galleryUrl) {
   } finally {
     pendingGalleryRefreshUrls.delete(galleryUrl);
     setGalleryFeedbackButtonsDisabled(galleryUrl, false);
+    updateReviewControls();
+    await flushDeferredReviewReload();
   }
 }
 
@@ -1968,7 +2167,7 @@ async function clearCookie() {
 }
 
 async function vote(galleryUrl, voteValue) {
-  await withPendingFeedback(galleryUrl, async (requestedView) => {
+  await withPendingFeedback(galleryUrl, async (requestedView, reviewContext) => {
     setStatus(voteValue > 0 ? "Recording upvote" : "Recording downvote");
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -1984,13 +2183,14 @@ async function vote(galleryUrl, voteValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
+    rememberReviewRating(payload, reviewContext);
     await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Vote recorded", payload));
-  });
+  }, true);
 }
 
 async function score(galleryUrl, scoreValue) {
-  await withPendingFeedback(galleryUrl, async (requestedView) => {
+  await withPendingFeedback(galleryUrl, async (requestedView, reviewContext) => {
     setStatus(`Recording score ${scoreValue}`);
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -2006,13 +2206,14 @@ async function score(galleryUrl, scoreValue) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
+    rememberReviewRating(payload, reviewContext);
     await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Score recorded", payload));
-  });
+  }, true);
 }
 
 async function skip(galleryUrl) {
-  await withPendingFeedback(galleryUrl, async (requestedView) => {
+  await withPendingFeedback(galleryUrl, async (requestedView, reviewContext) => {
     setStatus("Skipping gallery");
     const payload = await api("/api/feedback", {
       method: "POST",
@@ -2027,9 +2228,10 @@ async function skip(galleryUrl) {
         filter_text: localFilterEl.value.trim(),
       }),
     });
+    rememberReviewRating(payload, reviewContext);
     await applyFeedbackResult(payload, galleryUrl, requestedView);
     setStatus(feedbackStatusMessage("Gallery skipped", payload));
-  });
+  }, true);
 }
 
 async function markGallery(galleryUrl, kind) {
@@ -2101,7 +2303,11 @@ async function applyFeedbackResult(payload, galleryUrl, requestedView = currentV
     applyGalleryPage(payload);
   } else {
     const removedUrl = payload.removed_gallery_url || galleryUrl;
+    const removedIndex = renderedGalleryItems.findIndex((item) => item.url === removedUrl);
     renderedGalleryItems = renderedGalleryItems.filter((item) => item && item.url !== removedUrl);
+    if (reviewCurrentUrl === removedUrl) {
+      reviewCurrentUrl = renderedGalleryItems[Math.min(removedIndex, renderedGalleryItems.length - 1)]?.url || "";
+    }
     renderedGalleryUrls = renderedGalleryUrls.filter((url) => url !== removedUrl);
     nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
     renderGalleryCards(renderedGalleryItems);
@@ -2192,10 +2398,12 @@ function recordPageImpressions(payload, surface, offset = 0) {
   if (!payload.request_id || !Array.isArray(payload.items) || !payload.items.length) {
     return;
   }
-  const entries = payload.items.map((item) => ({
-    gallery_url: item.url,
-    element: recommendationsEl.querySelector(`[data-gallery-url="${CSS.escape(item.url)}"]`),
-  })).filter((entry) => entry.element);
+  disposeGalleryVisibility();
+  const contexts = payload.items.map((item) => {
+    const context = { requestId: payload.request_id, surface, ready: false };
+    impressionContexts.set(item.url, context);
+    return context;
+  });
   api("/api/impressions", {
     method: "POST",
     body: JSON.stringify({
@@ -2237,13 +2445,29 @@ function recordPageImpressions(payload, surface, offset = 0) {
       })),
     }),
   }).then(() => {
-    observeVisibleCards(entries.filter((entry) => entry.element.isConnected), (gallery_url) =>
+    for (const context of contexts) context.ready = true;
+    observeRenderedGalleries();
+  }).catch(() => null);
+}
+
+function observeRenderedGalleries() {
+  disposeGalleryVisibility();
+  if (typeof observeVisibleCards !== "function") return;
+  const entries = renderedGalleryItems.map((item) => ({
+    gallery_url: item.url,
+    context: impressionContexts.get(item.url),
+    element: recommendationsEl.querySelector(`[data-gallery-url="${CSS.escape(item.url)}"]`),
+  })).filter((entry) => entry.context?.ready && entry.element?.isConnected);
+  disposeGalleryVisibility = observeVisibleCards(entries, (gallery_url) => {
+    const context = entries.find((entry) => entry.gallery_url === gallery_url)?.context;
+    if (!context) return Promise.resolve();
+    return (
       api("/api/impressions/visible", {
         method: "POST",
-        body: JSON.stringify({ request_id: payload.request_id, surface, items: [{ gallery_url }] }),
+        body: JSON.stringify({ request_id: context.requestId, surface: context.surface, items: [{ gallery_url }] }),
       })
     );
-  }).catch(() => null);
+  });
 }
 
 async function loadContinuingUpdates(offset = 0, append = false) {
@@ -2498,18 +2722,35 @@ function renderParentChain(item) {
 
 function renderGalleryCards(items, append = false) {
   const mode = currentView;
+  const focus = isFocusReview();
   const classifierMode = mode === "classifier";
   const lowInterestMode = mode === "low-interest";
+  const seen = new Set(append ? renderedGalleryUrls : []);
+  items = items.filter((item) => {
+    if (!item?.url || seen.has(item.url)) return false;
+    seen.add(item.url);
+    return true;
+  });
   if (!append) {
     renderedGalleryUrls = [];
     renderedGalleryItems = [];
   }
   for (const item of items) {
-    if (item && item.url) {
+    if (item && item.url && !renderedGalleryUrls.includes(item.url)) {
       renderedGalleryUrls.push(item.url);
       renderedGalleryItems.push(item);
     }
   }
+  if (mode === "review") {
+    reviewCurrentUrl = currentReviewItem()?.url || "";
+    saveReviewPosition();
+  }
+  if (focus) {
+    items = currentReviewItem() ? [currentReviewItem()] : [];
+    append = false;
+  }
+  updateReviewControls();
+  disposeGalleryVisibility();
   if (!append && !items.length) {
     const emptyText = mode === "history" && localFilterEl.value.trim()
       ? "No matching reaction history found."
@@ -2523,7 +2764,7 @@ function renderGalleryCards(items, append = false) {
   for (const item of items) {
     const card = document.createElement("article");
     card.dataset.galleryUrl = item.url;
-    card.className = lowInterestMode ? "card low-interest-card" : "card";
+    card.className = focus ? "card focus-card" : lowInterestMode ? "card low-interest-card" : "card";
     const thumbContent = item.thumb_url
       ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
       : `<span>No thumbnail</span>`;
@@ -2614,18 +2855,9 @@ function renderGalleryCards(items, append = false) {
     const compactFeedbackControls = `<div class="votes">
           <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the queue.">Skip</button>
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal and correct the low-interest ranking.">Thumb up</button>
-        </div>`;
-    const feedbackControls = mode === "preview" || classifierMode
-      ? ""
-      : lowInterestMode
-        ? compactFeedbackControls
-      : `<div class="votes">
-          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
-          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
           <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal for this gallery.">Thumb up</button>
-        </div>
-        <label class="feedback-reason">
+        </div>`;
+    const negativeReasonControl = `<label class="feedback-reason">
           <span>Why not?</span>
           <select data-reason-for="${escapeAttr(item.url)}" aria-label="Optional negative feedback reason">
             <option value="">Optional reason</option>
@@ -2638,7 +2870,17 @@ function renderGalleryCards(items, append = false) {
             <option value="duplicate_update">Duplicate or update</option>
             <option value="other">Other</option>
           </select>
-        </label>
+        </label>`;
+    let feedbackControls = mode === "preview" || classifierMode
+      ? ""
+      : lowInterestMode
+        ? compactFeedbackControls
+      : `<div class="votes">
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
+          <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal for this gallery.">Thumb up</button>
+        </div>
+        ${negativeReasonControl}
         <div class="scorebar" aria-label="Score">
           ${[1, 2, 3, 4, 5]
             .map((value) => `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))}">${value}</button>`)
@@ -2661,6 +2903,18 @@ function renderGalleryCards(items, append = false) {
     const auditBadge = item.audit_id
       ? `<div class="interest-badge audit-badge">Random tail audit · p=${Number(item.audit_selection_probability || 0).toFixed(3)}</div>`
       : "";
+    let focusMore = "";
+    if (focus) {
+      focusMore = `<details class="focus-more"><summary>More</summary>
+        ${negativeReasonControl}${markActions}
+        <div class="card-actions">${refreshMetadataButton}</div>${feedbackActions}${classificationActions}
+        ${parentChain}${relatedFeedback}</details>`;
+      feedbackControls = `<footer class="focus-rating" aria-label="Gallery rating">
+        ${compactFeedbackControls}
+        <div class="scorebar" aria-label="Score">${[1, 2, 3, 4, 5].map((value) =>
+          `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))} (${value})">${value}</button>`).join("")}</div>
+      </footer>`;
+    }
     card.innerHTML = `
       <div class="media-preview">
         ${thumb}
@@ -2670,6 +2924,7 @@ function renderGalleryCards(items, append = false) {
         ${lowInterestBadge}
         ${auditBadge}
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
+        ${focus ? `<span class="review-opened${reviewOpenedUrls.has(item.url) ? "" : " hidden"}">Opened</span>` : ""}
         <div class="meta">${scoreMeta}</div>
         ${classifierSampleMeta}
         ${Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
@@ -2682,13 +2937,14 @@ function renderGalleryCards(items, append = false) {
         ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
         ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
-        ${lowInterestMode ? "" : parentChain}
+        ${lowInterestMode || focus ? "" : parentChain}
         ${lowInterestMode ? "" : `<div class="pillrow">${tags}</div>`}
         <div class="reason">${reasons}</div>
-        ${lowInterestMode ? "" : relatedFeedback}
-        ${classificationActions}
-        ${feedbackControls}
+        ${lowInterestMode || focus ? "" : relatedFeedback}
+        ${focus ? focusMore : classificationActions}
+        ${focus ? "" : feedbackControls}
       </div>
+      ${focus ? feedbackControls : ""}
     `;
     recommendationsEl.appendChild(card);
     if (pendingFeedbackUrls.has(item.url)) {
@@ -2698,6 +2954,8 @@ function renderGalleryCards(items, append = false) {
       queueVisualEmbedding(item);
     }
   }
+  observeRenderedGalleries();
+  updateReviewControls();
 }
 
 function replaceRenderedGallery(item) {
@@ -2781,21 +3039,33 @@ function markStatusMessage(base, payload) {
   return details.length ? `${base}; ${details.join("; ")}` : base;
 }
 
-async function withPendingFeedback(galleryUrl, action) {
-  if (pendingFeedbackUrls.has(galleryUrl)) {
+async function withPendingFeedback(galleryUrl, action, rating = false) {
+  if (pendingFeedbackUrls.has(galleryUrl) || (isFocusReview() && reviewBusy())) {
     return;
   }
+  const reviewContext = isFocusReview() && rating ? {
+    item: renderedGalleryItems.find((item) => item.url === galleryUrl),
+    index: renderedGalleryItems.findIndex((item) => item.url === galleryUrl),
+    epoch: reviewQueueEpoch,
+  } : null;
+  if (!rating || !isFocusReview()) reviewUndo = null;
   pendingFeedbackUrls.add(galleryUrl);
   const requestedView = currentView;
   // Lists started before or during a submission may contain pre-commit feedback.
   ++recommendationRequestId;
   setGalleryFeedbackButtonsDisabled(galleryUrl, true);
+  updateReviewControls();
   try {
-    await action(requestedView);
+    await action(requestedView, reviewContext);
   } finally {
     ++recommendationRequestId;
     pendingFeedbackUrls.delete(galleryUrl);
     setGalleryFeedbackButtonsDisabled(galleryUrl, false);
+    for (const item of renderedGalleryItems) {
+      setGalleryFeedbackButtonsDisabled(item.url, pendingFeedbackUrls.has(item.url));
+    }
+    updateReviewControls();
+    await flushDeferredReviewReload();
   }
 }
 
@@ -2821,11 +3091,13 @@ function setGalleryFeedbackButtonsDisabled(galleryUrl, disabled) {
 }
 
 function applyGalleryPage(payload, append = false) {
+  if (!append) impressionContexts.clear();
   renderGalleryCards(payload.items || [], append);
   updateCurrentQueueCount(payload);
   nextRecommendationOffset = payload.next_offset || 0;
   hasMoreRecommendations = Boolean(payload.has_more);
   updateLoadMore(payload.total || 0);
+  updateReviewControls();
   if (payload.last_fetch && payload.last_fetch.id) {
     lastRenderedFetchId = payload.last_fetch.id;
   }
@@ -2838,7 +3110,7 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
     return;
   }
   lastRenderedFetchId = lastFetch.id;
-  if (currentView !== "history") {
+  if (currentView !== "history" && !deferFocusRefresh()) {
     await loadCurrentPage();
   }
   refreshQueueCounts();
@@ -3293,6 +3565,7 @@ hathDownloadFilterEl.addEventListener("change", () => {
 });
 loadMoreBtn.addEventListener("click", () => {
   if (!hasMoreRecommendations) return;
+  if (isFocusReview() && reviewBusy()) return;
   loadCurrentPage(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
 });
 importFileEl.addEventListener("change", () => {
@@ -3312,6 +3585,14 @@ for (const tab of viewTabs) {
   });
 }
 recommendationsEl.addEventListener("click", (event) => {
+  const galleryLink = event.target.closest("a.thumb, a.title");
+  if (isFocusReview() && galleryLink) {
+    const card = galleryLink.closest("[data-gallery-url]");
+    if (card) {
+      reviewOpenedUrls.add(card.dataset.galleryUrl);
+      card.querySelector(".review-opened")?.classList.remove("hidden");
+    }
+  }
   const sampleClassificationButton = event.target.closest("button[data-sample-classification]");
   if (sampleClassificationButton) {
     labelClassificationSample(
@@ -3376,6 +3657,21 @@ recommendationsEl.addEventListener("click", (event) => {
     return;
   }
 });
+
+for (const input of document.querySelectorAll("input[name='reviewLayout']")) {
+  input.addEventListener("change", () => {
+    setReviewLayout(input.value);
+    input.blur();
+  });
+}
+document.querySelector("#reviewPrevBtn").addEventListener("click", () => navigateReview(-1).catch((error) => setStatus(error.message, true)));
+document.querySelector("#reviewNextBtn").addEventListener("click", () => navigateReview(1).catch((error) => setStatus(error.message, true)));
+document.querySelector("#reviewUndoBtn").addEventListener("click", () => undoReviewRating().catch((error) => setStatus(error.message, true)));
+document.querySelector("#reviewRefreshBtn").addEventListener("click", () => {
+  if (!reviewBusy()) loadCurrentPage().catch((error) => setStatus(error.message, true));
+});
+document.addEventListener("keydown", reviewKeydown);
+window.addEventListener("resize", updateReviewControls);
 
 applyStaticTooltips();
 

@@ -39,6 +39,7 @@ function fixture(view = "review") {
   }
   const document = {
     querySelector(selector) {
+      if (selector.startsWith("dialog[open]")) return null;
       if (!elements.has(selector)) elements.set(selector, element());
       return elements.get(selector);
     },
@@ -223,6 +224,209 @@ test("normal pagination and newer list requests still work", async () => {
   f.respond(2, page([items[0]]));
   await more;
   assert.deepEqual(f.urls(), [items[1].url, items[0].url]);
+});
+
+function focusFixture() {
+  const f = fixture();
+  f.run('reviewLayout = "focus"; renderGalleryCards(renderedGalleryItems);');
+  return f;
+}
+
+const undoResponse = (id = 7) => ({
+  ok: true, removed_gallery_url: items[0].url,
+  feedback_undo_supported: true, feedback_update: { latest_feedback_id: id },
+});
+
+test("Focus: navigation does not label; mode changes preserve the selected URL", async () => {
+  const f = focusFixture();
+  assert.equal(f.run('recommendationsEl.children.length'), 1);
+  await f.run('navigateReview(1)');
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  assert.equal(f.requests.length, 0);
+  f.run('setReviewLayout("grid"); setReviewLayout("focus");');
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  assert.equal(f.run('recommendationsEl.children[0].dataset.galleryUrl'), items[1].url);
+});
+
+test("Focus: pending rating blocks duplicate actions and navigation; success advances once", async () => {
+  const f = focusFixture();
+  const first = f.run('score(fixtureItems[0].url, 5)');
+  await f.run('navigateReview(1); skip(fixtureItems[0].url);');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  f.respond(0, undoResponse());
+  await first;
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  assert(f.buttons(items[1].url).every((button) => !button.disabled));
+  assert.equal(f.run('reviewUndo.feedbackId'), 7);
+});
+
+test("Focus: failed rating stays in place and can be retried", async () => {
+  const f = focusFixture();
+  const first = f.run('skip(fixtureItems[0].url)');
+  f.requests[0].reject(new Error("Synthetic failure"));
+  await assert.rejects(first);
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  assert(f.buttons().every((button) => !button.disabled));
+});
+
+test("Focus: exact-event undo restores the item and invalidates stale pages", async () => {
+  const f = focusFixture();
+  const vote = f.run('vote(fixtureItems[0].url, -1)');
+  f.respond(0, undoResponse());
+  await vote;
+  const loading = f.run('loadRecommendations(1, true)');
+  f.respond(1, page([items[1]]));
+  await loading;
+  const undo = f.run('undoReviewRating()');
+  assert.deepEqual(JSON.parse(f.requests[2].options.body), { gallery_url: items[0].url, feedback_id: 7 });
+  await f.run('undoReviewRating()');
+  assert.equal(f.requests.length, 3);
+  f.respond(2, { ok: true });
+  await undo;
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  assert.equal(f.run('reviewUndo'), null);
+});
+
+test("Focus: old backends do not enable undo", async () => {
+  const f = focusFixture();
+  const vote = f.run('skip(fixtureItems[0].url)');
+  f.respond(0, { ok: true, feedback_update: { latest_feedback_id: 7 } });
+  await vote;
+  assert.equal(f.run('reviewUndo'), null);
+  await f.run('undoReviewRating()');
+  assert.equal(f.requests.length, 1);
+});
+
+for (const status of [409, 500]) {
+  test(`Focus: undo ${status} retains the next gallery without local reinsertion`, async () => {
+    const f = focusFixture();
+    const vote = f.run('skip(fixtureItems[0].url)');
+    f.respond(0, undoResponse());
+    await vote;
+    const undo = f.run('undoReviewRating()');
+    f.requests[1].reject(Object.assign(new Error("Synthetic undo failure"), { status }));
+    await assert.rejects(undo);
+    assert.deepEqual(f.urls(), [items[1].url]);
+    assert.equal(Boolean(f.run('reviewUndo')), status !== 409);
+    assert.equal(f.run('reviewBusy()'), false);
+  });
+}
+
+test("Focus: background completion signals updates without replacing the queue", async () => {
+  const f = focusFixture();
+  await f.run('reloadRecommendationsAfterFetch({ fetch: {}, last_fetch: { id: 99 } })');
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.run('reviewUpdatesAvailable'), true);
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+});
+
+test("Focus: duplicate pagination is deduplicated and storage failures are harmless", async () => {
+  const f = focusFixture();
+  f.run('globalThis.sessionStorage = { setItem() { throw Error("blocked"); } };');
+  f.run('renderGalleryCards([fixtureItems[1]], true)');
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+  assert.equal(f.run('recommendationsEl.children.length'), 1);
+});
+
+test("Focus: shortcuts ignore composition, editable targets and repeat", async () => {
+  const f = focusFixture();
+  f.run(`globalThis.fixtureKey = { key: 's', target: { closest: () => null }, preventDefault() {} };`);
+  for (const flag of ['repeat', 'isComposing', 'ctrlKey', 'altKey', 'metaKey', 'shiftKey']) {
+    f.run(`reviewKeydown({ ...fixtureKey, ${flag}: true })`);
+  }
+  f.run(`reviewKeydown({ ...fixtureKey, target: { closest: () => ({}) } })`);
+  assert.equal(f.requests.length, 0);
+  f.run('reviewKeydown(fixtureKey)');
+  assert.equal(f.requests.length, 1);
+  f.respond(0, undoResponse());
+  await new Promise(setImmediate);
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+});
+
+test("Focus: failed queue loads release navigation and retain the current gallery", async () => {
+  const f = focusFixture();
+  const loading = f.run('loadRecommendations()');
+  f.requests[0].reject(new Error("Synthetic list failure"));
+  await assert.rejects(loading);
+  assert.equal(f.run('reviewBusy()'), false);
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+  assert(f.buttons().every((button) => !button.disabled));
+});
+
+test("Focus: returning during a pending vote reloads Review after the commit", async () => {
+  const f = focusFixture();
+  const vote = f.run('skip(fixtureItems[0].url)');
+  await f.run('setActiveView("favorite"); renderGalleryCards([]); setActiveView("review"); loadCurrentPage();');
+  assert.equal(f.requests.length, 1);
+  f.respond(0, undoResponse());
+  await new Promise(setImmediate);
+  assert.equal(f.requests.length, 2);
+  f.respond(1, page([items[1]]));
+  await vote;
+  assert.deepEqual(f.urls(), [items[1].url]);
+  assert.equal(f.run('reviewUndo'), null);
+  assert.equal(f.run('reviewBusy()'), false);
+});
+
+test("Focus: queue-boundary loading can retry without opening or labeling", async () => {
+  const f = focusFixture();
+  await f.run('navigateReview(1); hasMoreRecommendations = true;');
+  const first = f.run('navigateReview(1)');
+  f.requests[0].reject(new Error("Synthetic page failure"));
+  await assert.rejects(first);
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  const retry = f.run('navigateReview(1)');
+  f.respond(1, { items: [{ ...items[1], url: "https://example.test/g/c/token/" }], total: 3, has_more: false, next_offset: 3 });
+  await retry;
+  assert.equal(f.run('reviewCurrentUrl'), "https://example.test/g/c/token/");
+  assert(f.requests.every((request) => !request.options || request.options.method !== "POST"));
+});
+
+test("Focus: explicit queue refresh clears undo and restores only eligible saved URLs", async () => {
+  const f = focusFixture();
+  const vote = f.run('skip(fixtureItems[0].url)');
+  f.respond(0, undoResponse());
+  await vote;
+  const refresh = f.run('loadRecommendations()');
+  assert.equal(f.run('reviewUndo'), null);
+  f.respond(1, page([{ ...items[1], url: "https://example.test/g/new/token/" }]));
+  await refresh;
+  assert.equal(f.run('reviewCurrentUrl'), "https://example.test/g/new/token/");
+});
+
+test("Focus: returning during undo reloads eligible items instead of restoring an old view", async () => {
+  const f = focusFixture();
+  const vote = f.run('skip(fixtureItems[0].url)');
+  f.respond(0, undoResponse());
+  await vote;
+  const undo = f.run('undoReviewRating()');
+  await f.run('setActiveView("favorite"); renderGalleryCards([]); setActiveView("review"); loadCurrentPage();');
+  f.respond(1, { ok: true });
+  await new Promise(setImmediate);
+  assert.equal(f.requests.length, 3);
+  f.respond(2, page());
+  await undo;
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+  assert.equal(f.run('reviewBusy()'), false);
+  assert.equal(f.run('reviewUndo'), null);
+});
+
+test("Focus: metadata refresh clears undo and failure releases all controls", async () => {
+  const f = focusFixture();
+  const vote = f.run('skip(fixtureItems[0].url)');
+  f.respond(0, undoResponse());
+  await vote;
+  const refresh = f.run('refreshGalleryMetadata(fixtureItems[1].url)');
+  assert.equal(f.run('reviewUndo'), null);
+  assert.equal(f.run('reviewBusy()'), true);
+  await f.run('navigateReview(-1)');
+  f.requests[1].reject(new Error("Synthetic metadata failure"));
+  await assert.rejects(refresh);
+  assert.equal(f.run('reviewBusy()'), false);
+  assert(f.buttons(items[1].url).every((button) => !button.disabled));
 });
 
 for (const action of [
