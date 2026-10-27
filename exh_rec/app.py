@@ -187,6 +187,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_settings())
             elif path == "/api/status":
                 self.send_json(get_status())
+            elif path == "/api/health":
+                self.send_json({"service": "exh-rec", "status": "ok"})
             elif path == "/api/integrations/hath/status":
                 with db.connect() as conn:
                     self.send_json(hath_status(conn))

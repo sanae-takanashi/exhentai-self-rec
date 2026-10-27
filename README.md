@@ -58,6 +58,15 @@ python3 -m exh_rec.app
 
 Open <http://127.0.0.1:18787>.
 
+### Windows Desktop Launcher
+
+After setting up `.venv-rocm` or `.venv`, double-click `launch.vbs`. The native
+UI configures service and H@H file-path parameters, starts the service hidden,
+detects existing instances, and opens the homepage in your default browser.
+Closing the launcher leaves its service running; Stop only controls services
+started by this launcher. Automatic startup is opt-in and runs in the background
+after the current user signs in, not before login. See [LAUNCHER.md](LAUNCHER.md).
+
 ## H@H observer
 
 The repository includes a deployable sidecar under [`hath_observer`](hath_observer/README.md).
