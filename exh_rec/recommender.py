@@ -719,14 +719,17 @@ def reset_library(conn: sqlite3.Connection) -> dict[str, int]:
     return removed
 
 
-def set_classification_override(conn: sqlite3.Connection, gallery_url: str, classification: str) -> str:
+def set_classification_override(
+    conn: sqlite3.Connection, gallery_url: str, classification: str, *, retrain: bool = True
+) -> str:
     gallery_url = normalize_gallery_url(gallery_url)
     if not gallery_url:
         raise ValueError("valid gallery_url is required")
     classification = str(classification or "").strip().lower()
     if classification == "auto":
         conn.execute("DELETE FROM gallery_classification_overrides WHERE gallery_url = ?", (gallery_url,))
-        train_continuing_classifier(conn)
+        if retrain:
+            train_continuing_classifier(conn)
         return "auto"
     if classification not in {"review", "updates"}:
         raise ValueError("classification must be review, updates, or auto")
@@ -740,7 +743,8 @@ def set_classification_override(conn: sqlite3.Connection, gallery_url: str, clas
         """,
         (gallery_url, classification),
     )
-    train_continuing_classifier(conn)
+    if retrain:
+        train_continuing_classifier(conn)
     return classification
 
 

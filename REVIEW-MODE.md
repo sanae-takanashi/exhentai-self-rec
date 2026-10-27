@@ -20,8 +20,9 @@ click/download with an explicit preference.
   is restored only if it is still in the freshly returned eligible page.
 - Focus shows one queued gallery, an uncropped cover, the existing cached
   sample thumbnails, title, metadata and tags. The primary rating controls
-  stay in a consistent footer. Optional reasons, marks and classification
-  controls remain available under More. Existing score/vote/Skip meanings do
+  stay in a consistent footer, together with the optional reason selector,
+  Favorite, Ban and Mark as Updates. More contains only metadata refresh,
+  feedback history/clear and parent/related details. Existing score/vote/Skip meanings do
   not change; Skip still records a neutral score, not a temporary deferral.
 - The cover and title remain ordinary noreferrer links opening a new tab.
   Only a click on one of those links sets an Opened indicator in this tab.
@@ -75,6 +76,25 @@ and a positive integer feedback_id. It returns no reranked page and performs
 no remote requests. The normal feedback response advertises its availability.
 No schema migration, model gate, download integration, network exposure or
 production launcher changes are required.
+
+## Focus Controls And Classification Follow-Up
+
+Essential controls must be directly visible without opening More or scrolling
+the metadata pane, including on narrow mobile screens. Use a compact fixed
+footer with reasons/actions above the rating row; its measured height reserves
+the gallery work area. Keep covers uncropped and all controls within the viewport.
+
+Classification submission confirms only the committed override. It must not
+train the continuing classifier or rebuild either queue in the POST request.
+The classifier's existing signature check retrains on its next read; explicit
+overrides take precedence immediately. This changes no release/evaluation gates.
+After an explicit move succeeds, remove that gallery locally and advance once,
+preserving every other loaded item and its delivery context. Do not wait for
+queue counts, replace the Focus queue, or apply full pages from older servers.
+Failures retain the item and allow retry; duplicate actions remain guarded.
+Use Auto clears the displayed override and signals that a queue refresh is
+available in Focus; Grid reloads eligibility. Results from a departed view must
+never overwrite its replacement. Classification is not a rating or download.
 
 ## Acceptance
 

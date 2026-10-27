@@ -44,6 +44,8 @@ async function scenario(viewport) {
   const visible = [], errors = [], external = [];
   let delivery, feedbackRoute, feedbackCalls = 0, undoCalls = 0, listCalls = 0;
   let ratingMode = "failure", undoMode = "failure";
+  let classificationMode = "failure", classificationRoute, classificationCalls = 0, markCalls = 0;
+  let lastRating, holdCounts = false, countRoute;
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
   page.on("pageerror", (error) => errors.push(error.message));
   await context.route("**/*", async (route) => {
@@ -80,6 +82,7 @@ async function scenario(viewport) {
     }
     if (pathname === "/api/feedback") {
       feedbackCalls++;
+      lastRating = route.request().postDataJSON();
       if (ratingMode === "hold") { feedbackRoute = route; return; }
       if (ratingMode === "failure") return json(route, { error: "Synthetic rating failure" }, 500);
       const body = route.request().postDataJSON();
@@ -94,7 +97,22 @@ async function scenario(viewport) {
       removed.delete(route.request().postDataJSON().gallery_url);
       return json(route, { ok: true });
     }
-    if (pathname === "/api/queue-counts") return json(route, { review: items.length - removed.size });
+    if (pathname === "/api/classification") {
+      classificationCalls++;
+      if (classificationMode === "hold") { classificationRoute = route; return; }
+      return json(route, { error: "Synthetic classification failure" }, 500);
+    }
+    if (pathname === "/api/mark") {
+      markCalls++;
+      const body = route.request().postDataJSON();
+      if (body.kind === "ban") return json(route, { error: "Synthetic ban failure" }, 500);
+      removed.add(body.gallery_url);
+      return json(route, { ok: true, removed_gallery_url: body.gallery_url });
+    }
+    if (pathname === "/api/queue-counts") {
+      if (holdCounts) { countRoute = route; return; }
+      return json(route, { review: items.length - removed.size });
+    }
     return json(route, {});
   });
   try {
@@ -131,10 +149,12 @@ async function scenario(viewport) {
     assert.equal(listCalls, 1);
     assert.equal(await page.locator("#reviewRefreshBtn").evaluate((el) => el.classList.contains("updates-available")), true);
 
-    const score = page.locator('[data-score="5"]');
+    const score = page.locator('[data-score="1"]');
+    await page.locator('.focus-rating select[data-reason-for]').selectOption("quality");
     await score.click();
     await page.locator("#status").filter({ hasText: "Synthetic rating failure" }).waitFor();
     assert.equal(await current(), items[0].url);
+    assert.equal(lastRating.reason_code, "quality");
     assert(await score.isEnabled());
     ratingMode = "hold";
     await score.click();
@@ -168,7 +188,17 @@ async function scenario(viewport) {
     const imageBounds = await page.locator(".thumb img").boundingBox();
     assert(Math.abs(imageBounds.height - coverBounds.height) <= 1, "cover image overflows its frame");
     const bodyBounds = await page.locator(".focus-card .body").boundingBox();
-    assert(bodyBounds.y + bodyBounds.height <= bounds.y, "rating footer overlaps gallery details");
+    await page.screenshot({ path: path.join(output, `${viewport.width}-focus.png`) });
+    assert(bodyBounds.y + bodyBounds.height <= bounds.y,
+      `rating footer overlaps gallery details: ${JSON.stringify({ viewport, bounds, bodyBounds })}`);
+    for (const selector of ['select[data-reason-for]', '[data-mark="favorite"]', '[data-mark="ban"]', '[data-classification="updates"]']) {
+      const control = page.locator(`.focus-rating ${selector}`);
+      assert(await control.isVisible(), `${selector} is not directly visible`);
+      const box = await control.boundingBox();
+      assert(box.x >= 0 && box.y >= 0 && box.x + box.width <= viewport.width + 1 && box.y + box.height <= viewport.height + 1,
+        `${selector} is outside the viewport`);
+      if (selector.startsWith('[')) await control.click({ trial: true });
+    }
     await page.screenshot({ path: path.join(output, `${viewport.width}-focus.png`) });
 
     ratingMode = "success";
@@ -180,11 +210,39 @@ async function scenario(viewport) {
     await page.locator("#status").filter({ hasText: "Synthetic newer rating" }).waitFor();
     assert(await page.locator("#reviewUndoBtn").isDisabled());
     assert.equal(await current(), items[1].url);
+
+    const updates = page.locator('[data-classification="updates"]');
+    await updates.click();
+    await page.locator("#status").filter({ hasText: "Synthetic classification failure" }).waitFor();
+    assert.equal(await current(), items[1].url);
+    assert(await updates.isEnabled());
+    classificationMode = "hold";
+    await updates.click();
+    await until(() => classificationRoute);
+    await updates.dispatchEvent("click");
+    assert.equal(classificationCalls, 2);
+    assert.equal(await current(), items[1].url);
+    const beforeMoveLists = listCalls;
+    holdCounts = true;
+    removed.add(items[1].url);
+    await json(classificationRoute, { ok: true, gallery_url: items[1].url, classification: "updates" });
+    await page.waitForFunction((url) => document.querySelector(".focus-card")?.dataset.galleryUrl === url, items[2].url);
+    await until(() => countRoute);
+    assert(await page.locator('[data-score="5"]').isEnabled(), "classification waits for background counts");
+    assert.equal(listCalls, beforeMoveLists, "classification unexpectedly rebuilt the queue");
+    await page.locator('[data-mark="ban"]').click();
+    await page.locator("#status").filter({ hasText: "Synthetic ban failure" }).waitFor();
+    assert.equal(await current(), items[2].url);
+    await page.locator('[data-mark="favorite"]').click();
+    await page.waitForFunction(() => !document.querySelector(".focus-card"));
+    assert.equal(markCalls, 2);
+    holdCounts = false;
+    await json(countRoute, { review: 0 });
     await page.locator("#localFilter").fill("555");
     assert.equal(feedbackCalls, 3);
     assert.equal(external.length, 1);
     assert.deepEqual(errors, []);
-    return { viewport, feedbackCalls, undoCalls, visibleEvents: visible.length, passed: true };
+    return { viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };
   } finally {
     await context.close();
   }

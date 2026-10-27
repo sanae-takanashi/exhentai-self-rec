@@ -419,21 +419,12 @@ class Handler(BaseHTTPRequestHandler):
                     with db.connect() as conn:
                         ensure_gallery_exists(conn, gallery_url)
                         classification = set_classification_override(
-                            conn, gallery_url, str(payload.get("classification") or "")
-                        )
-                        review = recommendation_payload(
-                            conn,
-                            limit=40,
-                            filter_text=payload.get("filter_text"),
-                            interest_band=payload.get("interest_band") or "primary",
-                            require_bootstrap_match=configured_review_require_bootstrap_match(conn),
-                        )
-                        updates = continuing_update_payload(
-                            conn, limit=40, filter_text=payload.get("filter_text")
+                            conn, gallery_url, str(payload.get("classification") or ""), retrain=False
                         )
                 except ValueError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-                self.send_json({"ok": True, "classification": classification, "review": review, "updates": updates})
+                # The classifier's signature check refreshes it on the next read.
+                self.send_json({"ok": True, "gallery_url": gallery_url, "classification": classification})
             elif path == "/api/classification-samples/label":
                 payload = self.read_json()
                 try:

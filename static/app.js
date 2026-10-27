@@ -198,7 +198,7 @@ function updateReviewControls() {
   if (focus && recommendationsEl.getBoundingClientRect) {
     const top = recommendationsEl.getBoundingClientRect().top + window.scrollY;
     const footerHeight = recommendationsEl.querySelector(".focus-rating")?.getBoundingClientRect().height || 118;
-    recommendationsEl.style.setProperty("--review-work-height", `${Math.max(120, window.innerHeight - top - footerHeight - 24)}px`);
+    recommendationsEl.style.setProperty("--review-work-height", `${Math.max(48, window.innerHeight - top - footerHeight - 24)}px`);
   }
 }
 
@@ -2340,7 +2340,7 @@ async function classifyGallery(galleryUrl, classification) {
   await withPendingFeedback(galleryUrl, async (requestedView) => {
     const label = classification === "updates" ? "Updates" : classification === "review" ? "Review" : "Auto";
     setStatus(`Classifying gallery as ${label}`);
-    const payload = await api("/api/classification", {
+    await api("/api/classification", {
       method: "POST",
       body: JSON.stringify({
         gallery_url: galleryUrl,
@@ -2349,9 +2349,15 @@ async function classifyGallery(galleryUrl, classification) {
         interest_band: currentView === "low-interest" ? "low" : "primary",
       }),
     });
-    ++recommendationRequestId;
-    if (currentView === requestedView) {
-      applyGalleryPage(currentView === "continuing-updates" ? payload.updates : payload.review);
+    if (classification !== "auto") {
+      // Ignore legacy full-page responses: a move must not replace the review queue.
+      await applyFeedbackResult({ removed_gallery_url: galleryUrl }, galleryUrl, requestedView);
+    } else if (currentView === requestedView && isFocusReview()) {
+      ++recommendationRequestId;
+      renderedGalleryItems = renderedGalleryItems.map((item) => item.url === galleryUrl
+        ? { ...item, classification_override: null } : item);
+      deferFocusRefresh();
+      renderGalleryCards(renderedGalleryItems);
     } else {
       await loadCurrentPage();
     }
@@ -2852,10 +2858,11 @@ function renderGalleryCards(items, append = false) {
     const markActions = mode === "preview"
       ? ""
       : `<div class="card-actions">${banButton}${favoriteButton}${clearMarkButton}</div>`;
+    const thumbIcon = `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H5a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 3a3.13 3.13 0 0 1 3 2.88Z"/></svg>`;
     const compactFeedbackControls = `<div class="votes">
-          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" aria-label="Thumb down" title="Record a mild negative signal for this gallery.">${focus ? thumbIcon : "Thumb down"}</button>
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the queue.">Skip</button>
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" title="Record a mild positive signal for this gallery.">Thumb up</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" aria-label="Thumb up" title="Record a mild positive signal for this gallery.">${focus ? thumbIcon : "Thumb up"}</button>
         </div>`;
     const negativeReasonControl = `<label class="feedback-reason">
           <span>Why not?</span>
@@ -2906,10 +2913,11 @@ function renderGalleryCards(items, append = false) {
     let focusMore = "";
     if (focus) {
       focusMore = `<details class="focus-more"><summary>More</summary>
-        ${negativeReasonControl}${markActions}
-        <div class="card-actions">${refreshMetadataButton}</div>${feedbackActions}${classificationActions}
+        <div class="card-actions">${refreshMetadataButton}</div>${feedbackActions}
         ${parentChain}${relatedFeedback}</details>`;
       feedbackControls = `<footer class="focus-rating" aria-label="Gallery rating">
+        ${negativeReasonControl}
+        <div class="focus-actions">${markActions}${classificationActions}</div>
         ${compactFeedbackControls}
         <div class="scorebar" aria-label="Score">${[1, 2, 3, 4, 5].map((value) =>
           `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))} (${value})">${value}</button>`).join("")}</div>

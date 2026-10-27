@@ -434,6 +434,7 @@ for (const action of [
   'markGallery(fixtureItems[0].url, "ban")',
   "clearMark(fixtureItems[0].url)",
   "clearRating(fixtureItems[0].url)",
+  'classifyGallery(fixtureItems[0].url, "updates")',
 ]) {
   test(`${action}: a stale list cannot overwrite the completed action`, async () => {
     const f = fixture();
@@ -446,3 +447,57 @@ for (const action of [
     assert.deepEqual(f.urls(), [items[1].url]);
   });
 }
+
+for (const view of ["review", "low-interest", "continuing-updates"]) {
+  test(`${view}: classification advances locally without loading or replacing queues`, async () => {
+    const f = view === "review" ? focusFixture() : fixture(view);
+    const saving = f.run('classifyGallery(fixtureItems[0].url, "updates")');
+    f.respond(0, { ok: true, classification: "updates", review: page([items[0]]), updates: page() });
+    await saving;
+    assert.equal(f.requests.length, 1);
+    assert.deepEqual(f.urls(), [items[1].url]);
+    assert.equal(f.run('reviewBusy()'), false);
+  });
+}
+
+test("Focus: failed classification retains selection; duplicate/retry guards release after commit", async () => {
+  const f = focusFixture();
+  const first = f.run('classifyGallery(fixtureItems[0].url, "updates")');
+  await f.run('classifyGallery(fixtureItems[0].url, "updates"); navigateReview(1);');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  f.requests[0].reject(new Error("Synthetic classification failure"));
+  await assert.rejects(first);
+  assert(f.buttons().every((button) => !button.disabled));
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  const retry = f.run('classifyGallery(fixtureItems[0].url, "updates")');
+  f.respond(1, { ok: true, classification: "updates" });
+  await retry;
+  assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  assert.equal(f.run('reviewUndo'), null);
+});
+
+test("Focus: Use Auto clears the override without waiting for a queue rebuild", async () => {
+  const f = focusFixture();
+  f.run('renderedGalleryItems[0].classification_override = "review";');
+  const saving = f.run('classifyGallery(fixtureItems[0].url, "auto")');
+  f.respond(0, { ok: true, classification: "auto" });
+  await saving;
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.run('currentReviewItem().classification_override'), null);
+  assert.equal(f.run('reviewCurrentUrl'), items[0].url);
+  assert.equal(f.run('reviewUpdatesAvailable'), true);
+  assert.equal(f.run('reviewBusy()'), false);
+});
+
+test("classification completed after a view switch cannot apply the old queue", async () => {
+  const f = focusFixture();
+  const saving = f.run('classifyGallery(fixtureItems[0].url, "updates")');
+  f.run('setActiveView("favorite"); renderGalleryCards([fixtureItems[1]]);');
+  f.respond(0, { ok: true, classification: "updates", review: page() });
+  await new Promise(setImmediate);
+  assert(f.requests[1].url.startsWith("/api/marks?"));
+  f.respond(1, page([items[1]]));
+  await saving;
+  assert.deepEqual(f.urls(), [items[1].url]);
+});
