@@ -29,6 +29,28 @@ Only paths and non-secret settings are saved. Proxy URLs containing credentials
 are rejected. Runtime status contains fixed codes, never child output,
 tokens, cookies or complete command lines.
 
+## Recent Logs
+
+The Recent Logs tab refreshes with service status, and Start Service selects it
+automatically. It shows timestamps, severity, launcher lifecycle, H@H tunnel
+reconnects, HTTP request results and recognized service activity. Follow latest
+can be disabled to inspect older entries without scrolling to the end on update.
+The text is read-only and selectable; errors and warnings have distinct colors.
+
+Each managed run keeps up to 500 events in the ignored sibling
+`data/launcher/config.log.json`. Storage is bounded, flushed at most once per
+second for ordinary output and immediately for lifecycle transitions, and
+retained after the UI closes or the service stops.
+A new managed run replaces the previous run's history. Old already-running
+workers need an owner-controlled restart to begin producing logs; manually
+started external services have no attachable output.
+
+Raw stdout/stderr is never saved or displayed. A bounded pipe reader maps known
+output to fixed, allowlisted event summaries. Unknown output, traceback details,
+URLs/query values, local paths, credentials and command lines are omitted;
+health polling is silent. Unknown output is noted only once per run. The UI
+validates the stored event codes and fields again before formatting them.
+
 ## Background Lifecycle
 
 The background worker holds a per-profile Windows mutex. It checks the actual

@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 import uuid
 
 from scripts import launcher_core as core
+from scripts.launcher_logs import log_path, read_recent_logs
 from scripts.launcher_windows import (
     LauncherWindowsError, StartupRegistration, StopEvent, WindowsJob, kernel, signal_stop,
 )
@@ -253,6 +254,24 @@ class LauncherTests(unittest.TestCase):
         eventually(lambda: not any(alive(pid) for pid in pids.values()))
         self.assertFalse(self.controller.status(self.config)["managed"])
 
+    def test_background_logs_survive_ui_close_and_capture_output_without_private_text(self):
+        self.running_fixture()
+        eventually(lambda: any("HTTP server started" in line for line in read_recent_logs(self.path)))
+        self.assertNotIn("fixture-private-output-never-save", log_path(self.path).read_text(encoding="utf-8"))
+        import tkinter as tk
+        from scripts.launcher import LauncherApp
+        root = tk.Tk()
+        root.withdraw()
+        app = LauncherApp(root, self.path)
+        app.close()
+        self.controller.stop()
+        self.assertIn("Managed service stopped", read_recent_logs(self.path)[-1])
+
+    def test_large_process_output_is_drained_without_blocking_service_startup(self):
+        self.running_fixture("log-flood")
+        eventually(lambda: any("Feedback processed" in line for line in read_recent_logs(self.path)))
+        self.assertLess(log_path(self.path).stat().st_size, 16 * 1024)
+
     def test_closing_actual_ui_preserves_running_background_worker(self):
         import tkinter as tk
         from scripts.launcher import LauncherApp
@@ -302,6 +321,10 @@ class LauncherTests(unittest.TestCase):
         process = self.fixture("exit")
         self.assertEqual(process.wait(timeout=15), 1)
         self.assertEqual(core.read_runtime(self.path)["error"], "service-exited")
+        logs = "\n".join(read_recent_logs(self.path))
+        self.assertIn("required Python module", logs)
+        self.assertIn("service-exited", logs)
+        self.assertNotIn("fixture-only-private-module", logs)
 
     def test_stale_runtime_pid_does_not_grant_ownership(self):
         payload = {"profile_id": core.profile_id(self.path), "run_id": uuid.uuid4().hex,
@@ -473,6 +496,7 @@ class LauncherUITests(unittest.TestCase):
         with patch.object(self.app.controller, "stop") as stop:
             self.app.close()
         stop.assert_not_called()
+        self.assertEqual(self.app.timers, set())
         self.tearDown = lambda: None
 
     def test_startup_failure_restores_authoritative_checkbox(self):
@@ -494,6 +518,33 @@ class LauncherUITests(unittest.TestCase):
         registration.set_enabled.assert_called_once_with(False)
         self.assertFalse(self.app.auto_start.get())
         self.assertFalse(self.path.exists())
+
+    def test_recent_log_widget_is_read_only_and_respects_follow_toggle(self):
+        lines = [f"10-28 12:00:00  INFO   [service] Entry {index}" for index in range(80)]
+        self.app.render_logs(lines)
+        self.assertEqual(str(self.app.log_text.cget("state")), "disabled")
+        self.assertIn("Entry 79", self.app.log_text.get("1.0", "end"))
+        self.app.follow_logs.set(False)
+        self.app.log_text.yview_moveto(0)
+        self.app.render_logs(lines + ["10-28 12:00:01  ERROR  [launcher] Failed."])
+        self.assertEqual(self.app.log_text.yview()[0], 0)
+        self.assertTrue(self.app.log_text.tag_ranges("error"))
+        self.app.render_logs([], external=True)
+        self.assertIn("unavailable", self.app.log_status.cget("text"))
+
+    def test_start_selects_logs_and_status_refresh_reads_persisted_history(self):
+        from scripts.launcher_logs import RecentLog
+        log = RecentLog(self.path, uuid.uuid4().hex)
+        log.add("launcher.running")
+        log.flush(force=True)
+        with patch.object(self.app.controller, "status", return_value={"state": "stopped", "managed": False}):
+            self.app.refresh()
+            self.pump()
+        self.assertIn("Service is ready", self.app.log_text.get("1.0", "end"))
+        with patch.object(self.app.controller, "start", return_value="already-running"):
+            self.app.start()
+            self.assertEqual(self.app.notebook.select(), str(self.app.logs_tab))
+            self.pump()
 
 
 if __name__ == "__main__":

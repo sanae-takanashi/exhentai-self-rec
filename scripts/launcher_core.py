@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +21,7 @@ import urllib.request
 import uuid
 import webbrowser
 
+from scripts.launcher_logs import FAILURES, RecentLog
 from scripts.launcher_windows import (
     LauncherWindowsError, ProfileMutex, StartupRegistration, StopEvent,
     WindowsJob, mutex_active, signal_stop,
@@ -387,14 +389,19 @@ def supervise_background(config_path: Path) -> int:
     stop = None
     child = None
     launched = False
+    output_reader = None
     failure = ""
     run_id = uuid.uuid4().hex
+    recent_log = RecentLog(config_path, run_id)
     runtime = {"profile_id": profile_id(config_path), "run_id": run_id, "supervisor_pid": os.getpid(),
                "state": "starting", "error": "", "started_at": datetime.now(timezone.utc).isoformat()}
 
     def publish(state: str, error: str = ""):
         runtime.update(state=state, error=error)
         atomic_json(runtime_path(config_path), runtime)
+        fields = {"reason": error if error in FAILURES else "launch-failed"} if state == "failed" else {}
+        recent_log.add("launcher." + state, **fields)
+        recent_log.flush(force=True)
 
     try:
         config = load_config(config_path)
@@ -409,9 +416,12 @@ def supervise_background(config_path: Path) -> int:
         publish("starting")
         job = WindowsJob()
         child = subprocess.Popen(config.service_command(), cwd=ROOT, env=config.environment(),
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  creationflags=subprocess.CREATE_NO_WINDOW)
         job.assign(child.pid)
+        output_reader = threading.Thread(target=recent_log.capture, args=(child.stdout,), daemon=True,
+                                         name="launcher-output")
+        output_reader.start()
         child.stdin.write(b"1")
         child.stdin.flush()
         child.stdin.close()
@@ -419,6 +429,7 @@ def supervise_background(config_path: Path) -> int:
         deadline = time.monotonic() + config.startup_timeout
         ready = False
         while True:
+            recent_log.flush()
             if stop.wait():
                 publish("stopping")
                 break
@@ -457,6 +468,10 @@ def supervise_background(config_path: Path) -> int:
             failure = "cleanup-failed"
         finally:
             try:
+                if output_reader is not None:
+                    output_reader.join(timeout=2)
+                elif child is not None and child.stdout is not None:
+                    child.stdout.close()
                 if failure:
                     publish("failed", failure)
                 elif launched:

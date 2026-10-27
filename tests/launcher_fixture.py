@@ -24,6 +24,7 @@ def main():
         time.sleep(120)
         return 0
     if args.mode == "exit":
+        print("ModuleNotFoundError: fixture-only-private-module", file=sys.stderr, flush=True)
         return 7
     if args.mode == "supervise":
         from scripts.launcher_core import LaunchConfig, supervise_background
@@ -43,6 +44,11 @@ def main():
     child = subprocess.Popen([sys.executable, str(Path(__file__)), "sleep", "--records", str(args.records)],
                              creationflags=subprocess.CREATE_NO_WINDOW)
     args.records.write_text(json.dumps({"parent": os.getpid(), "child": child.pid}), encoding="utf-8")
+    print("Serving ExHentai recommender at http://127.0.0.1", flush=True)
+    print("Authorization: Bearer fixture-private-output-never-save", file=sys.stderr, flush=True)
+    if args.scenario == "log-flood":
+        print("x" * (256 * 1024), flush=True)
+        print("[feedback] action=record fixture-only", flush=True)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ExhRec/fixture"

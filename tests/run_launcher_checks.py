@@ -22,7 +22,9 @@ class RetainedTemporaryDirectory(tempfile.TemporaryDirectory):
 
 
 tempfile.TemporaryDirectory = RetainedTemporaryDirectory
-suite = unittest.defaultTestLoader.loadTestsFromNames(["tests.test_launcher", "tests.test_hath_launcher"])
+suite = unittest.defaultTestLoader.loadTestsFromNames([
+    "tests.test_launcher", "tests.test_launcher_logs", "tests.test_hath_launcher",
+])
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 print(f"Retained synthetic fixture root: {fixtures}")
 sys.exit(0 if result.wasSuccessful() else 1)

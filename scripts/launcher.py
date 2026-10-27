@@ -17,6 +17,7 @@ from scripts.launcher_core import (
     load_config, save_config, startup_registration, supervise_background,
 )
 from scripts.launcher_windows import LauncherWindowsError
+from scripts.launcher_logs import read_recent_logs
 
 
 ERRORS = {
@@ -71,8 +72,10 @@ class LauncherApp:
         self.results = queue.Queue()
         self.busy = False
         self.closed = False
+        self.timers = set()
         self.polling = False
         self.config_generation = 0
+        self.log_lines = None
         self.latest = {"state": "checking", "managed": False}
         self.notice = tk.StringVar(value="")
         try:
@@ -116,12 +119,33 @@ class LauncherApp:
             button.grid(row=0, column=column, sticky="ew", padx=(0, 8) if column < 3 else 0)
             actions.columnconfigure(column, weight=1)
 
-        notebook = ttk.Notebook(root)
+        self.notebook = notebook = ttk.Notebook(root)
         notebook.grid(row=2, column=0, sticky="nsew", padx=20)
         basic = ttk.Frame(notebook, padding=18)
         advanced = ttk.Frame(notebook, padding=18)
+        self.logs_tab = ttk.Frame(notebook, padding=12)
         notebook.add(basic, text="Service & H@H")
         notebook.add(advanced, text="Advanced")
+        notebook.add(self.logs_tab, text="Recent Logs")
+        self.logs_tab.columnconfigure(0, weight=1)
+        self.logs_tab.rowconfigure(1, weight=1)
+        log_toolbar = ttk.Frame(self.logs_tab)
+        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        log_toolbar.columnconfigure(0, weight=1)
+        self.log_status = ttk.Label(log_toolbar, text="No recent logs.", style="Muted.TLabel")
+        self.log_status.grid(row=0, column=0, sticky="w")
+        self.follow_logs = tk.BooleanVar(value=True)
+        ttk.Checkbutton(log_toolbar, text="Follow latest", variable=self.follow_logs,
+                        command=self.follow_latest_log).grid(row=0, column=1, sticky="e")
+        self.log_text = tk.Text(self.logs_tab, wrap="word", state="disabled", font=("Consolas", 10),
+                                width=1, height=1, background="#ffffff", foreground="#24292f",
+                                relief="flat", padx=10, pady=8)
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+        log_scroll = ttk.Scrollbar(self.logs_tab, orient="vertical", command=self.log_text.yview)
+        log_scroll.grid(row=1, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.tag_configure("error", foreground="#b42332")
+        self.log_text.tag_configure("warning", foreground="#8a5715")
         self.variables = {}
         self.form_widgets = []
         values = asdict(self.config)
@@ -169,9 +193,17 @@ class LauncherApp:
         except (LauncherError, LauncherWindowsError, OSError) as error:
             self.notice.set(error_message(error))
         root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(50, self.refresh)
-        root.after(100, self.drain)
-        root.after(1500, self.poll_status)
+        self.schedule(50, self.refresh)
+        self.schedule(100, self.drain)
+        self.schedule(1500, self.poll_status)
+
+    def schedule(self, delay, callback):
+        def run():
+            self.timers.discard(timer)
+            if not self.closed:
+                callback()
+        timer = self.root.after(delay, run)
+        self.timers.add(timer)
 
     def field(self, frame, row, label, name, browse=None, choices=None, editable=False, hath=False):
         ttk = self.ttk
@@ -244,6 +276,7 @@ class LauncherApp:
     def start(self):
         config = self.save()
         if config is not None:
+            self.notebook.select(self.logs_tab)
             self.notice.set("Starting service...")
             self.submit(lambda: self.controller.start(config),
                         lambda result: self.notice.set("Service already running." if result == "already-running" else "Background start requested."))
@@ -288,7 +321,9 @@ class LauncherApp:
 
         def work():
             try:
-                self.results.put(("status", self.controller.status(config), None, None, generation))
+                status = self.controller.status(config)
+                status["logs"] = read_recent_logs(self.path)
+                self.results.put(("status", status, None, None, generation))
             except Exception as error:
                 self.results.put(("status", None, None, error_message(error), generation))
         self.executor.submit(work)
@@ -297,7 +332,7 @@ class LauncherApp:
         if self.closed:
             return
         self.refresh()
-        self.root.after(1500, self.poll_status)
+        self.schedule(1500, self.poll_status)
 
     def drain(self):
         if self.closed:
@@ -321,7 +356,7 @@ class LauncherApp:
                     callback(result)
                 self.refresh()
             self.render_status(self.latest)
-        self.root.after(100, self.drain)
+        self.schedule(100, self.drain)
 
     def render_status(self, status):
         state = status.get("state", "checking")
@@ -342,11 +377,39 @@ class LauncherApp:
         for widget, mode in self.form_widgets:
             widget.configure(state="disabled" if managed or self.busy else mode)
         self.update_hath_fields()
+        if "logs" in status:
+            self.render_logs(status["logs"], external=state == "external")
         if state == "failed" and status.get("error"):
             self.notice.set(error_message(status["error"]))
 
+    def render_logs(self, lines, external=False):
+        self.log_status.configure(text="External service: previous managed logs only." if external and lines else
+                                  "External service: logs unavailable." if external else
+                                  f"{len(lines)} recent entries" if lines else "No recent logs.")
+        if lines == self.log_lines:
+            return
+        previous_view = self.log_text.yview()
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        for line in lines:
+            tag = "error" if "  ERROR  " in line else "warning" if "  WARN   " in line else ""
+            self.log_text.insert("end", line + "\n", tag)
+        self.log_text.configure(state="disabled")
+        self.log_lines = list(lines)
+        if self.follow_logs.get():
+            self.follow_latest_log()
+        else:
+            self.log_text.yview_moveto(previous_view[0])
+
+    def follow_latest_log(self):
+        if self.follow_logs.get():
+            self.log_text.see("end")
+
     def close(self):
         self.closed = True
+        for timer in self.timers:
+            self.root.after_cancel(timer)
+        self.timers.clear()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
