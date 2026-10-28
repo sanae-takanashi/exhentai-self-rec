@@ -51,6 +51,36 @@ URLs/query values, local paths, credentials and command lines are omitted;
 health polling is silent. Unknown output is noted only once per run. The UI
 validates the stored event codes and fields again before formatting them.
 
+## Fetch Activity
+
+Fetch Activity displays the current or most recent fetch in this server process,
+including automatic refreshes, manual queries and detail-only enrichment. It
+refreshes with service status without starting work or calculating recommendations.
+
+- Run ID, trigger, start time in UTC, elapsed time and age of the latest activity.
+- Fetched, newly stored, enriched and error counts.
+- Separate query and detail progress bars. Query completion is not overall completion.
+- Phase overview for lists/covers, details/samples, optional model work and finalization.
+- Frozen query plan with source, resume status, per-query results and page caps.
+- Initial-page and catch-up budgets, selected-detail limits and extra sample pages.
+- Up to 120 stage messages for listing, covers, details, samples, caching, parent
+  metadata, model retraining and final recommendation refresh.
+
+Page caps are upper bounds: queries can end early after catching up. Reaching a
+cap without catching up is explicitly partial, not success. Detail progress
+counts processed attempts, including failures; Enriched counts successful stores.
+ETA remains unknown rather than estimating from variable remote and model work.
+Long requests retain their current stage and show the age of the latest update.
+
+The lightweight `/api/fetch-progress` endpoint only copies bounded in-memory
+telemetry; it does not open the database or expose cookies, request URLs or raw
+exception details. Query text and the current gallery title are visible locally
+in this view, but not persisted as launcher logs. A new run replaces the previous
+snapshot; server restart clears it. Connection failures clear live counts. Older
+servers show a restart-required message. Restart the service yourself when ready
+to enable this endpoint; updating the launcher alone cannot instrument an already
+running old server.
+
 ## Background Lifecycle
 
 The background worker holds a per-profile Windows mutex. It checks the actual

@@ -18,6 +18,7 @@ from scripts.launcher_core import (
 )
 from scripts.launcher_windows import LauncherWindowsError
 from scripts.launcher_logs import read_recent_logs
+from scripts.launcher_fetch import FetchActivityView, read_fetch_activity
 
 
 ERRORS = {
@@ -146,6 +147,7 @@ class LauncherApp:
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.tag_configure("error", foreground="#b42332")
         self.log_text.tag_configure("warning", foreground="#8a5715")
+        self.fetch_activity = FetchActivityView(notebook, tk, ttk)
         self.variables = {}
         self.form_widgets = []
         values = asdict(self.config)
@@ -323,6 +325,8 @@ class LauncherApp:
             try:
                 status = self.controller.status(config)
                 status["logs"] = read_recent_logs(self.path)
+                status["fetch_activity"] = (read_fetch_activity(status["home_url"])
+                                            if status["state"] in {"running", "external"} else {"availability": "offline"})
                 self.results.put(("status", status, None, None, generation))
             except Exception as error:
                 self.results.put(("status", None, None, error_message(error), generation))
@@ -379,6 +383,8 @@ class LauncherApp:
         self.update_hath_fields()
         if "logs" in status:
             self.render_logs(status["logs"], external=state == "external")
+        if "fetch_activity" in status:
+            self.fetch_activity.render(status["fetch_activity"])
         if state == "failed" and status.get("error"):
             self.notice.set(error_message(status["error"]))
 

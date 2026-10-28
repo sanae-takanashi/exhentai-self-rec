@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
+from .fetch_activity import FetchActivity
 from .audit import low_interest_audit_report, record_visible_impressions
 from .exhentai import (
     Gallery,
@@ -116,6 +117,7 @@ PORT = int(os.environ.get("EXH_REC_PORT", "18787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 FETCH_LOCK = threading.Lock()
 FETCH_STATE: dict[str, Any] = {"running": False}
+FETCH_ACTIVITY = FetchActivity()
 PARENT_UPDATE_STATE: dict[str, Any] = {"running": False, "logs": []}
 REFRESH_STATE: dict[str, Any] = {"last_checked_at": None, "next_check_at": None, "last_error": None}
 REFRESH_WAKE = threading.Event()
@@ -189,6 +191,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_status())
             elif path == "/api/health":
                 self.send_json({"service": "exh-rec", "status": "ok"})
+            elif path == "/api/fetch-progress":
+                self.send_json(FETCH_ACTIVITY.snapshot())
             elif path == "/api/integrations/hath/status":
                 with db.connect() as conn:
                     self.send_json(hath_status(conn))
@@ -1534,9 +1538,13 @@ def refresh_summary(conn) -> dict:
 
 
 def update_fetch_progress(message: str, **fields: Any) -> None:
+    activity_plan = fields.pop("activity_plan", None)
+    if fields.get("running") is True:
+        FETCH_STATE.clear()
     fields["message"] = message
     fields["updated_at"] = current_timestamp()
     FETCH_STATE.update(fields)
+    FETCH_ACTIVITY.update(message, FETCH_STATE, plan=activity_plan)
     log_fields = dict(fields)
     log_fields.pop("message", None)
     fetch_log(message, **log_fields)
@@ -1776,6 +1784,17 @@ def fetch_and_store(
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
     query_plan = build_query_plan(tags, learned_tags, force_query=force_query)
+    try:
+        with db.connect() as conn:
+            activity_plan = []
+            for entry in query_plan:
+                cursor = get_fetch_query_state(conn, entry)
+                active = cursor_enabled_for(entry) and bool(cursor and cursor["anchors"])
+                activity_plan.append({**entry, "page_budget": pages + stale_extra_pages if active else pages,
+                                      "resuming": bool(cursor and cursor.get("resume_url"))})
+    except Exception:
+        FETCH_LOCK.release()
+        raise
     queries = [entry["query"] for entry in query_plan]
     run_id: int | None = None
     fetched = 0
@@ -1790,6 +1809,7 @@ def fetch_and_store(
     cursor_incomplete_queries: list[str] = []
     update_fetch_progress(
         "fetch started",
+        activity_plan=activity_plan,
         running=True,
         trigger=trigger,
         stage="starting",
@@ -1844,8 +1864,11 @@ def fetch_and_store(
                     cursor_active=cursor_active,
                     cursor_resuming=bool(next_url),
                     cursor_caught_up=cursor_caught_up,
+                    cursor_matches=len(matched_anchors),
+                    cursor_match_target=anchor_match_target,
                     page_start=0,
                     page_count=page_limit,
+                    query_page_limit=page_limit,
                     remaining_extra_pages=max(0, page_limit - pages),
                 )
                 for page_number in range(page_limit):
@@ -1916,6 +1939,7 @@ def fetch_and_store(
                         fetched_batch=len(page_galleries),
                         fetched=fetched,
                         stored=stored,
+                        stored_page=page_stored,
                         cursor_matches=len(matched_anchors),
                         cursor_match_target=anchor_match_target,
                     )
@@ -1973,6 +1997,7 @@ def fetch_and_store(
                 update_fetch_progress(
                     "query failed",
                     stage="error",
+                    query_index=query_index,
                     current_query=display_query(query),
                     error=str(exc),
                     errors=list(errors),
@@ -1996,13 +2021,17 @@ def fetch_and_store(
                 )
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
+                update_fetch_progress("detail samples started", stage="enriching_details")
                 samples = collect_gallery_samples(cookie, detailed, sample_pages, proxy_url=proxy_url)
+                update_fetch_progress("detail cache started", stage="enriching_details")
                 cache_sample_thumbnails(detailed.url, samples)
+                update_fetch_progress("detail storing", stage="enriching_details")
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
                 try:
+                    update_fetch_progress("parent chain started", stage="enriching_details", enriched=enriched)
                     parent_enriched += fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
                 except Exception as exc:
                     parent_errors.append(f"parent chain {detailed.parent_url or detailed.url}: {exc}")
@@ -2031,6 +2060,7 @@ def fetch_and_store(
                     "detail fetch failed",
                     stage="enriching_details",
                     detail_index=detail_index,
+                    detail_done=detail_index,
                     detail_total=len(selected_for_detail),
                     current_gallery_url=gallery.url,
                     error=str(exc),
@@ -2059,6 +2089,7 @@ def fetch_and_store(
                  json.dumps(cursor_incomplete_queries, ensure_ascii=True), run_id),
             )
             last_fetch = last_fetch_run(conn)
+            update_fetch_progress("refreshing recommendations", stage="finalizing")
             page = recommend_page(
                 conn,
                 limit=40,
@@ -2108,6 +2139,7 @@ def fetch_and_store(
         else:
             last = None
         FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
+        FETCH_ACTIVITY.update("stopped", FETCH_STATE)
         FETCH_LOCK.release()
 
 
@@ -2137,6 +2169,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         stage="selecting_details",
         queries=["recommendation details"],
         detail_limit=requested_limit,
+        sample_extra_pages=extra_pages,
         started_at=current_timestamp(),
         fetched=0,
         stored=0,
@@ -2178,13 +2211,17 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 )
                 detailed = fetch_gallery_detail(cookie, gallery, proxy_url=proxy_url)
                 ensure_api_cover(cookie, gallery, detailed, proxy_url=proxy_url)
+                update_fetch_progress("detail samples started", stage="enriching_details")
                 samples = collect_gallery_samples(cookie, detailed, extra_pages, proxy_url=proxy_url)
+                update_fetch_progress("detail cache started", stage="enriching_details")
                 cache_sample_thumbnails(detailed.url, samples)
+                update_fetch_progress("detail storing", stage="enriching_details")
                 with db.connect() as conn:
                     store_galleries(conn, [detailed], detail_fetched=True)
                     store_gallery_samples(conn, detailed.url, detailed.page_count, samples)
                 enriched += 1
                 try:
+                    update_fetch_progress("parent chain started", stage="enriching_details", enriched=enriched)
                     parent_enriched += fetch_parent_chain_metadata(cookie, detailed, proxy_url=proxy_url)
                 except Exception as exc:
                     parent_errors.append(f"parent chain {detailed.parent_url or detailed.url}: {exc}")
@@ -2213,6 +2250,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                     "detail fetch failed",
                     stage="enriching_details",
                     detail_index=detail_index,
+                    detail_done=detail_index,
                     detail_total=len(candidates),
                     current_gallery_url=gallery.url,
                     error=str(exc),
@@ -2235,6 +2273,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 (status, enriched, json.dumps(errors, ensure_ascii=True), run_id),
             )
             last_fetch = last_fetch_run(conn)
+            update_fetch_progress("refreshing recommendations", stage="finalizing")
             page = recommend_page(
                 conn,
                 limit=40,
@@ -2277,6 +2316,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         else:
             last = None
         FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
+        FETCH_ACTIVITY.update("stopped", FETCH_STATE)
         FETCH_LOCK.release()
 
 

@@ -85,7 +85,7 @@ def classify_output(line: str):
             route = urlsplit(target).path
         except ValueError:
             route = "other"
-        if route == "/api/health":
+        if route in {"/api/health", "/api/fetch-progress"}:
             return None
         return "http.request", {"method": method, "route": route if route in HTTP_ROUTES else "other", "status": int(status)}
     prefixes = {

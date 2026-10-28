@@ -546,6 +546,17 @@ class LauncherUITests(unittest.TestCase):
             self.assertEqual(self.app.notebook.select(), str(self.app.logs_tab))
             self.pump()
 
+    def test_live_fetch_activity_is_polled_on_status_worker_and_rendered(self):
+        from tests.test_fetch_activity import running_activity
+        activity, _ = running_activity()
+        status = {"state": "running", "managed": True, "home_url": "http://127.0.0.1:12345/"}
+        with patch.object(self.app.controller, "status", return_value=status), patch(
+                "scripts.launcher.read_fetch_activity", return_value={"availability": "available", "activity": activity.snapshot()["activity"]}) as read:
+            self.app.refresh()
+            self.pump()
+        read.assert_called_with(status["home_url"])
+        self.assertIn("Running", self.app.fetch_activity.heading.cget("text"))
+
 
 if __name__ == "__main__":
     unittest.main()

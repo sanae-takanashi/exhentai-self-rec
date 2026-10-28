@@ -2,6 +2,8 @@ import http.client
 import json
 import sqlite3
 import tempfile
+import threading
+from http.server import ThreadingHTTPServer
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -110,6 +112,49 @@ class CatchUpTest(unittest.TestCase):
         with db.connect() as conn:
             return app.get_fetch_query_state(conn, {"query": None, "source": "recent"})
 
+    def test_inflight_fetch_is_readable_over_http_while_remote_page_is_pending(self):
+        from scripts.launcher_fetch import read_fetch_activity
+        entered, release = threading.Event(), threading.Event()
+        failures = []
+
+        def remote_page(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("Synthetic remote page wait timed out")
+            return GalleryBatch([gallery(10)])
+
+        def fetch():
+            try:
+                app.fetch_and_store()
+            except Exception as error:
+                failures.append(type(error).__name__)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        worker = threading.Thread(target=fetch, daemon=True)
+        with patch.object(app, "fetch_galleries", side_effect=remote_page), patch.object(app.Handler, "log_message"), patch("builtins.print"):
+            serving.start()
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                payload = read_fetch_activity(f"http://127.0.0.1:{server.server_port}/")
+                self.assertEqual(payload["availability"], "available")
+                data = payload["activity"]
+                self.assertTrue(data["running"])
+                self.assertEqual(data["stage"], "fetching_pages")
+                self.assertEqual(data["queries"][0]["state"], "running")
+                self.assertEqual(data["pages_done"], 0)
+                self.assertEqual(data["page_budget"], 2)
+            finally:
+                release.set()
+                worker.join(10)
+                server.shutdown()
+                server.server_close()
+                serving.join()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(app.FETCH_ACTIVITY.snapshot()["activity"]["running"])
+
     def test_partial_run_resumes_and_promotes_frozen_head_only_after_catch_up(self):
         with db.connect() as conn:
             conn.execute("UPDATE fetch_query_state SET last_success_at='2000-01-01 00:00:00'")
@@ -119,6 +164,13 @@ class CatchUpTest(unittest.TestCase):
             first = app.fetch_and_store()
         self.assertEqual(first["status"], "partial")
         self.assertFalse(first["ok"])
+        activity = app.FETCH_ACTIVITY.snapshot()["activity"]
+        self.assertFalse(activity["running"])
+        self.assertEqual(activity["status"], "partial")
+        self.assertEqual(activity["queries"][0]["state"], "partial")
+        self.assertEqual(activity["pages_done"], 2)
+        self.assertEqual(activity["page_budget"], 2)
+        self.assertEqual(activity["incomplete_count"], 1)
         self.assertEqual(self.state()["anchors"], [gallery(10).url])
         self.assertEqual(self.state()["pending_anchors"], [gallery(30).url])
         self.assertEqual(self.state()["resume_url"], "https://exhentai.org/?next=28")
@@ -129,6 +181,12 @@ class CatchUpTest(unittest.TestCase):
             second = app.fetch_and_store()
         self.assertEqual(fetch.call_args.kwargs["next_url"], "https://exhentai.org/?next=28")
         self.assertEqual(second["status"], "success")
+        activity = app.FETCH_ACTIVITY.snapshot()["activity"]
+        self.assertEqual(activity["status"], "success")
+        self.assertTrue(activity["queries"][0]["resuming"])
+        self.assertEqual(activity["queries"][0]["state"], "done")
+        self.assertEqual(activity["pages_done"], 1)
+        self.assertEqual(activity["incomplete_count"], 0)
         self.assertEqual(self.state()["anchors"], [gallery(30).url])
         self.assertIsNone(self.state()["resume_url"])
         self.assertEqual(self.state()["pending_anchors"], [])
