@@ -149,7 +149,6 @@ let reviewUndoPending = false;
 let reviewReloadQueued = false;
 let reviewUpdatesAvailable = false;
 let reviewHintsExpanded = true;
-let reviewReasonSelection = null;
 let reviewPaginationDirty = false;
 const reviewOpenedUrls = new Set();
 const impressionContexts = new Map();
@@ -289,66 +288,29 @@ async function flushDeferredReviewReload() {
   }
 }
 
-function reviewShortcutHints(selectingReason = false) {
-  return selectingReason
-    ? '<span><kbd>j</kbd>/<kbd>k</kbd> Reason</span><span><kbd>0-8</kbd> Choose</span><span><kbd>Enter</kbd> Apply</span><span><kbd>Esc</kbd> Cancel</span>'
-    : '<span><kbd>j</kbd>/<kbd>k</kbd> Next / Previous</span><span><kbd>o</kbd> Open</span><span><kbd>1-5</kbd> Rate</span><span><kbd>r</kbd> Reason</span><span><kbd>a</kbd>/<kbd>d</kbd> Down / Up</span><span><kbd>s</kbd> Skip</span><span><kbd>z</kbd> Undo</span>';
+function reviewShortcutHints() {
+  return '<span><kbd>j</kbd>/<kbd>k</kbd> Next / Previous</span><span><kbd>o</kbd> Open</span><span><kbd>1-5</kbd> Rate</span><span><kbd>q</kbd>/<kbd>w</kbd> Prev / Next reason</span><span><kbd>a</kbd>/<kbd>d</kbd> Down / Up</span><span><kbd>s</kbd> Skip</span><span><kbd>z</kbd> Undo</span>';
 }
 
-function finishReviewReason(cancel = false, returnFocus = false) {
-  const selection = reviewReasonSelection;
-  if (!selection) return;
-  reviewReasonSelection = null;
-  selection.select.removeEventListener("blur", selection.onBlur);
-  if (cancel) selection.select.value = selection.original;
-  const hints = recommendationsEl.querySelector(".review-key-items");
-  if (hints) hints.innerHTML = reviewShortcutHints();
-  const details = recommendationsEl.querySelector(".review-key-hints");
-  if (details) details.open = selection.hintsOpen;
-  if (returnFocus) selection.select.blur();
-  updateReviewControls();
-}
-
-function beginReviewReason() {
+function cycleReviewReason(delta) {
   const select = recommendationsEl.querySelector(".focus-rating select[data-reason-for]");
-  if (!select || select.disabled) return;
-  const details = recommendationsEl.querySelector(".review-key-hints");
-  reviewReasonSelection = { select, original: select.value, hintsOpen: Boolean(details?.open),
-    onBlur: () => finishReviewReason() };
-  select.addEventListener("blur", reviewReasonSelection.onBlur);
-  const hints = recommendationsEl.querySelector(".review-key-items");
-  if (hints) hints.innerHTML = reviewShortcutHints(true);
-  if (details) details.open = true;
-  select.focus();
-  updateReviewControls();
+  if (!select || select.disabled || !select.options.length) return;
+  select.selectedIndex = (Math.max(0, select.selectedIndex) + delta + select.options.length) % select.options.length;
 }
 
 function reviewKeydown(event) {
   if (!isFocusReview() || reviewBusy() || event.defaultPrevented || event.repeat || event.isComposing ||
       event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
+      event.target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])") ||
       document.querySelector("dialog[open], [role='dialog'][aria-modal='true']")) return;
   const key = event.key.toLowerCase();
-  // Numbers choose reasons only after R explicitly enters this select.
-  if (reviewReasonSelection) {
-    const { select } = reviewReasonSelection;
-    if (!select.isConnected || event.target !== select) finishReviewReason();
-    else {
-      if (key === "j" || key === "k") {
-        select.selectedIndex = Math.max(0, Math.min(select.options.length - 1, select.selectedIndex + (key === "j" ? 1 : -1)));
-      } else if (/^[0-8]$/.test(key)) select.selectedIndex = Number(key);
-      else if (key === "enter" || key === "escape") finishReviewReason(key === "escape", true);
-      else return;
-      event.preventDefault();
-      return;
-    }
-  }
-  if (event.target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")) return;
   const item = currentReviewItem();
   let action;
   if (key === "z") action = () => undoReviewRating();
   else if (key === "arrowleft" || key === "k") action = () => navigateReview(-1);
   else if (key === "arrowright" || key === "j") action = () => navigateReview(1);
-  else if (item && key === "r") action = () => beginReviewReason();
+  else if (item && key === "q") action = () => cycleReviewReason(-1);
+  else if (item && key === "w") action = () => cycleReviewReason(1);
   else if (item && key === "a") action = () => vote(item.url, -1);
   else if (item && key === "d") action = () => vote(item.url, 1);
   else if (item && /^[1-5]$/.test(key)) action = () => score(item.url, Number(key));
@@ -2801,7 +2763,6 @@ function renderParentChain(item) {
 }
 
 function renderGalleryCards(items, append = false) {
-  finishReviewReason();
   const previousHints = recommendationsEl.querySelector(".review-key-hints");
   if (previousHints) reviewHintsExpanded = previousHints.open;
   const mode = currentView;
@@ -2942,17 +2903,17 @@ function renderGalleryCards(items, append = false) {
           <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" aria-label="Thumb up" title="Record a mild positive signal for this gallery.${focus ? " (d)" : ""}">${focus ? thumbIcon : "Thumb up"}</button>
         </div>`;
     const negativeReasonControl = `<label class="feedback-reason">
-          <span>Why not?${focus ? " (r)" : ""}</span>
-          <select data-reason-for="${escapeAttr(item.url)}" aria-label="Optional negative feedback reason">
-            <option value="">${focus ? "0 " : ""}Optional reason</option>
-            <option value="visual_style">${focus ? "1 " : ""}Visual style</option>
-            <option value="content_tags">${focus ? "2 " : ""}Content or tags</option>
-            <option value="creator_character">${focus ? "3 " : ""}Creator or character</option>
-            <option value="quality">${focus ? "4 " : ""}Quality</option>
-            <option value="gallery_too_small">${focus ? "5 " : ""}Gallery too small</option>
-            <option value="too_few_relevant_images">${focus ? "6 " : ""}Too few relevant images</option>
-            <option value="duplicate_update">${focus ? "7 " : ""}Duplicate or update</option>
-            <option value="other">${focus ? "8 " : ""}Other</option>
+          <span>Why not?</span>
+          <select data-reason-for="${escapeAttr(item.url)}" aria-label="Optional negative feedback reason"${focus ? ' title="Previous reason (q) / Next reason (w)"' : ""}>
+            <option value="">Optional reason</option>
+            <option value="visual_style">Visual style</option>
+            <option value="content_tags">Content or tags</option>
+            <option value="creator_character">Creator or character</option>
+            <option value="quality">Quality</option>
+            <option value="gallery_too_small">Gallery too small</option>
+            <option value="too_few_relevant_images">Too few relevant images</option>
+            <option value="duplicate_update">Duplicate or update</option>
+            <option value="other">Other</option>
           </select>
         </label>`;
     let feedbackControls = mode === "preview" || classifierMode
@@ -3779,7 +3740,7 @@ document.querySelector("#reviewRefreshBtn").addEventListener("click", () => {
 document.addEventListener("keydown", reviewKeydown);
 recommendationsEl.addEventListener("toggle", (event) => {
   if (!event.target.matches?.(".review-key-hints")) return;
-  if (!reviewReasonSelection) reviewHintsExpanded = event.target.open;
+  reviewHintsExpanded = event.target.open;
   updateReviewControls();
 }, true);
 window.addEventListener("resize", updateReviewControls);

@@ -41,12 +41,12 @@ not inject or install it, and the script does not submit downloads or feedback.
   switches, list requests, feedback and undo.
 - Keys 1-5 rate, A/D thumb down/up, S skips, O activates the normal gallery link,
   J/K (or left/right) navigate next/previous, and Z undoes the last rating.
-  R enters reason selection: J/K cycle, 0-8 choose, Enter applies, Esc cancels.
-  Reason selection never submits feedback and temporarily changes the hint bar.
+  Q/W cycle the previous/next reason, including the empty option, without moving
+  focus or submitting feedback. There is no selection mode or Enter confirmation;
+  J/K always navigate galleries, and 1-5 always rate. R is not an app shortcut.
   Shortcuts are active only in Focus
   Review, ignore key repeat/composition/modifiers, and do not intercept text
-  inputs, editable content or an open dialog. Selects retain native behavior
-  unless R explicitly enters reason selection. Tooltips name controls
+  inputs, selects, editable content or an open dialog. Tooltips name controls
   and their shortcuts. A compact footer reminder can be collapsed with its
   keyboard icon; that state survives card changes in the current page.
 - Undo is single-level and applies only to the last successful score/vote/Skip

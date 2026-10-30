@@ -8,11 +8,11 @@ Skip, and Z undoes the last supported rating. Thumbs retain their existing mild
 vote semantics; they are not aliases for scores 1/5. Input fields, dialogs, pending actions,
 composition and held keys retain their existing guards.
 
-R focuses the reason select in an explicit selection mode. J/K move down/up;
-0-8 choose the numbered option (0 clears). Enter applies and returns to Review;
-Esc restores the previous selection. Tab or clicking away keeps the selection.
+Q/W choose the previous/next reason directly, cycling through all options,
+including the empty optional reason. Focus stays in Review; there is no selection
+mode or Enter confirmation. J/K always navigate galleries, and 1-5 always rate.
 Selecting a reason never submits feedback. Reasons accompany only negative
-votes or scores 1/2. The footer switches to reason keys while selecting.
+votes or scores 1/2. R is no longer an app shortcut.
 
 The keyboard icon collapses the reminder. Tab to it and press Enter or Space
 to toggle it without a mouse. Collapse state survives card changes, not reloads.
@@ -47,7 +47,10 @@ map <v-ex1280> LinkHints.activateFocus direct="em=a[onclick*=\"do_hathdl('1280')
 ```
 
 For Review, preserve the existing Vimium exclusion that passes through
-`0 1 2 3 4 5 6 7 8 <left> <right> j k r a d o s z` at `:http://127.0.0.1:18787/`.
+`1 2 3 4 5 <left> <right> j k q w a d o s z` at `:http://127.0.0.1:18787/`.
+Add Q/W to that rule's pass-through keys before trying them in Vimium. The app
+cannot override keys intercepted by an extension; changing app code alone does
+not update this rule. R is intentionally not a Review binding.
 Other sites retain Vimium's D page-down behavior. Link-hint labels vary per page;
 use the label currently shown for Archive Download, not a fixed label.
 

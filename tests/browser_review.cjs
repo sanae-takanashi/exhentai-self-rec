@@ -167,46 +167,56 @@ async function scenario(viewport) {
     assert.equal(listCalls, 1);
     assert.equal(await page.locator("#reviewRefreshBtn").evaluate((el) => el.classList.contains("updates-available")), true);
 
-    // Reason selection is local only; digits must never leak into rating.
+    // Q/W change reasons directly without feedback, a mode switch or focus theft.
     await page.keyboard.press("j");
     assert.equal(await current(), items[1].url);
     await page.keyboard.press("k");
     assert.equal(await current(), items[0].url);
     const reason = page.locator('.focus-rating select[data-reason-for]');
-    await page.keyboard.press("r");
-    assert(await reason.evaluate((el) => el === document.activeElement));
-    assert.match(await hints.innerText(), /Apply/);
-    for (const flag of ["repeat", "isComposing", "ctrlKey", "altKey", "metaKey", "shiftKey"]) {
-      await reason.evaluate((el, flag) => el.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "4", bubbles: true, cancelable: true, [flag]: true,
-      })), flag);
-      assert.equal(await reason.inputValue(), "", `reason ignored guard: ${flag}`);
-    }
-    await page.keyboard.press("j");
-    assert.equal(await reason.inputValue(), "visual_style");
-    await page.keyboard.press("k");
+    assert.match(await hints.innerText(), /q\/w Prev \/ Next reason/);
+    await page.keyboard.press("q");
+    assert.equal(await reason.inputValue(), "other");
+    await page.keyboard.press("w");
     assert.equal(await reason.inputValue(), "");
     const reasons = ["", "visual_style", "content_tags", "creator_character", "quality",
       "gallery_too_small", "too_few_relevant_images", "duplicate_update", "other"];
-    for (let index = 0; index < reasons.length; index++) {
-      await page.keyboard.press(String(index));
+    for (let index = 1; index <= reasons.length; index++) {
+      await page.keyboard.press("w");
+      assert.equal(await reason.inputValue(), reasons[index % reasons.length]);
+      assert.equal(await reason.evaluate((el) => el === document.activeElement), false);
+    }
+    for (let index = reasons.length - 1; index >= 0; index--) {
+      await page.keyboard.press("q");
       assert.equal(await reason.inputValue(), reasons[index]);
     }
-    await page.keyboard.press("Escape");
-    assert.equal(await reason.inputValue(), "", "cancel must restore original reason");
+    for (const flag of ["repeat", "isComposing", "ctrlKey", "altKey", "metaKey", "shiftKey"]) {
+      await page.locator("body").evaluate((el, flag) => el.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "w", bubbles: true, cancelable: true, [flag]: true,
+      })), flag);
+      assert.equal(await reason.inputValue(), "", `reason ignored guard: ${flag}`);
+    }
+    await reason.focus();
+    await page.keyboard.press("w");
+    assert.equal(await reason.inputValue(), "", "native select must retain its own keys");
+    await reason.blur();
+    await page.evaluate(() => {
+      const dialog = document.createElement("dialog");
+      dialog.id = "synthetic-key-guard";
+      document.body.append(dialog);
+      dialog.showModal();
+    });
+    await page.keyboard.press("w");
+    assert.equal(await reason.inputValue(), "", "dialog must block reason keys");
+    await page.evaluate(() => document.querySelector("#synthetic-key-guard").close());
     await page.keyboard.press("r");
-    await page.keyboard.press("4");
-    await page.keyboard.press("Enter");
-    assert.equal(await reason.inputValue(), "quality");
-    assert.equal(await reason.evaluate((el) => el === document.activeElement), false);
+    assert.equal(await reason.inputValue(), "", "R is no longer bound");
     assert.equal(feedbackCalls, 0, "reason keys submitted feedback");
-    // Reason mode temporarily expands hints but does not change the user's preference.
+    // Direct reason keys do not expand a collapsed reminder.
     await hintToggle.focus();
     await page.keyboard.press("Enter");
     await page.waitForFunction(() => !document.querySelector(".review-key-hints").open);
-    await page.keyboard.press("r");
-    assert.equal(await hints.getAttribute("open"), "");
-    await page.keyboard.press("Escape");
+    await page.keyboard.press("w");
+    assert.equal(await reason.inputValue(), "visual_style");
     assert.equal(await hints.getAttribute("open"), null);
     await page.keyboard.press("j");
     assert.equal(await hints.getAttribute("open"), null);
@@ -215,21 +225,18 @@ async function scenario(viewport) {
     await page.keyboard.press("Enter");
     await page.waitForFunction(() => document.querySelector(".review-key-hints").open);
     await hintToggle.blur();
-    // Explicit mode cannot survive blur or a rerender, or intercept another input.
-    await page.keyboard.press("r");
-    await page.keyboard.press("Tab");
-    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
+    // Input fields retain all ordinary letter keys.
     await page.locator("#localFilter").focus();
     await page.keyboard.press("j");
+    await page.keyboard.press("q");
+    await page.keyboard.press("w");
     assert.equal(await current(), items[0].url);
+    assert.equal(await reason.inputValue(), "");
     await page.locator("#localFilter").fill("");
     await page.locator("#localFilter").blur();
-    await page.keyboard.press("r");
     await page.evaluate(() => renderGalleryCards(renderedGalleryItems));
-    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
-    await page.keyboard.press("r");
-    await page.keyboard.press("4");
-    await page.keyboard.press("Enter");
+    for (let index = 0; index < 4; index++) await page.keyboard.press("w");
+    assert.equal(await reason.inputValue(), "quality");
     for (const [key, value] of [["a", -1], ["d", 1]]) {
       const before = feedbackCalls;
       await page.keyboard.press(key);
@@ -242,19 +249,21 @@ async function scenario(viewport) {
     }
 
     const score = page.locator('[data-score="1"]');
-    await page.locator('.focus-rating select[data-reason-for]').selectOption("quality");
-    await score.click();
+    await page.keyboard.press("q");
+    await page.keyboard.press("w");
+    await page.keyboard.press("1");
     await page.locator("#status").filter({ hasText: "Synthetic rating failure" }).waitFor();
     assert.equal(await current(), items[0].url);
     assert.equal(lastRating.reason_code, "quality");
+    assert.equal(lastRating.score, 1, "reason cycling must not hijack the score keys");
     assert(await score.isEnabled());
     ratingMode = "hold";
     await score.click();
     await until(() => feedbackRoute);
     assert(await page.locator("#reviewNextBtn").isDisabled());
-    for (const key of ["j", "k", "r", "a", "d", "1"]) await page.keyboard.press(key);
+    for (const key of ["j", "k", "q", "w", "a", "d", "1"]) await page.keyboard.press(key);
     assert.equal(await current(), items[0].url);
-    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
+    assert.equal(await reason.inputValue(), "quality");
     await score.dispatchEvent("click");
     assert.equal(feedbackCalls, 4);
     removed.add(items[0].url);

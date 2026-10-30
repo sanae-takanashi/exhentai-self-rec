@@ -354,23 +354,44 @@ test("Focus: left-hand keys dispatch navigation and native votes, not score alia
   f.run(`globalThis.actions = [];
     navigateReview = (direction) => actions.push(['navigate', direction]);
     vote = (url, value) => actions.push(['vote', url, value]);
+    cycleReviewReason = (direction) => actions.push(['reason', direction]);
     score = () => { throw Error('Thumbs must not score'); };
     globalThis.fixtureKey = { target: { closest: () => null }, preventDefault() {} };
   `);
-  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd']) {
+  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd', 'q', 'w']) {
     for (const flag of ['repeat', 'isComposing', 'ctrlKey', 'altKey', 'metaKey', 'shiftKey', 'defaultPrevented']) {
       f.run(`reviewKeydown({ ...fixtureKey, key: '${key}', ${flag}: true })`);
     }
     f.run(`reviewKeydown({ ...fixtureKey, key: '${key}', target: { closest: () => ({}) } })`);
   }
   assert.equal(f.run('actions.length'), 0);
-  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd']) {
+  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd', 'q', 'w']) {
     f.run(`reviewKeydown({ ...fixtureKey, key: '${key}' })`);
   }
   assert.deepEqual(JSON.parse(f.run('JSON.stringify(actions)')), [
     ['navigate', 1], ['navigate', -1], ['navigate', -1], ['navigate', 1],
     ['vote', items[0].url, -1], ['vote', items[0].url, 1],
+    ['reason', -1], ['reason', 1],
   ]);
+  f.run(`reviewKeydown({ ...fixtureKey, key: 'r' })`);
+  assert.equal(f.run('actions.length'), 8, 'R must not be an app binding');
+});
+
+test("Focus: reason cycling is local, wraps through empty and ignores unavailable controls", () => {
+  const f = focusFixture();
+  f.run(`globalThis.reasonSelect = { selectedIndex: 0, options: Array(9), disabled: false };
+    recommendationsEl.querySelector = () => reasonSelect;
+    cycleReviewReason(-1);
+  `);
+  assert.equal(f.run('reasonSelect.selectedIndex'), 8);
+  f.run('cycleReviewReason(1)');
+  assert.equal(f.run('reasonSelect.selectedIndex'), 0);
+  f.run('reasonSelect.disabled = true; cycleReviewReason(1)');
+  assert.equal(f.run('reasonSelect.selectedIndex'), 0);
+  f.run('reasonSelect.disabled = false; reasonSelect.options = []; cycleReviewReason(1)');
+  assert.equal(f.run('reasonSelect.selectedIndex'), 0);
+  f.run('recommendationsEl.querySelector = () => null; cycleReviewReason(1)');
+  assert.equal(f.requests.length, 0);
 });
 
 test("Focus: failed queue loads release navigation and retain the current gallery", async () => {
