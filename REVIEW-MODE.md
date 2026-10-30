@@ -62,6 +62,22 @@ click/download with an explicit preference.
   site navigation. Missing covers, long titles, empty results, API failures,
   unavailable browser storage and repeated mode switches remain usable.
 
+## Queue Continuation
+
+Successful feedback or classification at the Focus queue tail automatically
+checks for a successor. Grid also refills when the loaded batch becomes empty.
+This check runs even if the previous response said No More: feedback can admit
+new candidates into the bounded recommendation pool. A failed continuation
+does not undo or resubmit the successful action; Next, Load More and Refresh
+remain available to retry, and Focus rating undo remains valid.
+
+Feedback can also change eligibility, interest bands and ranking. The next
+append after a local removal or undo therefore scans from offset zero without
+replacing or reordering existing queued cards. Duplicate-only pages are skipped
+until an unseen URL or actual exhaustion is found. Non-advancing/out-of-range
+cursors fail with a retryable error. Existing delivery contexts are preserved;
+new deliveries still require independent viewport visibility confirmation.
+
 ## Implementation
 
 Keep the existing API page and card data as the queue. Add a presentation state

@@ -76,6 +76,7 @@ function fixture(view = "review") {
   vm.runInContext(source.slice(0, bootstrap), context);
   vm.runInContext(`
     api = fixtureApi;
+    globalThis.fixtureRecordPageImpressions = recordPageImpressions;
     refreshQueueCounts = () => {};
     recordPageImpressions = () => {};
     queueVisualEmbedding = () => {};
@@ -184,6 +185,9 @@ test("simultaneous feedback on different cards preserves both successful removal
   await first;
   assert(f.buttons(items[1].url).every((button) => button.disabled));
   f.respond(1, { ok: true, removed_gallery_url: items[1].url });
+  await new Promise(setImmediate);
+  assert.equal(f.requests.length, 3);
+  f.respond(2, page([]));
   await second;
   assert.deepEqual(f.urls(), []);
 });
@@ -500,4 +504,159 @@ test("classification completed after a view switch cannot apply the old queue", 
   f.respond(1, page([items[1]]));
   await saving;
   assert.deepEqual(f.urls(), [items[1].url]);
+});
+
+const nextItem = { ...items[1], url: "https://example.test/g/next/token/" };
+const tick = () => new Promise(setImmediate);
+
+for (const layout of ["focus", "grid"]) {
+  test(`${layout}: consuming the final card rechecks inventory even after No More`, async () => {
+    const f = fixture();
+    f.run(`reviewLayout = "${layout}"; applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false });`);
+    const saving = f.run("skip(fixtureItems[0].url)");
+    f.respond(0, undoResponse());
+    await tick();
+    assert.equal(f.requests.length, 2);
+    assert.equal(new URL(f.requests[1].url, "https://local.test").searchParams.get("offset"), "0");
+    f.respond(1, page([nextItem]));
+    await saving;
+    assert.deepEqual(f.urls(), [nextItem.url]);
+    assert.equal(f.run("reviewBusy()"), false);
+    if (layout === "focus") {
+      assert.equal(f.run("reviewUndo.feedbackId"), 7);
+      const undo = f.run("undoReviewRating()");
+      f.respond(2, { ok: true });
+      await undo;
+      assert.deepEqual(f.urls(), [items[0].url, nextItem.url]);
+    }
+  });
+}
+
+test("Focus: rating the tail loads its successor without jumping back to an earlier card", async () => {
+  const f = focusFixture();
+  await f.run("navigateReview(1)");
+  const saving = f.run("skip(fixtureItems[1].url)");
+  f.respond(0, { ...undoResponse(), removed_gallery_url: items[1].url });
+  await tick();
+  assert.equal(f.requests.length, 2);
+  f.respond(1, { items: [items[0]], next_offset: 1, total: 2, has_more: true });
+  await tick();
+  assert.equal(f.requests.length, 3);
+  f.respond(2, { items: [nextItem], next_offset: 2, total: 2, has_more: false });
+  await saving;
+  assert.deepEqual(f.urls(), [items[0].url, nextItem.url]);
+  assert.equal(f.run("reviewCurrentUrl"), nextItem.url);
+});
+
+test("Focus: a duplicate-only page continues until a new card without another Next click", async () => {
+  const f = focusFixture();
+  await f.run("navigateReview(1); hasMoreRecommendations = true;");
+  const loading = f.run("navigateReview(1)");
+  f.respond(0, { items, total: 5, next_offset: 4, has_more: true });
+  await tick();
+  assert.equal(f.requests.length, 2);
+  f.respond(1, { items: [nextItem], total: 5, next_offset: 5, has_more: false });
+  await loading;
+  assert.equal(f.run("reviewCurrentUrl"), nextItem.url);
+});
+
+test("Focus: a failed automatic continuation keeps the committed rating and allows a retry", async () => {
+  const f = focusFixture();
+  f.run("applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false })");
+  const saving = f.run("skip(fixtureItems[0].url)");
+  f.respond(0, undoResponse());
+  await tick();
+  assert.equal(f.requests.length, 2);
+  f.requests[1].reject(new Error("Synthetic next-page failure"));
+  await saving;
+  assert.deepEqual(f.urls(), []);
+  assert.equal(f.run("reviewUndo.feedbackId"), 7);
+  assert.equal(f.run("reviewBusy()"), false);
+  assert.equal(f.run('document.querySelector("#reviewNextBtn").disabled'), false);
+  const retry = f.run("navigateReview(1)");
+  f.respond(2, page([nextItem]));
+  await retry;
+  assert.equal(f.run("reviewCurrentUrl"), nextItem.url);
+});
+
+test("Focus: true exhaustion performs one lookup without a reload loop", async () => {
+  const f = focusFixture();
+  f.run("applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false })");
+  const saving = f.run("skip(fixtureItems[0].url)");
+  f.respond(0, undoResponse());
+  await tick();
+  assert.equal(f.requests.length, 2);
+  f.respond(1, page([]));
+  await saving;
+  await f.run("navigateReview(1)");
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.run('document.querySelector("#reviewNextBtn").disabled'), true);
+});
+
+test("Focus: moving the last card to Updates refills without recording a rating", async () => {
+  const f = focusFixture();
+  f.run("applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false })");
+  const saving = f.run('classifyGallery(fixtureItems[0].url, "updates")');
+  f.respond(0, { ok: true, classification: "updates" });
+  await tick();
+  assert.equal(f.requests.length, 2);
+  assert(f.requests[1].url.startsWith("/api/recommendations?"));
+  f.respond(1, page([nextItem]));
+  await saving;
+  assert.deepEqual(f.urls(), [nextItem.url]);
+  assert.equal(f.run("reviewUndo"), null);
+});
+
+test("Focus: reranking after a rating rescans before the old offset", async () => {
+  const f = focusFixture();
+  const saving = f.run("skip(fixtureItems[0].url)");
+  f.respond(0, undoResponse());
+  await saving;
+  const loading = f.run("navigateReview(1)");
+  assert.equal(new URL(f.requests[1].url, "https://local.test").searchParams.get("offset"), "0");
+  f.respond(1, { items: [nextItem, items[1]], next_offset: 2, total: 2, has_more: false });
+  await loading;
+  assert.deepEqual(f.urls(), [items[1].url, nextItem.url]);
+  assert.equal(f.run("reviewCurrentUrl"), nextItem.url);
+});
+
+for (const nextOffset of [2, 10001, null]) {
+  test(`Focus: invalid continuation cursor ${nextOffset} fails without looping`, async () => {
+    const f = focusFixture();
+    await f.run("navigateReview(1); hasMoreRecommendations = true;");
+    const loading = f.run("navigateReview(1)");
+    f.respond(0, { items, total: 5, next_offset: nextOffset, has_more: true });
+    await assert.rejects(loading, /pagination did not advance/);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.run("reviewBusy()"), false);
+    assert.equal(f.run("reviewCurrentUrl"), items[1].url);
+  });
+}
+
+test("Focus: a view switch during duplicate-page scanning discards its later result", async () => {
+  const f = focusFixture();
+  await f.run("navigateReview(1); hasMoreRecommendations = true;");
+  const loading = f.run("navigateReview(1)");
+  f.respond(0, { items, total: 5, next_offset: 4, has_more: true });
+  await tick();
+  f.run('setActiveView("favorite"); renderGalleryCards([fixtureItems[0]]);');
+  f.respond(1, page([nextItem]));
+  await loading;
+  assert.deepEqual(f.urls(), [items[0].url]);
+  assert.equal(f.run("reviewLoading"), false);
+});
+
+test("append deliveries retain existing viewport contexts and acknowledge new contexts independently", async () => {
+  const f = fixture();
+  f.run(`
+    observeRenderedGalleries = () => {};
+    impressionContexts.set(fixtureItems[0].url, { requestId: "original", ready: true });
+    fixtureRecordPageImpressions({ request_id: "rescan", items: fixtureItems }, "review", 0, true);
+  `);
+  assert.equal(f.run("impressionContexts.get(fixtureItems[0].url).requestId"), "original");
+  assert.equal(f.run("impressionContexts.get(fixtureItems[1].url).ready"), false);
+  f.respond(0, { ok: true });
+  await tick();
+  assert.equal(f.run("impressionContexts.get(fixtureItems[0].url).requestId"), "original");
+  assert.equal(f.run("impressionContexts.get(fixtureItems[1].url).ready"), true);
 });

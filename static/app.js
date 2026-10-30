@@ -148,6 +148,7 @@ let reviewLoadSequence = 0;
 let reviewUndoPending = false;
 let reviewReloadQueued = false;
 let reviewUpdatesAvailable = false;
+let reviewPaginationDirty = false;
 const reviewOpenedUrls = new Set();
 const impressionContexts = new Map();
 let disposeGalleryVisibility = () => {};
@@ -186,7 +187,7 @@ function updateReviewControls() {
   const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
   document.querySelector("#reviewPosition").textContent = `${index < 0 ? 0 : index + 1} / ${renderedGalleryItems.length}`;
   document.querySelector("#reviewPrevBtn").disabled = reviewBusy() || index <= 0;
-  document.querySelector("#reviewNextBtn").disabled = reviewBusy() || (index >= renderedGalleryItems.length - 1 && !hasMoreRecommendations);
+  document.querySelector("#reviewNextBtn").disabled = reviewBusy() || (index >= renderedGalleryItems.length - 1 && !hasMoreRecommendations && !reviewPaginationDirty);
   document.querySelector("#reviewUndoBtn").disabled = reviewBusy() || !reviewUndo;
   const refresh = document.querySelector("#reviewRefreshBtn");
   refresh.disabled = reviewBusy();
@@ -216,10 +217,11 @@ async function navigateReview(delta) {
   if (!isFocusReview() || reviewBusy()) return;
   const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
   const target = index + delta;
-  if (target >= renderedGalleryItems.length && hasMoreRecommendations) {
+  if (target >= renderedGalleryItems.length && (hasMoreRecommendations || reviewPaginationDirty)) {
     const previousLength = renderedGalleryItems.length;
+    const epoch = reviewQueueEpoch;
     await loadCurrentPage(nextRecommendationOffset, true);
-    if (!isFocusReview() || renderedGalleryItems.length <= previousLength) return;
+    if (!isFocusReview() || epoch !== reviewQueueEpoch || renderedGalleryItems.length <= previousLength) return;
   }
   if (target < 0 || target >= renderedGalleryItems.length) return;
   reviewCurrentUrl = renderedGalleryItems[target].url;
@@ -260,6 +262,7 @@ async function undoReviewRating() {
     renderedGalleryItems = renderedGalleryItems.filter((item) => item.url !== undo.item.url);
     renderedGalleryItems.splice(Math.min(undo.index, renderedGalleryItems.length), 0, undo.item);
     ++nextRecommendationOffset;
+    reviewPaginationDirty = true;
     reviewCurrentUrl = undo.item.url;
     renderGalleryCards(renderedGalleryItems);
     refreshQueueCounts();
@@ -271,6 +274,7 @@ async function undoReviewRating() {
     ++recommendationRequestId;
     reviewUndoPending = false;
     for (const item of renderedGalleryItems) setGalleryFeedbackButtonsDisabled(item.url, false);
+    updateLoadMore();
     updateReviewControls();
     await flushDeferredReviewReload();
   }
@@ -968,6 +972,7 @@ function setActiveView(view) {
   reviewLoading = false;
   disposeGalleryVisibility();
   currentView = view;
+  reviewPaginationDirty = false;
   for (const tab of viewTabs) {
     const active = tab.dataset.view === view;
     tab.classList.toggle("active", active);
@@ -1979,6 +1984,7 @@ async function loadRecommendations(offset = 0, append = false) {
     return;
   }
   const requestedView = currentView;
+  if (requestedView === "review" && append && reviewPaginationDirty) offset = 0;
   const requestId = ++recommendationRequestId;
   const reviewLoadId = requestedView === "review" ? ++reviewLoadSequence : null;
   if (requestedView === "review") {
@@ -1989,6 +1995,7 @@ async function loadRecommendations(offset = 0, append = false) {
       reviewUndo = null;
       reviewUpdatesAvailable = false;
     }
+    updateLoadMore();
     updateReviewControls();
   }
   const localFilter = localFilterEl.value.trim();
@@ -2006,22 +2013,32 @@ async function loadRecommendations(offset = 0, append = false) {
   }
   let payload;
   try {
-    payload = await api(
-      `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
-    );
+    while (true) {
+      payload = await api(
+        `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+      );
+      if (requestId !== recommendationRequestId || currentView !== requestedView) return;
+      // Feedback can rerank unseen items before the old offset. Rescan without
+      // replacing the loaded queue, and skip pages containing only known URLs.
+      if (requestedView !== "review" || !append || !payload.has_more ||
+          payload.items.some((item) => item?.url && !renderedGalleryUrls.includes(item.url))) break;
+      recordPageImpressions(payload, "review", offset, true);
+      if (!Number.isInteger(payload.next_offset) || payload.next_offset <= offset || payload.next_offset > 10000) {
+        throw new Error("Review pagination did not advance; refresh the queue to retry");
+      }
+      offset = payload.next_offset;
+    }
+    applyGalleryPage(payload, append);
+    renderLowInterestPolicy(payload.low_interest_policy, requestedView);
+    recordPageImpressions(payload, requestedView === "preview" ? "preview" : "review", offset, append);
+    setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(requestedView).loaded}`);
   } finally {
     if (requestedView === "review" && reviewLoadId === reviewLoadSequence) {
       reviewLoading = false;
+      updateLoadMore();
       updateReviewControls();
     }
   }
-  if (requestId !== recommendationRequestId || currentView !== requestedView) {
-    return;
-  }
-  applyGalleryPage(payload, append);
-  renderLowInterestPolicy(payload.low_interest_policy, requestedView);
-  recordPageImpressions(payload, requestedView === "preview" ? "preview" : "review", offset);
-  setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(requestedView).loaded}`);
 }
 
 async function fetchNew(query = "") {
@@ -2309,8 +2326,12 @@ async function applyFeedbackResult(payload, galleryUrl, requestedView = currentV
       reviewCurrentUrl = renderedGalleryItems[Math.min(removedIndex, renderedGalleryItems.length - 1)]?.url || "";
     }
     renderedGalleryUrls = renderedGalleryUrls.filter((url) => url !== removedUrl);
-    nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
+    if (removedIndex >= 0) {
+      nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
+      if (currentView === "review") reviewPaginationDirty = true;
+    }
     renderGalleryCards(renderedGalleryItems);
+    updateLoadMore();
   }
   refreshQueueCounts();
 }
@@ -2400,14 +2421,14 @@ async function loadDiscovery(offset = 0, append = false) {
   setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(currentView).loaded}`);
 }
 
-function recordPageImpressions(payload, surface, offset = 0) {
+function recordPageImpressions(payload, surface, offset = 0, preserveExisting = false) {
   if (!payload.request_id || !Array.isArray(payload.items) || !payload.items.length) {
     return;
   }
   disposeGalleryVisibility();
   const contexts = payload.items.map((item) => {
     const context = { requestId: payload.request_id, surface, ready: false };
-    impressionContexts.set(item.url, context);
+    if (!preserveExisting || !impressionContexts.has(item.url)) impressionContexts.set(item.url, context);
     return context;
   });
   api("/api/impressions", {
@@ -3059,12 +3080,16 @@ async function withPendingFeedback(galleryUrl, action, rating = false) {
   if (!rating || !isFocusReview()) reviewUndo = null;
   pendingFeedbackUrls.add(galleryUrl);
   const requestedView = currentView;
+  const epoch = reviewQueueEpoch;
+  const atReviewTail = isFocusReview() && reviewCurrentUrl === galleryUrl && renderedGalleryItems.at(-1)?.url === galleryUrl;
+  let succeeded = false;
   // Lists started before or during a submission may contain pre-commit feedback.
   ++recommendationRequestId;
   setGalleryFeedbackButtonsDisabled(galleryUrl, true);
   updateReviewControls();
   try {
     await action(requestedView, reviewContext);
+    succeeded = true;
   } finally {
     ++recommendationRequestId;
     pendingFeedbackUrls.delete(galleryUrl);
@@ -3074,6 +3099,19 @@ async function withPendingFeedback(galleryUrl, action, rating = false) {
     }
     updateReviewControls();
     await flushDeferredReviewReload();
+    if (succeeded && requestedView === "review" && currentView === requestedView && epoch === reviewQueueEpoch &&
+        !reviewBusy() && !renderedGalleryUrls.includes(galleryUrl) && (atReviewTail || !renderedGalleryItems.length)) {
+      const previousLength = renderedGalleryItems.length;
+      try {
+        await loadRecommendations(nextRecommendationOffset, true);
+        if (atReviewTail && isFocusReview() && epoch === reviewQueueEpoch && renderedGalleryItems.length > previousLength) {
+          reviewCurrentUrl = renderedGalleryItems[previousLength].url;
+          renderGalleryCards(renderedGalleryItems);
+        }
+      } catch (_) {
+        setStatus("Action saved, but the next galleries could not load. Retry Load More or Refresh.", true);
+      }
+    }
   }
 }
 
@@ -3104,6 +3142,7 @@ function applyGalleryPage(payload, append = false) {
   updateCurrentQueueCount(payload);
   nextRecommendationOffset = payload.next_offset || 0;
   hasMoreRecommendations = Boolean(payload.has_more);
+  if (currentView === "review") reviewPaginationDirty = false;
   updateLoadMore(payload.total || 0);
   updateReviewControls();
   if (payload.last_fetch && payload.last_fetch.id) {
@@ -3125,12 +3164,11 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
 }
 
 function updateLoadMore(total = null) {
-  loadMoreBtn.disabled = !hasMoreRecommendations;
-  loadMoreBtn.textContent = hasMoreRecommendations
-    ? "Load More"
-    : total && total > 0
-      ? "No More"
-      : "Load More";
+  const canLoad = hasMoreRecommendations || (currentView === "review" && reviewPaginationDirty);
+  loadMoreBtn.disabled = !canLoad || (currentView === "review" && reviewLoading);
+  if (canLoad || total !== null) {
+    loadMoreBtn.textContent = canLoad || !total ? "Load More" : "No More";
+  }
 }
 
 function startParentProgressPolling() {
@@ -3572,8 +3610,8 @@ hathDownloadFilterEl.addEventListener("change", () => {
   if (hathStatusPayload) renderHathDownloadList(hathStatusPayload);
 });
 loadMoreBtn.addEventListener("click", () => {
-  if (!hasMoreRecommendations) return;
-  if (isFocusReview() && reviewBusy()) return;
+  if (!hasMoreRecommendations && !(currentView === "review" && reviewPaginationDirty)) return;
+  if (currentView === "review" && reviewBusy()) return;
   loadCurrentPage(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
 });
 importFileEl.addEventListener("change", () => {

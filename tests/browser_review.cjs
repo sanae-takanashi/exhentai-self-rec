@@ -41,6 +41,8 @@ async function scenario(viewport) {
     page_count: 40, category: "Illustration", uploader: "Fixture uploader", like_probability: 0.78,
   }));
   const removed = new Set();
+  const refillItem = { ...items[2], url: "https://example.test/g/refill/token/", title: "Synthetic replenished inventory" };
+  let refillAvailable = false;
   const visible = [], errors = [], external = [];
   let delivery, feedbackRoute, feedbackCalls = 0, undoCalls = 0, listCalls = 0;
   let ratingMode = "failure", undoMode = "failure";
@@ -69,6 +71,7 @@ async function scenario(viewport) {
     if (pathname === "/api/recommendations") {
       listCalls++;
       const remaining = items.filter((item) => !removed.has(item.url));
+      if (refillAvailable && !removed.has(refillItem.url)) remaining.push(refillItem);
       return json(route, { request_id: `synthetic-${listCalls}`, items: remaining, total: remaining.length,
         next_offset: remaining.length, has_more: false });
     }
@@ -233,13 +236,19 @@ async function scenario(viewport) {
     await page.locator('[data-mark="ban"]').click();
     await page.locator("#status").filter({ hasText: "Synthetic ban failure" }).waitFor();
     assert.equal(await current(), items[2].url);
+    refillAvailable = true;
+    const beforeRefillLists = listCalls;
     await page.locator('[data-mark="favorite"]').click();
-    await page.waitForFunction(() => !document.querySelector(".focus-card"));
+    await page.waitForFunction((url) => document.querySelector(".focus-card")?.dataset.galleryUrl === url, refillItem.url);
+    assert.equal(listCalls, beforeRefillLists + 1, "tail did not recheck inventory after No More");
+    await page.locator('[data-score="5"]').click();
+    await page.waitForFunction(() => !document.querySelector(".focus-card") && document.querySelector("#reviewNextBtn").disabled);
+    assert.equal(listCalls, beforeRefillLists + 2, "true exhaustion did not finish in one lookup");
     assert.equal(markCalls, 2);
     holdCounts = false;
     await json(countRoute, { review: 0 });
     await page.locator("#localFilter").fill("555");
-    assert.equal(feedbackCalls, 3);
+    assert.equal(feedbackCalls, 4);
     assert.equal(external.length, 1);
     assert.deepEqual(errors, []);
     return { viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };
