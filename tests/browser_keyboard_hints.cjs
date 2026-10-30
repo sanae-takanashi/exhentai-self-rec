@@ -97,6 +97,7 @@ async function scenario(viewport, colorScheme) {
     await page.addScriptTag({ path: scriptPath });
     assert.equal(await status.textContent(), "");
     assert.match(await host.locator(".items").innerText(), /f Link hints/);
+    assert.match(await host.locator(".items").innerText(), /j\/k Page down \/ up/);
     assert.doesNotMatch(await host.locator(".items").innerText(), /download/);
     assert.equal(await page.locator("table").innerHTML(), nativeHTML);
     await checkBounds();

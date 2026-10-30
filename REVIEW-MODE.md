@@ -39,10 +39,14 @@ not inject or install it, and the script does not submit downloads or feedback.
   Pending operations disable navigation and prevent duplicate submissions.
   The existing request-generation guards remain in force across mode/view
   switches, list requests, feedback and undo.
-- Keys 1-5 rate, S skips, O activates the normal gallery link, left/right
-  navigate, and Z undoes the last rating. Shortcuts are active only in Focus
+- Keys 1-5 rate, A/D thumb down/up, S skips, O activates the normal gallery link,
+  J/K (or left/right) navigate next/previous, and Z undoes the last rating.
+  R enters reason selection: J/K cycle, 0-8 choose, Enter applies, Esc cancels.
+  Reason selection never submits feedback and temporarily changes the hint bar.
+  Shortcuts are active only in Focus
   Review, ignore key repeat/composition/modifiers, and do not intercept text
-  inputs, selects, editable content or an open dialog. Tooltips name controls
+  inputs, editable content or an open dialog. Selects retain native behavior
+  unless R explicitly enters reason selection. Tooltips name controls
   and their shortcuts. A compact footer reminder can be collapsed with its
   keyboard icon; that state survives card changes in the current page.
 - Undo is single-level and applies only to the last successful score/vote/Skip

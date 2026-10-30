@@ -349,6 +349,30 @@ test("Focus: shortcuts ignore composition, editable targets and repeat", async (
   assert.equal(f.run('reviewCurrentUrl'), items[1].url);
 });
 
+test("Focus: left-hand keys dispatch navigation and native votes, not score aliases", () => {
+  const f = focusFixture();
+  f.run(`globalThis.actions = [];
+    navigateReview = (direction) => actions.push(['navigate', direction]);
+    vote = (url, value) => actions.push(['vote', url, value]);
+    score = () => { throw Error('Thumbs must not score'); };
+    globalThis.fixtureKey = { target: { closest: () => null }, preventDefault() {} };
+  `);
+  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd']) {
+    for (const flag of ['repeat', 'isComposing', 'ctrlKey', 'altKey', 'metaKey', 'shiftKey', 'defaultPrevented']) {
+      f.run(`reviewKeydown({ ...fixtureKey, key: '${key}', ${flag}: true })`);
+    }
+    f.run(`reviewKeydown({ ...fixtureKey, key: '${key}', target: { closest: () => ({}) } })`);
+  }
+  assert.equal(f.run('actions.length'), 0);
+  for (const key of ['j', 'k', 'ArrowLeft', 'ArrowRight', 'a', 'd']) {
+    f.run(`reviewKeydown({ ...fixtureKey, key: '${key}' })`);
+  }
+  assert.deepEqual(JSON.parse(f.run('JSON.stringify(actions)')), [
+    ['navigate', 1], ['navigate', -1], ['navigate', -1], ['navigate', 1],
+    ['vote', items[0].url, -1], ['vote', items[0].url, 1],
+  ]);
+});
+
 test("Focus: failed queue loads release navigation and retain the current gallery", async () => {
   const f = focusFixture();
   const loading = f.run('loadRecommendations()');

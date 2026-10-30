@@ -167,6 +167,80 @@ async function scenario(viewport) {
     assert.equal(listCalls, 1);
     assert.equal(await page.locator("#reviewRefreshBtn").evaluate((el) => el.classList.contains("updates-available")), true);
 
+    // Reason selection is local only; digits must never leak into rating.
+    await page.keyboard.press("j");
+    assert.equal(await current(), items[1].url);
+    await page.keyboard.press("k");
+    assert.equal(await current(), items[0].url);
+    const reason = page.locator('.focus-rating select[data-reason-for]');
+    await page.keyboard.press("r");
+    assert(await reason.evaluate((el) => el === document.activeElement));
+    assert.match(await hints.innerText(), /Apply/);
+    for (const flag of ["repeat", "isComposing", "ctrlKey", "altKey", "metaKey", "shiftKey"]) {
+      await reason.evaluate((el, flag) => el.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "4", bubbles: true, cancelable: true, [flag]: true,
+      })), flag);
+      assert.equal(await reason.inputValue(), "", `reason ignored guard: ${flag}`);
+    }
+    await page.keyboard.press("j");
+    assert.equal(await reason.inputValue(), "visual_style");
+    await page.keyboard.press("k");
+    assert.equal(await reason.inputValue(), "");
+    const reasons = ["", "visual_style", "content_tags", "creator_character", "quality",
+      "gallery_too_small", "too_few_relevant_images", "duplicate_update", "other"];
+    for (let index = 0; index < reasons.length; index++) {
+      await page.keyboard.press(String(index));
+      assert.equal(await reason.inputValue(), reasons[index]);
+    }
+    await page.keyboard.press("Escape");
+    assert.equal(await reason.inputValue(), "", "cancel must restore original reason");
+    await page.keyboard.press("r");
+    await page.keyboard.press("4");
+    await page.keyboard.press("Enter");
+    assert.equal(await reason.inputValue(), "quality");
+    assert.equal(await reason.evaluate((el) => el === document.activeElement), false);
+    assert.equal(feedbackCalls, 0, "reason keys submitted feedback");
+    // Reason mode temporarily expands hints but does not change the user's preference.
+    await hintToggle.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => !document.querySelector(".review-key-hints").open);
+    await page.keyboard.press("r");
+    assert.equal(await hints.getAttribute("open"), "");
+    await page.keyboard.press("Escape");
+    assert.equal(await hints.getAttribute("open"), null);
+    await page.keyboard.press("j");
+    assert.equal(await hints.getAttribute("open"), null);
+    await page.keyboard.press("k");
+    await hintToggle.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.querySelector(".review-key-hints").open);
+    await hintToggle.blur();
+    // Explicit mode cannot survive blur or a rerender, or intercept another input.
+    await page.keyboard.press("r");
+    await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
+    await page.locator("#localFilter").focus();
+    await page.keyboard.press("j");
+    assert.equal(await current(), items[0].url);
+    await page.locator("#localFilter").fill("");
+    await page.locator("#localFilter").blur();
+    await page.keyboard.press("r");
+    await page.evaluate(() => renderGalleryCards(renderedGalleryItems));
+    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
+    await page.keyboard.press("r");
+    await page.keyboard.press("4");
+    await page.keyboard.press("Enter");
+    for (const [key, value] of [["a", -1], ["d", 1]]) {
+      const before = feedbackCalls;
+      await page.keyboard.press(key);
+      await until(() => feedbackCalls === before + 1);
+      await page.waitForFunction(() => !reviewBusy());
+      assert.equal(lastRating.vote, value);
+      assert.equal(lastRating.reason_code, value < 0 ? "quality" : null);
+      assert.equal(Object.hasOwn(lastRating, "score"), false);
+      assert.equal(await current(), items[0].url, "failed vote advanced the queue");
+    }
+
     const score = page.locator('[data-score="1"]');
     await page.locator('.focus-rating select[data-reason-for]').selectOption("quality");
     await score.click();
@@ -178,8 +252,11 @@ async function scenario(viewport) {
     await score.click();
     await until(() => feedbackRoute);
     assert(await page.locator("#reviewNextBtn").isDisabled());
+    for (const key of ["j", "k", "r", "a", "d", "1"]) await page.keyboard.press(key);
+    assert.equal(await current(), items[0].url);
+    assert.equal(await page.evaluate(() => reviewReasonSelection), null);
     await score.dispatchEvent("click");
-    assert.equal(feedbackCalls, 2);
+    assert.equal(feedbackCalls, 4);
     removed.add(items[0].url);
     await json(feedbackRoute, { ok: true, removed_gallery_url: items[0].url, feedback_undo_supported: true,
       feedback_update: { latest_feedback_id: 2 } });
@@ -268,7 +345,7 @@ async function scenario(viewport) {
     holdCounts = false;
     await json(countRoute, { review: 0 });
     await page.locator("#localFilter").fill("555");
-    assert.equal(feedbackCalls, 4);
+    assert.equal(feedbackCalls, 6);
     assert.equal(external.length, 1);
     assert.deepEqual(errors, []);
     return { viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };

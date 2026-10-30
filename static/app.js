@@ -149,6 +149,7 @@ let reviewUndoPending = false;
 let reviewReloadQueued = false;
 let reviewUpdatesAvailable = false;
 let reviewHintsExpanded = true;
+let reviewReasonSelection = null;
 let reviewPaginationDirty = false;
 const reviewOpenedUrls = new Set();
 const impressionContexts = new Map();
@@ -288,17 +289,68 @@ async function flushDeferredReviewReload() {
   }
 }
 
+function reviewShortcutHints(selectingReason = false) {
+  return selectingReason
+    ? '<span><kbd>j</kbd>/<kbd>k</kbd> Reason</span><span><kbd>0-8</kbd> Choose</span><span><kbd>Enter</kbd> Apply</span><span><kbd>Esc</kbd> Cancel</span>'
+    : '<span><kbd>j</kbd>/<kbd>k</kbd> Next / Previous</span><span><kbd>o</kbd> Open</span><span><kbd>1-5</kbd> Rate</span><span><kbd>r</kbd> Reason</span><span><kbd>a</kbd>/<kbd>d</kbd> Down / Up</span><span><kbd>s</kbd> Skip</span><span><kbd>z</kbd> Undo</span>';
+}
+
+function finishReviewReason(cancel = false, returnFocus = false) {
+  const selection = reviewReasonSelection;
+  if (!selection) return;
+  reviewReasonSelection = null;
+  selection.select.removeEventListener("blur", selection.onBlur);
+  if (cancel) selection.select.value = selection.original;
+  const hints = recommendationsEl.querySelector(".review-key-items");
+  if (hints) hints.innerHTML = reviewShortcutHints();
+  const details = recommendationsEl.querySelector(".review-key-hints");
+  if (details) details.open = selection.hintsOpen;
+  if (returnFocus) selection.select.blur();
+  updateReviewControls();
+}
+
+function beginReviewReason() {
+  const select = recommendationsEl.querySelector(".focus-rating select[data-reason-for]");
+  if (!select || select.disabled) return;
+  const details = recommendationsEl.querySelector(".review-key-hints");
+  reviewReasonSelection = { select, original: select.value, hintsOpen: Boolean(details?.open),
+    onBlur: () => finishReviewReason() };
+  select.addEventListener("blur", reviewReasonSelection.onBlur);
+  const hints = recommendationsEl.querySelector(".review-key-items");
+  if (hints) hints.innerHTML = reviewShortcutHints(true);
+  if (details) details.open = true;
+  select.focus();
+  updateReviewControls();
+}
+
 function reviewKeydown(event) {
   if (!isFocusReview() || reviewBusy() || event.defaultPrevented || event.repeat || event.isComposing ||
       event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
-      event.target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])") ||
       document.querySelector("dialog[open], [role='dialog'][aria-modal='true']")) return;
-  const item = currentReviewItem();
   const key = event.key.toLowerCase();
+  // Numbers choose reasons only after R explicitly enters this select.
+  if (reviewReasonSelection) {
+    const { select } = reviewReasonSelection;
+    if (!select.isConnected || event.target !== select) finishReviewReason();
+    else {
+      if (key === "j" || key === "k") {
+        select.selectedIndex = Math.max(0, Math.min(select.options.length - 1, select.selectedIndex + (key === "j" ? 1 : -1)));
+      } else if (/^[0-8]$/.test(key)) select.selectedIndex = Number(key);
+      else if (key === "enter" || key === "escape") finishReviewReason(key === "escape", true);
+      else return;
+      event.preventDefault();
+      return;
+    }
+  }
+  if (event.target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")) return;
+  const item = currentReviewItem();
   let action;
   if (key === "z") action = () => undoReviewRating();
-  else if (key === "arrowleft") action = () => navigateReview(-1);
-  else if (key === "arrowright") action = () => navigateReview(1);
+  else if (key === "arrowleft" || key === "k") action = () => navigateReview(-1);
+  else if (key === "arrowright" || key === "j") action = () => navigateReview(1);
+  else if (item && key === "r") action = () => beginReviewReason();
+  else if (item && key === "a") action = () => vote(item.url, -1);
+  else if (item && key === "d") action = () => vote(item.url, 1);
   else if (item && /^[1-5]$/.test(key)) action = () => score(item.url, Number(key));
   else if (item && key === "s") action = () => skip(item.url);
   else if (item && key === "o") action = () => recommendationsEl.querySelector("a.title")?.click();
@@ -2749,6 +2801,9 @@ function renderParentChain(item) {
 }
 
 function renderGalleryCards(items, append = false) {
+  finishReviewReason();
+  const previousHints = recommendationsEl.querySelector(".review-key-hints");
+  if (previousHints) reviewHintsExpanded = previousHints.open;
   const mode = currentView;
   const focus = isFocusReview();
   const classifierMode = mode === "classifier";
@@ -2882,22 +2937,22 @@ function renderGalleryCards(items, append = false) {
       : `<div class="card-actions">${banButton}${favoriteButton}${clearMarkButton}</div>`;
     const thumbIcon = `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H5a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 3a3.13 3.13 0 0 1 3 2.88Z"/></svg>`;
     const compactFeedbackControls = `<div class="votes">
-          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" aria-label="Thumb down" title="Record a mild negative signal for this gallery.">${focus ? thumbIcon : "Thumb down"}</button>
+          <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" aria-label="Thumb down" title="Record a mild negative signal for this gallery.${focus ? " (a)" : ""}">${focus ? thumbIcon : "Thumb down"}</button>
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the queue.">Skip</button>
-          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" aria-label="Thumb up" title="Record a mild positive signal for this gallery.">${focus ? thumbIcon : "Thumb up"}</button>
+          <button class="up" type="button" data-vote="1" data-url="${escapeAttr(item.url)}" aria-label="Thumb up" title="Record a mild positive signal for this gallery.${focus ? " (d)" : ""}">${focus ? thumbIcon : "Thumb up"}</button>
         </div>`;
     const negativeReasonControl = `<label class="feedback-reason">
-          <span>Why not?</span>
+          <span>Why not?${focus ? " (r)" : ""}</span>
           <select data-reason-for="${escapeAttr(item.url)}" aria-label="Optional negative feedback reason">
-            <option value="">Optional reason</option>
-            <option value="visual_style">Visual style</option>
-            <option value="content_tags">Content or tags</option>
-            <option value="creator_character">Creator or character</option>
-            <option value="quality">Quality</option>
-            <option value="gallery_too_small">Gallery too small</option>
-            <option value="too_few_relevant_images">Too few relevant images</option>
-            <option value="duplicate_update">Duplicate or update</option>
-            <option value="other">Other</option>
+            <option value="">${focus ? "0 " : ""}Optional reason</option>
+            <option value="visual_style">${focus ? "1 " : ""}Visual style</option>
+            <option value="content_tags">${focus ? "2 " : ""}Content or tags</option>
+            <option value="creator_character">${focus ? "3 " : ""}Creator or character</option>
+            <option value="quality">${focus ? "4 " : ""}Quality</option>
+            <option value="gallery_too_small">${focus ? "5 " : ""}Gallery too small</option>
+            <option value="too_few_relevant_images">${focus ? "6 " : ""}Too few relevant images</option>
+            <option value="duplicate_update">${focus ? "7 " : ""}Duplicate or update</option>
+            <option value="other">${focus ? "8 " : ""}Other</option>
           </select>
         </label>`;
     let feedbackControls = mode === "preview" || classifierMode
@@ -2945,7 +3000,7 @@ function renderGalleryCards(items, append = false) {
           `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))} (${value})">${value}</button>`).join("")}</div>
         <details class="review-key-hints" ${reviewHintsExpanded ? "open" : ""}>
           <summary title="Toggle keyboard hints" aria-label="Toggle keyboard hints"><svg aria-hidden="true" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M8 16h8"/></svg></summary>
-          <div class="review-key-items"><span><kbd>&larr;</kbd><kbd>&rarr;</kbd> Navigate</span><span><kbd>o</kbd> Open</span><span><kbd>1-5</kbd> Rate</span><span><kbd>s</kbd> Skip (neutral)</span><span><kbd>z</kbd> Undo rating</span></div>
+          <div class="review-key-items">${reviewShortcutHints()}</div>
         </details>
       </footer>`;
     }
@@ -3724,7 +3779,7 @@ document.querySelector("#reviewRefreshBtn").addEventListener("click", () => {
 document.addEventListener("keydown", reviewKeydown);
 recommendationsEl.addEventListener("toggle", (event) => {
   if (!event.target.matches?.(".review-key-hints")) return;
-  reviewHintsExpanded = event.target.open;
+  if (!reviewReasonSelection) reviewHintsExpanded = event.target.open;
   updateReviewControls();
 }, true);
 window.addEventListener("resize", updateReviewControls);
