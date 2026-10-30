@@ -148,6 +148,7 @@ let reviewLoadSequence = 0;
 let reviewUndoPending = false;
 let reviewReloadQueued = false;
 let reviewUpdatesAvailable = false;
+let reviewHintsExpanded = true;
 let reviewPaginationDirty = false;
 const reviewOpenedUrls = new Set();
 const impressionContexts = new Map();
@@ -2942,6 +2943,10 @@ function renderGalleryCards(items, append = false) {
         ${compactFeedbackControls}
         <div class="scorebar" aria-label="Score">${[1, 2, 3, 4, 5].map((value) =>
           `<button type="button" data-score="${value}" data-url="${escapeAttr(item.url)}" title="${escapeAttr(scoreTooltip(value))} (${value})">${value}</button>`).join("")}</div>
+        <details class="review-key-hints" ${reviewHintsExpanded ? "open" : ""}>
+          <summary title="Toggle keyboard hints" aria-label="Toggle keyboard hints"><svg aria-hidden="true" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M8 16h8"/></svg></summary>
+          <div class="review-key-items"><span><kbd>&larr;</kbd><kbd>&rarr;</kbd> Navigate</span><span><kbd>o</kbd> Open</span><span><kbd>1-5</kbd> Rate</span><span><kbd>s</kbd> Skip (neutral)</span><span><kbd>z</kbd> Undo rating</span></div>
+        </details>
       </footer>`;
     }
     card.innerHTML = `
@@ -3717,6 +3722,11 @@ document.querySelector("#reviewRefreshBtn").addEventListener("click", () => {
   if (!reviewBusy()) loadCurrentPage().catch((error) => setStatus(error.message, true));
 });
 document.addEventListener("keydown", reviewKeydown);
+recommendationsEl.addEventListener("toggle", (event) => {
+  if (!event.target.matches?.(".review-key-hints")) return;
+  reviewHintsExpanded = event.target.open;
+  updateReviewControls();
+}, true);
 window.addEventListener("resize", updateReviewControls);
 
 applyStaticTooltips();

@@ -7,9 +7,13 @@ pages there, optionally downloads through the site's own resolution dialog,
 then returns to this application to rate it. Obvious negatives may be rated
 from their cover without opening the site.
 
-Focus Review changes only this application. It does not inject scripts into
+Focus Review itself changes only this application. It does not inject scripts into
 ExHentai, inspect its tabs, trigger downloads, select resolutions, or equate a
 click/download with an explicit preference.
+
+An optional, separately installed read-only userscript adds keyboard reminders
+on native ExHentai gallery/Archiver pages. See KEYBOARD-WORKFLOW.md. The app does
+not inject or install it, and the script does not submit downloads or feedback.
 
 ## First Version
 
@@ -39,7 +43,8 @@ click/download with an explicit preference.
   navigate, and Z undoes the last rating. Shortcuts are active only in Focus
   Review, ignore key repeat/composition/modifiers, and do not intercept text
   inputs, selects, editable content or an open dialog. Tooltips name controls
-  and their shortcuts; the work surface contains no shortcut tutorial.
+  and their shortcuts. A compact footer reminder can be collapsed with its
+  keyboard icon; that state survives card changes in the current page.
 - Undo is single-level and applies only to the last successful score/vote/Skip
   submitted from Focus. It is not Clear Rating: the server checks the gallery
   and exact latest feedback ID under a write transaction, removes only that
@@ -116,8 +121,9 @@ never overwrite its replacement. Classification is not a rating or download.
 
 1. Desktop and mobile both display a single usable gallery and fixed-position
    primary actions, without cropped covers or horizontal page overflow.
-2. Native external links retain target=_blank and rel=noreferrer. No browser
-   extension, injected remote script or automatic popup is introduced.
+2. Native external links retain target=_blank and rel=noreferrer. The app adds
+   no browser extension, injected remote script or automatic popup. The optional
+   user-installed hint script remains isolated from Review and native actions.
 3. Scoring from the cover and returning to score after site browsing both
    advance exactly once, only after a successful response.
 4. Navigation/mode changes do not generate preference labels or reorder items.
@@ -146,6 +152,7 @@ python tests/run_review_checks.py
 node --test tests/test_feedback.cjs tests/test_visibility.cjs
 node tests/browser_feedback.cjs
 node tests/browser_review.cjs
+node tests/browser_keyboard_hints.cjs
 ```
 
 The browser scripts use the existing optional Playwright installation under

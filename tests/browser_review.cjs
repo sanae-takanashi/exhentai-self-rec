@@ -127,6 +127,21 @@ async function scenario(viewport) {
     const cover = page.locator("a.thumb");
     assert.equal(await cover.getAttribute("target"), "_blank");
     assert.equal(await cover.getAttribute("rel"), "noreferrer");
+    const hints = page.locator(".review-key-hints");
+    const hintToggle = hints.locator("summary");
+    assert(await hints.locator(".review-key-items").isVisible());
+    await hintToggle.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => !document.querySelector(".review-key-hints").open);
+    assert.equal(await hints.locator(".review-key-items").isVisible(), false);
+    await page.keyboard.press("ArrowRight");
+    assert.equal(await current(), items[1].url);
+    assert.equal(await hints.getAttribute("open"), null, "collapsed hints reset after navigation");
+    await page.keyboard.press("ArrowLeft");
+    await hintToggle.focus();
+    await page.keyboard.press("Space");
+    await page.waitForFunction(() => document.querySelector(".review-key-hints").open);
+    assert.equal(feedbackCalls, 0, "hint controls submitted feedback");
     await page.locator("#reviewNextBtn").click();
     assert.equal(await current(), items[1].url);
     assert.equal(feedbackCalls, 0);
@@ -186,6 +201,11 @@ async function scenario(viewport) {
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     const bounds = await page.locator(".focus-rating").boundingBox();
     assert(bounds.y >= 0 && bounds.y + bounds.height <= viewport.height + 1);
+    for (const hint of await hints.locator(".review-key-items > span").all()) {
+      const box = await hint.boundingBox();
+      assert(box.x >= 0 && box.x + box.width <= viewport.width && box.y + box.height <= viewport.height,
+        "keyboard hint outside viewport");
+    }
     assert.equal(await page.locator(".thumb img").evaluate((el) => getComputedStyle(el).objectFit), "contain");
     const coverBounds = await cover.boundingBox();
     const imageBounds = await page.locator(".thumb img").boundingBox();
