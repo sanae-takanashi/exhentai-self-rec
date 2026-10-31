@@ -83,6 +83,48 @@ sample, not whole-library duplication or integrity; dimensions require Pillow
 already installed on the remote host. Completion markers do not independently
 prove complete or uncorrupted image content.
 
+For an isolated local page-index experiment (no site requests or production
+database writes), collect at most three existing pages per completed gallery:
+
+```powershell
+./.venv-rocm/Scripts/python.exe scripts/probe_hath_pages.py --batched --output data/hath-pages-experiment
+./.venv-rocm/Scripts/python.exe scripts/plan_hath_metadata.py --source data/hath-pages-experiment/manifest.json --output data/hath-metadata-plan.json
+./.venv-rocm/Scripts/python.exe scripts/compare_hath_pages.py --dataset data/hath-pages-experiment --output data/hath-pages-comparison.json --device cpu
+./.venv-rocm/Scripts/python.exe scripts/compare_hath_pages.py --dataset data/hath-pages-experiment --output data/hath-pages-comparison.json --verify-only
+```
+
+The collector uses the enabled launcher's existing SSH profile. It transfers
+only completed-download samples (8 MiB per file, 64 MiB total, 100 galleries
+maximum), verifies hashes before writing, and refuses existing output paths.
+`--batched` inventories first, then transfers eight galleries per SSH request.
+Completed batches are retained with verified checkpoints. An interrupted run
+can continue with `--batched --resume` and the same output directory; an already
+complete experiment is never overwritten. Changed gallery counts or corrupted
+checkpoints fail closed. A partial batch directory is preserved and requires
+a new output directory, not automatic deletion.
+Titles, gallery URLs/tokens, cookies and client keys are not exported. Metadata
+gaps remain explicit, including downloads without a known gallery URL. Existing
+cached covers/sample previews are copied separately (32 MiB total); sprite
+frames are cropped with the app's existing crop helper. Missing cache entries
+never cause a fetch. Sampling uses numeric filename prefixes when unambiguous,
+otherwise lexical filename order, not verified site page numbers.
+
+`plan_hath_metadata.py` checks missing galleries against allowlisted URL columns
+in local downloads, feedback, marks, feature snapshots and impressions. It
+reports only counts and evidence table names, never URLs/tokens. It does not
+read browser history or settings, fetch metadata, or repair the production DB.
+
+The comparison reuses the installed DINOv2 encoder with model downloads disabled
+and writes only a new experiment report containing local per-page vectors,
+dimensions, nearest cross-gallery samples and full-page/preview comparisons.
+A same-page 250px ablation separates resolution changes from content changes.
+Neighbor overlap uses the same cached-preview gallery set for both variants.
+These are feasibility metrics, not preference accuracy, evidence of improvement,
+or permission to promote a model. No training, labels, recommendation weights,
+service configuration, CDN cache or remote files are changed. Use the existing
+safe-exec runner for contained SSH execution; keep experiment images/reports
+under ignored `data/`, never in the repository.
+
 Set `EXH_REC_HATH_TOKEN` on the recommendation server, then run
 `python -m hath_observer` on the H@H machine with its download directory,
 receiver URL, and the same token. No extra Python packages are required.
