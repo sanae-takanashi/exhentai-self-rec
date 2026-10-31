@@ -47,6 +47,7 @@ from .net import (
     temporary_ban_detected,
 )
 from .hath import HathPayloadError, hath_status, ingest_event_batch
+from .local_pages import LocalPageLibrary
 from .hath_pack import HATH_PACK_RUNNER, HathPackConflict, HathPackError
 from .classification import (
     label_continuing_classifier_sample,
@@ -138,6 +139,7 @@ FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_MAX_BYTES = 5 * 1024 * 1024
+LOCAL_PAGES = LocalPageLibrary(Path(os.environ.get("EXH_REC_LOCAL_PAGES_DIR", db.DATA_DIR / "hath-page-library")))
 PARENT_UPDATE_LOG_LIMIT = 120
 PARENT_UPDATE_FETCH_RETRIES = 2
 PARENT_UPDATE_RETRY_BACKOFF_SECONDS = 1.0
@@ -191,6 +193,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_status())
             elif path == "/api/health":
                 self.send_json({"service": "exh-rec", "status": "ok"})
+            elif path == "/api/local-pages":
+                with db.connect() as conn:
+                    self.send_json(LOCAL_PAGES.catalog(conn))
+            elif path == "/api/local-pages/compare":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    with db.connect() as conn:
+                        result = LOCAL_PAGES.compare(str(query.get("key", [""])[0]), conn)
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise ApiError(HTTPStatus.NOT_FOUND, "Local comparison unavailable") from None
+                self.send_json(result)
+            elif path == "/api/local-pages/image":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    data, content_type = LOCAL_PAGES.image(str(query.get("id", [""])[0]))
+                except (OSError, ValueError, KeyError, TypeError):
+                    raise ApiError(HTTPStatus.NOT_FOUND, "Local image unavailable") from None
+                self.send_bytes(data, content_type, cache_control="private, no-store")
             elif path == "/api/fetch-progress":
                 self.send_json(FETCH_ACTIVITY.snapshot())
             elif path == "/api/integrations/hath/status":

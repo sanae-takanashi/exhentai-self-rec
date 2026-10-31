@@ -1693,12 +1693,14 @@ dd {
 }
 
 .focus-review #galleryView > .toolbar {
-  display: block;
+  display: flex;
+  flex-wrap: nowrap;
   margin-bottom: 12px;
 }
 
 .focus-review #localFilter {
   max-width: 440px;
+  min-width: 0;
 }
 
 .focus-review .grid {
@@ -1758,6 +1760,79 @@ dd {
   height: 86px;
   flex: 0 0 64px;
   object-fit: contain;
+}
+
+.local-media-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.local-media-tools:not(:has(button)):has(.local-media-status:empty) { display: none; }
+
+.local-image-button {
+  display: block;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.media-preview img[hidden], #localPagesDialog img[hidden] { display: none; }
+
+#localPagesDialog {
+  width: min(1100px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 24px);
+  padding: 18px;
+  box-sizing: border-box;
+  overflow: auto;
+}
+
+#localPagesDialog header, #localImageDialog header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+#localPagesDialog h2, #localImageDialog h2 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }
+#localPagesDialog h3 { font-size: 16px; margin: 12px 0; overflow-wrap: anywhere; }
+.local-page-toolbar { display: flex; gap: 8px; align-items: center; }
+.local-page-toolbar select { flex: 1; min-width: 0; width: 0; }
+#localPagesStatus { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.local-source-pages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.local-source-pages figure { margin: 0; min-width: 0; }
+.local-source-pages button { width: 100%; }
+.local-source-pages img { width: 100%; height: 200px; object-fit: contain; background: #0a0b0d; }
+.local-source-pages figcaption { font-size: 12px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+.local-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.local-comparison section { min-width: 0; }
+.local-comparison ol { list-style: none; padding: 0; margin: 0; }
+.local-comparison li { display: grid; grid-template-columns: 18px 60px minmax(0, 1fr); gap: 8px; align-items: center; border-top: 1px solid var(--line); padding: 10px 0; min-height: 92px; }
+.local-comparison li img { width: 60px; height: 82px; object-fit: contain; }
+.local-rank { color: var(--muted); font-size: 12px; }
+.local-result-title { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; padding: 0; border: 0; background: none; text-align: left; font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; max-width: 100%; }
+#localImageDialog { width: min(1000px, calc(100vw - 24px)); max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); box-sizing: border-box; overflow: auto; }
+#localImage { display: block; width: 100%; height: auto; object-fit: contain; }
+#localImageStatus { font-size: 13px; color: var(--muted); }
+
+@media (max-width: 600px) {
+  #localPagesDialog { padding: 12px; }
+  .local-source-pages { gap: 6px; }
+  .local-source-pages img { height: 120px; }
+  .local-comparison { gap: 10px; }
+  .local-comparison li { grid-template-columns: 14px minmax(0, 1fr); gap: 4px; align-content: start; }
+  .local-comparison li > div { grid-column: 1 / -1; }
+  .local-comparison li img { width: 100%; height: 112px; }
+  .local-comparison h3 { min-height: 40px; }
 }
 
 .focus-card .body {

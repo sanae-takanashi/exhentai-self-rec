@@ -476,6 +476,61 @@ Override the bind address or port with:
 EXH_REC_HOST=0.0.0.0 EXH_REC_PORT=18787 python3 -m exh_rec.app
 ```
 
+## Local H@H Page Library
+
+Completed-download samples from the offline experiment can be published as a
+local preview library. This does not query CDN caches, download new pages,
+recover missing site metadata, train a model, or change recommendation ranking.
+Requires Pillow for the build; serving and similarity lookup do not require
+PyTorch or model downloads.
+
+```powershell
+.\.venv\Scripts\python.exe scripts/build_hath_page_library.py --experiment data/hath-page-experiment-20261031 --output data/hath-page-library
+.\.venv\Scripts\python.exe scripts/preview_local_pages.py --port 18788
+```
+
+The builder verifies experiment source hashes/vectors, copies only indexed
+raster images to content-addressed files, recomputes independent cover/body
+aggregates, and refuses an existing output directory. Images, vectors and
+reports stay under ignored `data/`; no site URLs or credentials are copied into
+the derived index. Interrupted output must be retained or moved to a separate
+location before a new build, not silently overwritten.
+
+The preview server is loopback-only at `http://127.0.0.1:18788/`. It reads only
+gallery identity/title/link columns through SQLite `mode=ro` and `query_only`,
+rejects POST, does not run the recommender or background workers, and opens no
+browser automatically. `--database` and `--library` override local paths; a busy
+port fails without touching the existing process.
+
+For normal Review, the backend reads `data/hath-page-library` by default, or
+`EXH_REC_LOCAL_PAGES_DIR`. Restart with the established launcher to load the
+new backend; no production restart is performed by the builder/preview. The
+Local Pages toolbar icon and per-card Compare samples open a separate dialog.
+Missing/failed Review covers and missing/failed site sample previews can use
+the local page bytes. Local fallbacks never enter production embedding jobs.
+Both comparison columns use the same candidate set; cover vectors and inner
+samples (excluding the first filename-ordered file) stay distinct. Unknown or
+ambiguous metadata has no fabricated site link. See REVIEW-MODE.md for states
+and provenance limits.
+
+Endpoints: GET `/api/local-pages`, `/api/local-pages/compare?key=<gid-resolution>`,
+and `/api/local-pages/image?id=<sha256>`. Images must be indexed, regular raster
+files under the configured library; paths, links/reparse points, changed bytes,
+and digest mismatches fail closed. An absent/invalid index disables the library
+without disabling the ordinary Review workflow. Keep this private like the
+existing image cache; this does not add authentication to the personal app.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_local_pages
+node tests/browser_local_pages.cjs
+node tests/browser_local_pages.cjs --live
+```
+
+`--live` checks the GET-only preview at port 18788, including 59 indexed galleries
+and 43 paired galleries in the fixed 2026-10-31 snapshot. Synthetic browser
+checks cover desktop and two mobile sizes with all external networking blocked;
+screenshots/results remain in ignored `data/browser-validation`.
+
 ## Safety notes
 
 This is a personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.

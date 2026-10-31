@@ -143,9 +143,43 @@ never overwrite its replacement. Classification is not a rating or download.
 
 ## Deferred
 
-No reader, high-resolution fetcher, new sampling policy, download basket,
+No remote reader, high-resolution fetcher, new sampling policy, download basket,
 automatic download, resolution memory, batch labeling or ranker activation.
 Cross-page session restoration beyond the freshly loaded page is not promised.
+
+## Local Page Previews And Comparison
+
+An optional, separately built local library now supplies preview fallbacks in
+Review. Site covers and stored samples remain preferred. Missing covers use
+the first sampled local file; failed site images try one local fallback and
+then show an unavailable state. Missing site samples use the existing
+first/middle/last file samples. Local files are labeled, not presented as
+verified site page numbers or original-resolution images. Cover/title links
+keep the normal native-site destination; local sample buttons inspect an
+already-downloaded file in a modal and never open the remote site.
+
+The Local Pages toolbar icon opens a separate read-only library dialog.
+Compare samples on a matched Review card opens that gallery directly. The
+dialog offers every indexed gallery, including metadata gaps, sample inspection,
+and two Top-3 columns. Cover similarity uses only the cached cover vector;
+inner-sample similarity averages downloaded sample vectors excluding file
+position 1. Both columns search the identical paired candidate set, deduplicated
+by gid with the widest sampled version preferred; all versions of the query
+gid are excluded. Missing/ambiguous metadata does not invent a site link.
+Without a cover or body vector, local samples remain available but the
+comparison is explicitly unavailable. Cosine is similarity, not a preference
+probability, and filename order is not a verified site-page identity.
+
+The dialog has independent catalog/comparison request-generation guards.
+Changing the selection or closing it invalidates old responses. Retry, empty
+libraries, invalid libraries, failed comparisons and unavailable images remain
+usable. Native modal focus blocks Focus Review rating shortcuts. Inspection
+does not submit labels or reorder the current queue; the local vectors are
+never passed to the production visual-embedding endpoints or ranker.
+
+Build and preview instructions are in README.md. Serving a new backend requires
+the owner's normal restart. The separate loopback-only preview server uses a
+read-only database connection, refuses POST, and starts no production workers.
 
 ## Verification And Rollout
 

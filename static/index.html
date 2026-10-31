@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ExHentai Recommender</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20261030-keyboard-hints">
+    <link rel="stylesheet" href="/static/styles.css?v=20261031-local-pages">
   </head>
   <body>
     <header class="topbar">
@@ -254,6 +254,7 @@
             <span id="lowInterestPolicyDetail"></span>
           </section>
           <div class="toolbar">
+            <button id="localPagesBtn" class="icon-button" type="button" aria-label="Local Pages" title="Local Pages"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m22 13-1.296-1.296a2.4 2.4 0 0 0-3.408 0L12 17"/><path d="M4 8H3a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-1"/><rect width="14" height="14" x="8" y="2" rx="1"/><circle cx="14" cy="8" r="2"/></svg></button>
             <input id="query" type="search" placeholder="Optional one-off search query">
             <button id="searchFetchBtn" type="button">Fetch Query</button>
             <input id="localFilter" type="search" placeholder="Filter local title, tag, category, uploader">
@@ -431,6 +432,24 @@
       </section>
     </main>
 
+    <dialog id="localPagesDialog" aria-labelledby="localPagesTitle">
+      <header>
+        <h2 id="localPagesTitle">Local Pages</h2>
+        <button id="localPagesClose" class="icon-button" type="button" aria-label="Close local pages" title="Close"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m18 6-12 12M6 6l12 12"/></svg></button>
+      </header>
+      <div class="local-page-toolbar">
+        <label for="localPagesSelect">Gallery</label>
+        <select id="localPagesSelect"></select>
+        <button id="localPagesRetry" class="icon-button" type="button" aria-label="Reload local pages" title="Reload local pages"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5"/></svg></button>
+      </div>
+      <p id="localPagesStatus" role="status"></p>
+      <div id="localPagesContent"></div>
+    </dialog>
+    <dialog id="localImageDialog" aria-labelledby="localImageTitle">
+      <header><h2 id="localImageTitle">Local file</h2><button id="localImageClose" class="icon-button" type="button" aria-label="Close image" title="Close"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m18 6-12 12M6 6l12 12"/></svg></button></header>
+      <img id="localImage" alt="Local downloaded page">
+      <p id="localImageStatus" role="status"></p>
+    </dialog>
     <dialog id="modelDialog">
       <form method="dialog">
         <header>
@@ -442,6 +461,6 @@
     </dialog>
 
     <script src="/static/visibility.js?v=20260909-1"></script>
-    <script src="/static/app.js?v=20261030-reason-qw"></script>
+    <script src="/static/app.js?v=20261031-local-pages"></script>
   </body>
 </html>

@@ -657,6 +657,7 @@ function applyVisualSettings(visual) {
 
 async function loadSettings() {
   const settings = await api("/api/settings");
+  localPagesPreview = settings.local_pages_preview === true;
   const supportsLowInterest = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_percent");
   const supportsLowInterestThreshold = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_auto_threshold");
   const supportsLowInterestAudit = Object.prototype.hasOwnProperty.call(settings, "review_low_interest_audit_enabled");
@@ -2494,6 +2495,7 @@ function recordPageImpressions(payload, surface, offset = 0, preserveExisting = 
 
 function observeRenderedGalleries() {
   disposeGalleryVisibility();
+  if (document.querySelector("#localPagesDialog")?.open || document.querySelector("#localImageDialog")?.open) return;
   if (typeof observeVisibleCards !== "function") return;
   const entries = renderedGalleryItems.map((item) => ({
     gallery_url: item.url,
@@ -2762,6 +2764,122 @@ function renderParentChain(item) {
   return `<div class="parent-chain"><span>Parent chain</span>${links}</div>`;
 }
 
+let localPageItems = [];
+let localPagesPreview = false;
+let localPageGids = new Map();
+let localPageCatalogRequest = 0;
+let localPageComparisonRequest = 0;
+const localPagesDialog = document.querySelector("#localPagesDialog");
+const localPagesSelect = document.querySelector("#localPagesSelect");
+const localPagesStatus = document.querySelector("#localPagesStatus");
+const localPagesContent = document.querySelector("#localPagesContent");
+
+function localPageForGallery(url) {
+  try {
+    const parsed = new URL(url);
+    if (!["exhentai.org", "e-hentai.org"].includes(parsed.hostname)) return null;
+    const gid = parsed.pathname.match(/^\/g\/(\d+)\/[0-9a-f]+\/$/)?.[1];
+    return localPageGids.get(gid) || null;
+  } catch { return null; }
+}
+
+async function loadLocalPageCatalog() {
+  const request = ++localPageCatalogRequest;
+  const payload = await api("/api/local-pages");
+  if (request !== localPageCatalogRequest) return false;
+  localPageItems = payload.available && Array.isArray(payload.items) ? payload.items : [];
+  localPageGids = new Map();
+  for (const item of localPageItems) {
+    const previous = localPageGids.get(item.gid);
+    if (!previous || item.pages[0]?.width > previous.pages[0]?.width) localPageGids.set(item.gid, item);
+  }
+  const selected = localPagesSelect.value;
+  localPagesSelect.innerHTML = localPageItems.map((item) => `<option value="${escapeAttr(item.key)}">${escapeHtml(item.title)} [${escapeHtml(item.resolution)}]</option>`).join("");
+  if (localPageItems.some((item) => item.key === selected)) localPagesSelect.value = selected;
+  localPagesSelect.disabled = !localPageItems.length;
+  localPagesStatus.textContent = payload.available
+    ? `${localPageItems.length} galleries / ${payload.comparable_count} comparable / ${payload.collected_at || "Snapshot date unknown"}`
+    : payload.reason === "invalid_library" ? "Local library unavailable: validation failed." : "No local page library.";
+  return true;
+}
+
+function localPageImages(item) {
+  return `<div class="local-source-pages">${item.pages.map((image) =>
+    `<figure><button type="button" class="local-image-button" data-local-image="${escapeAttr(image.src)}" data-local-caption="Local file ${image.position} / ${image.width} x ${image.height}" title="Inspect local file ${image.position}"><img src="${escapeAttr(image.src)}" alt="Local file ${image.position}" loading="lazy"></button><figcaption>File ${image.position} / ${image.width} x ${image.height}</figcaption></figure>`).join("")}</div>`;
+}
+
+async function loadLocalPageComparison() {
+  const key = localPagesSelect.value;
+  const request = ++localPageComparisonRequest;
+  localPagesContent.replaceChildren();
+  if (!key) return;
+  localPagesStatus.textContent = "Loading comparison...";
+  try {
+    const payload = await api(`/api/local-pages/compare?${new URLSearchParams({ key })}`);
+    if (request !== localPageComparisonRequest || !localPagesDialog.open || localPagesSelect.value !== key) return;
+    const item = payload.item;
+    localPagesStatus.textContent = `${item.metadata_status === "matched" ? "Metadata matched" : "Metadata " + item.metadata_status} / ${item.ordering === "numeric_filename_prefix" ? "Numeric filename order" : "Filename order"} / ${item.image_count} files`;
+    const title = item.url ? `<a href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>` : escapeHtml(item.title);
+    const results = (source) => payload[source].map((candidate, index) => {
+      const image = source === "cover" ? candidate.cover : candidate.pages.find((page) => page.position !== 1);
+      return `<li><span class="local-rank">${index + 1}</span>${image ? `<button type="button" class="local-image-button" data-local-image="${escapeAttr(image.src)}" data-local-caption="${escapeAttr(candidate.title)}" title="Inspect ${escapeAttr(candidate.title)}"><img src="${escapeAttr(image.src)}" alt="${source === "cover" ? "Cached cover" : "Local inner sample"}" loading="lazy"></button>` : ""}<div><button type="button" class="local-result-title" data-local-key="${escapeAttr(candidate.key)}" title="${escapeAttr(candidate.title)}">${escapeHtml(candidate.title)}</button><div class="meta">Cosine ${candidate.cosine.toFixed(3)}</div></div></li>`;
+    }).join("");
+    localPagesContent.innerHTML = `<h3>${title}</h3>${localPageImages(item)}${payload.comparable
+      ? `<div class="local-comparison"><section><h3>Cover similarity</h3><ol>${results("cover")}</ol></section><section><h3>Inner-sample similarity</h3><ol>${results("body")}</ol></section></div><p class="meta">${payload.candidate_count} shared candidates / cosine similarity</p>`
+      : '<p class="meta">Cover / inner-sample comparison unavailable.</p>'}`;
+  } catch {
+    if (request === localPageComparisonRequest && localPagesDialog.open) localPagesStatus.textContent = "Comparison unavailable. Retry available.";
+  }
+}
+
+async function openLocalPages(key = "") {
+  if (!localPagesDialog.open) localPagesDialog.showModal();
+  disposeGalleryVisibility();
+  localPagesContent.replaceChildren();
+  localPagesStatus.textContent = "Loading local library...";
+  ++localPageComparisonRequest;
+  const request = localPageCatalogRequest + 1;
+  try {
+    if (!await loadLocalPageCatalog() || !localPagesDialog.open) return;
+    if (localPageItems.some((item) => item.key === key)) localPagesSelect.value = key;
+    await loadLocalPageComparison();
+  } catch {
+    if (request === localPageCatalogRequest && localPagesDialog.open) localPagesStatus.textContent = "Local library unavailable. Retry available.";
+  }
+}
+
+function inspectLocalImage(src, caption) {
+  const dialog = document.querySelector("#localImageDialog");
+  const image = document.querySelector("#localImage");
+  document.querySelector("#localImageTitle").textContent = caption || "Local file";
+  document.querySelector("#localImageStatus").textContent = "Loading...";
+  image.onload = () => { document.querySelector("#localImageStatus").textContent = ""; };
+  image.onerror = () => { document.querySelector("#localImageStatus").textContent = "Local image unavailable."; };
+  image.src = src;
+  if (!dialog.open) dialog.showModal();
+  disposeGalleryVisibility();
+}
+
+function localMediaError(event) {
+  const image = event.target;
+  if (currentView !== "review" || !(image instanceof HTMLImageElement)) return;
+  const card = image.closest("[data-gallery-url]");
+  const item = card ? localPageForGallery(card.dataset.galleryUrl) : null;
+  const index = Number(image.dataset.sampleIndex || 0);
+  const fallback = item?.pages[index % item.pages.length];
+  if (fallback && !image.src.includes("/api/local-pages/image") && !image.dataset.localRetried) {
+    image.dataset.localRetried = "1";
+    image.src = fallback.src;
+    image.alt = `Local file ${fallback.position}`;
+    image.title = image.alt;
+    const status = card.querySelector(".local-media-status");
+    if (status) status.textContent = "Local file preview";
+  } else {
+    image.hidden = true;
+    if (card?.querySelector(".local-media-status")) card.querySelector(".local-media-status").textContent = "Preview unavailable";
+  }
+}
+
 function renderGalleryCards(items, append = false) {
   const previousHints = recommendationsEl.querySelector(".review-key-hints");
   if (previousHints) reviewHintsExpanded = previousHints.open;
@@ -2809,18 +2927,20 @@ function renderGalleryCards(items, append = false) {
     const card = document.createElement("article");
     card.dataset.galleryUrl = item.url;
     card.className = focus ? "card focus-card" : lowInterestMode ? "card low-interest-card" : "card";
-    const thumbContent = item.thumb_url
-      ? `<img src="${escapeAttr(thumbnailSrc(item))}" alt="" loading="lazy">`
+    const localItem = mode === "review" ? localPageForGallery(item.url) : null;
+    const localCover = localItem?.pages[0];
+    const thumbContent = item.thumb_url || localCover
+      ? `<img src="${escapeAttr(item.thumb_url ? thumbnailSrc(item) : localCover.src)}" alt="${item.thumb_url ? "" : `Local file ${localCover.position}`}" loading="lazy">`
       : `<span>No thumbnail</span>`;
-    const thumb = item.thumb_url && (mode === "review" || lowInterestMode || classifierMode)
+    const thumb = (item.thumb_url || localCover) && (mode === "review" || lowInterestMode || classifierMode)
       ? `<a class="thumb" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer" aria-label="Open ${escapeAttr(item.title)}">${thumbContent}</a>`
       : `<div class="thumb">${thumbContent}</div>`;
     const samples = item.samples || [];
     const samplesPreview = samples.length && !lowInterestMode
       ? `<div class="samples">${samples
-          .map((thumb, index) => `<img src="${escapeAttr(sampleSrc(item.url, index))}" alt="" loading="lazy">`)
+          .map((thumb, index) => `<img src="${escapeAttr(sampleSrc(item.url, index))}" data-sample-index="${index}" alt="" loading="lazy">`)
           .join("")}</div>`
-      : "";
+      : localItem ? `<div class="samples">${localItem.pages.map((page) => `<button class="local-image-button" type="button" data-local-image="${escapeAttr(page.src)}" data-local-caption="Local file ${page.position}" title="Inspect local file ${page.position}"><img src="${escapeAttr(page.src)}" alt="Local file ${page.position}" loading="lazy"></button>`).join("")}</div>` : "";
     const tags = (item.tags || []).slice(0, 8).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
     const reasons = (item.reasons || []).map((reason) => `<span class="reason">${escapeHtml(reason)}</span>`).join(" ");
     const relatedFeedback = renderRelatedFeedback(item);
@@ -2971,6 +3091,7 @@ function renderGalleryCards(items, append = false) {
         ${samplesPreview}
       </div>
       <div class="body">
+        ${mode === "review" ? `<div class="local-media-tools"><span class="local-media-status">${localItem && (!item.thumb_url || !samples.length) ? "Local file preview" : ""}</span>${localItem ? `<button type="button" class="clear" data-local-compare="${escapeAttr(localItem.key)}">Compare samples</button>` : ""}</div>` : ""}
         ${lowInterestBadge}
         ${auditBadge}
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
@@ -3652,6 +3773,10 @@ for (const tab of viewTabs) {
   });
 }
 recommendationsEl.addEventListener("click", (event) => {
+  const localImage = event.target.closest("button[data-local-image]");
+  if (localImage) { inspectLocalImage(localImage.dataset.localImage, localImage.dataset.localCaption); return; }
+  const localCompare = event.target.closest("button[data-local-compare]");
+  if (localCompare) { openLocalPages(localCompare.dataset.localCompare); return; }
   const galleryLink = event.target.closest("a.thumb, a.title");
   if (isFocusReview() && galleryLink) {
     const card = galleryLink.closest("[data-gallery-url]");
@@ -3747,14 +3872,34 @@ window.addEventListener("resize", updateReviewControls);
 
 applyStaticTooltips();
 
+recommendationsEl.addEventListener("error", localMediaError, true);
+document.querySelector("#localPagesBtn").addEventListener("click", () => openLocalPages());
+document.querySelector("#localPagesRetry").addEventListener("click", () => openLocalPages(localPagesSelect.value));
+document.querySelector("#localPagesClose").addEventListener("click", () => localPagesDialog.close());
+document.querySelector("#localImageClose").addEventListener("click", () => document.querySelector("#localImageDialog").close());
+localPagesDialog.addEventListener("close", () => { ++localPageComparisonRequest; ++localPageCatalogRequest; observeRenderedGalleries(); });
+document.querySelector("#localImageDialog").addEventListener("close", observeRenderedGalleries);
+localPagesSelect.addEventListener("change", loadLocalPageComparison);
+localPagesContent.addEventListener("click", (event) => {
+  const image = event.target.closest("button[data-local-image]");
+  if (image) inspectLocalImage(image.dataset.localImage, image.dataset.localCaption);
+  const candidate = event.target.closest("button[data-local-key]");
+  if (candidate) { localPagesSelect.value = candidate.dataset.localKey; loadLocalPageComparison(); }
+});
+localPagesContent.addEventListener("error", (event) => {
+  if (event.target instanceof HTMLImageElement) { event.target.hidden = true; event.target.parentElement.title = "Local image unavailable"; }
+}, true);
+
 loadSettings()
   .then(loadStatus)
+  .then(() => loadLocalPageCatalog().catch(() => {}))
   .then(async () => {
     setActiveView(currentView);
     const counts = loadQueueCounts();
     const hathStatus = loadHathStatus({ announce: false }).catch(() => null);
     await loadCurrentPage();
     await Promise.all([counts, hathStatus]);
+    if (localPagesPreview) await openLocalPages();
   })
   .catch((error) => setStatus(error.message, true));
 
