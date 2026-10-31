@@ -70,6 +70,19 @@ after the current user signs in, not before login. See [LAUNCHER.md](LAUNCHER.md
 ## H@H observer
 
 The repository includes a deployable sidecar under [`hath_observer`](hath_observer/README.md).
+
+For a read-only library coverage audit, run
+`python scripts/audit_hath_library.py --output data/hath-library-audit.json`.
+It uses the existing enabled launcher SSH profile, reads completed downloads
+under `/srv/hath/download`, and opens the recommendation database in read-only
+mode. It reports aggregate metadata/sample coverage and hashes at most three
+existing images per gallery with bounded I/O. It never reads the CDN cache,
+client keys, or cookies, submits downloads, changes labels, or trains models.
+An existing output file is not overwritten. Hash results describe only the
+sample, not whole-library duplication or integrity; dimensions require Pillow
+already installed on the remote host. Completion markers do not independently
+prove complete or uncorrupted image content.
+
 Set `EXH_REC_HATH_TOKEN` on the recommendation server, then run
 `python -m hath_observer` on the H@H machine with its download directory,
 receiver URL, and the same token. No extra Python packages are required.
