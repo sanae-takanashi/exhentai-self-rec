@@ -211,6 +211,68 @@ class HathPageProbeTests(unittest.TestCase):
         self.assertEqual(len(result["galleries"]), 1)
         self.assertEqual(result["galleries"][0]["pages"], [])
 
+    def test_interrupted_batch_run_resumes_only_missing_batches(self):
+        root = fixture()
+        for gid in ("123", "124", "125"):
+            gallery(root, gid)
+        output = root / "dataset"
+        calls = []
+        def interrupted(config, transport_report=None, selected_keys=None, byte_budget=None):
+            calls.append(selected_keys)
+            if len(calls) == 3:
+                raise ValueError("fixture_transport_interruption")
+            return collect_remote(root, parse_download_directory_name, selected_keys, byte_budget)
+        with patch("scripts.probe_hath_pages.fetch_remote", side_effect=interrupted), patch("scripts.probe_hath_pages.BATCH_SIZE", 1):
+            with self.assertRaisesRegex(ValueError, "fixture_transport_interruption"):
+                collect_batches({}, output)
+        self.assertTrue((output / "batch-000/source.json").exists())
+        self.assertFalse((output / "batch-001").exists())
+        def complete(config, transport_report=None, selected_keys=None, byte_budget=None):
+            return collect_remote(root, parse_download_directory_name, selected_keys, byte_budget)
+        with patch("scripts.probe_hath_pages.fetch_remote", side_effect=complete) as request, patch("scripts.probe_hath_pages.BATCH_SIZE", 1):
+            resumed = collect_batches({}, output, resume=True)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(sum(len(row["pages"]) for row in resumed["galleries"]), 9)
+
+    def test_total_image_budget_is_enforced_across_batches(self):
+        root = fixture()
+        for gid in ("123", "124", "125"):
+            gallery(root, gid)
+        budget = len(picture()) * 4
+        def fetch(config, transport_report=None, selected_keys=None, byte_budget=None):
+            return collect_remote(root, parse_download_directory_name, selected_keys, byte_budget)
+        with patch("scripts.probe_hath_pages.fetch_remote", side_effect=fetch), patch("scripts.probe_hath_pages.BATCH_SIZE", 1), patch("scripts.probe_hath_pages.TOTAL_LIMIT", budget):
+            result = collect_batches({}, root / "dataset")
+        self.assertEqual(result["sample_bytes"], budget)
+        self.assertEqual(sum(len(row["pages"]) for row in result["galleries"]), 4)
+        self.assertEqual(result["skipped"]["byte_limit"], 5)
+
+    def test_changed_completed_gallery_does_not_silently_mix_snapshots(self):
+        root = fixture()
+        path = gallery(root)
+        def fetch(config, transport_report=None, selected_keys=None, byte_budget=None):
+            if selected_keys:
+                (path / "6-page.png").write_bytes(picture())
+            return collect_remote(root, parse_download_directory_name, selected_keys, byte_budget)
+        with patch("scripts.probe_hath_pages.fetch_remote", side_effect=fetch):
+            with self.assertRaisesRegex(ValueError, "gallery_changed_between_batches"):
+                collect_batches({}, root / "dataset")
+        self.assertFalse((root / "dataset/manifest.json").exists())
+
+    def test_partial_batch_directory_is_preserved_not_deleted(self):
+        root = fixture()
+        gallery(root)
+        output = root / "dataset"
+        inventory = unpack_verified(collect_remote(root, parse_download_directory_name, []), output / "inventory")
+        (output / "inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+        partial = output / "batch-000"
+        partial.mkdir()
+        retained = partial / "retained-fixture.txt"
+        retained.write_text("incomplete fixture", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "partial_batch_requires_new_output"):
+            collect_batches({}, output, resume=True)
+        self.assertEqual(retained.read_text(encoding="utf-8"), "incomplete fixture")
+
     def test_remote_code_remains_python36_compatible(self):
         source = Path(__file__).resolve().parents[1] / "scripts/probe_hath_pages.py"
         ast.parse(source.read_text(encoding="utf-8"), feature_version=(3, 6))
