@@ -568,6 +568,13 @@ means the selected work covered all missing records, not exhaustive search
 pagination. No production URL repair, preference labels, model updates,
 gallery-detail requests, image downloads or service restarts occur.
 
+For a stopped search response, `stop_diagnostics` and the corresponding event
+contain only allowlisted boolean markers and bounded counts, such as HTTP
+status, response size, search-form presence and gallery-link counts. No page
+text, title, arbitrary attribute, header or exception body is retained.
+A blank HTTP 200 response is `empty_search_response`, not `no_visible_hits`.
+It does not prove successful login or explain why the upstream returned no body.
+
 ## Safety notes
 
 This is a personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.

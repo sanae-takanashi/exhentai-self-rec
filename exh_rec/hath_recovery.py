@@ -29,10 +29,30 @@ GID = re.compile(r"[1-9][0-9]{0,19}\Z")
 SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 GALLERY = re.compile(r"https://(?:exhentai|e-hentai)\.org/g/([1-9][0-9]{0,19})/([0-9a-fA-F]{1,64})/\Z")
 URL_TABLES = ("hath_downloads", "feedback", "gallery_marks", "gallery_feature_snapshots", "recommendation_impressions")
+DIAGNOSTIC_FLAGS = frozenset({"listing_marker", "search_form", "login_marker", "challenge_marker",
+                              "empty_marker", "rate_limit_marker", "content_warning_marker", "has_more"})
+DIAGNOSTIC_COUNTS = frozenset({"response_bytes", "text_chars", "html_tags", "forms", "images",
+                               "anchors", "gallery_anchors", "canonical_candidates", "missing_slash_candidates",
+                               "http_gallery_candidates"})
+
+
+def safe_diagnostics(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {key: value[key] for key in DIAGNOSTIC_FLAGS if type(value.get(key)) is bool}
+    result.update({key: value[key] for key in DIAGNOSTIC_COUNTS
+                   if type(value.get(key)) is int and 0 <= value[key] <= MAX_RESPONSE * 4})
+    if type(value.get("http_status")) is int and 100 <= value["http_status"] <= 599:
+        result["http_status"] = value["http_status"]
+    return result
 
 
 class RecoveryError(Exception):
     """Only fixed public reason codes belong in this exception."""
+
+    def __init__(self, reason, diagnostics=None):
+        super().__init__(reason)
+        self.diagnostics = safe_diagnostics(diagnostics)
 
 
 def search_url(kind, value):
@@ -56,33 +76,52 @@ class SearchParser(LinkTitleParser):
         self.listing = False
         self.has_more = False
         self.blocked = False
+        self.counts = Counter()
+        self.search_form = False
 
     def handle_starttag(self, tag, attrs):
         super().handle_starttag(tag, attrs)
         attributes = dict(attrs)
+        if tag in {"html", "form", "img", "a"}:
+            self.counts[tag] += 1
+        self.search_form |= tag == "input" and attributes.get("name") in {"f_search", "f_shash"}
         classes = set((attributes.get("class") or "").split())
         self.listing |= bool(classes & {"itg", "glink", "gl1t"})
         self.has_more |= attributes.get("id") in {"unext", "dnext"} and bool(attributes.get("href"))
         self.blocked |= attributes.get("name") in {"password", "captcha"} or attributes.get("id") == "challenge-form"
 
 
-def parse_search(text):
-    if temporary_ban_detected(text):
-        raise RecoveryError("rate_limited")
+def parse_search(text, transport=None):
     parser = SearchParser()
     parser.feed(text)
-    if parser.blocked or re.search(r"sad\s*panda|cf-chl-|verify you are human|you are not logged in", text, re.I):
-        raise RecoveryError("access_required")
+    challenge = bool(re.search(r"cf-chl-|verify you are human", text, re.I))
+    login = bool(re.search(r"sad\s*panda|you are not logged in|requires? you to log (?:on|in)|must be logged (?:on|in)", text, re.I))
     candidates = {}
     for href, _, _ in parser.links:
         url = urllib.parse.urljoin(BASE, href)
         if GALLERY.fullmatch(url):
             candidates[url] = {"url": url, "gid": gallery_identity(url)}
     empty = bool(re.search(r"\bNo hits found\b|\bNo unfiltered results found\b", text, re.I))
+    diagnostics = safe_diagnostics({**safe_diagnostics(transport),
+        "text_chars": len(text), "html_tags": parser.counts["html"], "forms": parser.counts["form"],
+        "images": parser.counts["img"], "anchors": parser.counts["a"], "gallery_anchors": len(parser.links),
+        "canonical_candidates": len(candidates), "listing_marker": parser.listing,
+        "search_form": parser.search_form, "login_marker": login, "challenge_marker": challenge or parser.blocked,
+        "empty_marker": empty, "rate_limit_marker": temporary_ban_detected(text), "has_more": parser.has_more,
+        "content_warning_marker": bool(re.search(r"\bContent Warning\b", text, re.I)),
+        "missing_slash_candidates": sum(bool(GALLERY.fullmatch(urllib.parse.urljoin(BASE, href) + "/")) for href, _, _ in parser.links),
+        "http_gallery_candidates": sum(bool(GALLERY.fullmatch(urllib.parse.urljoin(BASE, href).replace("http://", "https://", 1))) for href, _, _ in parser.links
+                                       if href.startswith("http://"))})
+    if not text.strip():
+        raise RecoveryError("empty_search_response", diagnostics)
+    if diagnostics["rate_limit_marker"]:
+        raise RecoveryError("rate_limited", diagnostics)
+    if parser.blocked or challenge or login:
+        raise RecoveryError("access_required", diagnostics)
     if len(candidates) > 100 or (empty and candidates) or (not candidates and not empty) or (candidates and not parser.listing):
-        raise RecoveryError("unrecognized_search_page")
+        raise RecoveryError("unrecognized_search_page", diagnostics)
     if empty and parser.has_more:
-        raise RecoveryError("unrecognized_search_page")
+        raise RecoveryError("unrecognized_search_page", diagnostics)
     return {"candidates": list(candidates.values()), "has_more": parser.has_more,
             "outcome": "candidates" if candidates else "no_visible_hits"}
 
@@ -139,7 +178,8 @@ class RecoveryClient:
                     body = response.read(MAX_RESPONSE + 1)
                     if len(body) > MAX_RESPONSE:
                         raise RecoveryError("response_limit")
-            return parse_search(body.decode("utf-8", errors="replace"))
+                    status = getattr(response, "status", 200)
+            return parse_search(body.decode("utf-8", errors="replace"), {"http_status": status, "response_bytes": len(body)})
         except urllib.error.HTTPError as exc:
             if exc.code in {429, 509}:
                 reason = "rate_limited"
@@ -150,7 +190,7 @@ class RecoveryClient:
             else:
                 reason = "http_error"
             exc.close()
-            raise RecoveryError(reason) from None
+            raise RecoveryError(reason, {"http_status": exc.code}) from None
         except RecoveryError:
             raise
         except Exception:
@@ -275,9 +315,12 @@ def recover(plan, lookup, max_requests=12, record=lambda result: None):
                         raise RecoveryError("invalid_search_evidence")
                     cache[kind, value] = {"candidates": found, "has_more": result["has_more"], "outcome": result["outcome"]}
                 except Exception as exc:
-                    reasons = {"rate_limited", "access_required", "redirect_blocked", "unrecognized_search_page", "http_error", "transport_failed", "response_limit", "unsupported_response_encoding", "invalid_search_evidence"}
+                    reasons = {"rate_limited", "access_required", "redirect_blocked", "empty_search_response", "unrecognized_search_page", "http_error", "transport_failed", "response_limit", "unsupported_response_encoding", "invalid_search_evidence"}
                     stopped = str(exc) if isinstance(exc, RecoveryError) and str(exc) in reasons else "lookup_failed"
-                    record({"kind": kind, "value": value, "status": "stopped", "reason": stopped})
+                    diagnostics = safe_diagnostics(exc.diagnostics) if isinstance(exc, RecoveryError) else {}
+                    if diagnostics:
+                        item["stop_diagnostics"] = diagnostics
+                    record({"kind": kind, "value": value, "status": "stopped", "reason": stopped, **({"diagnostics": diagnostics} if diagnostics else {})})
                     break
                 # A failed durable write must abort, not turn into search evidence.
                 record({"kind": kind, "value": value, "status": "ok", **cache[kind, value]})
@@ -330,12 +373,15 @@ def validate_output_directory(path):
 def markdown_report(report):
     summary = report["summary"]
     lines = ["# H@H Recovery Candidates", "", "Read-only evidence. No links were written back to the production database.", "",
-             f"Status: {summary['status']}; completed {summary['completed']}/{summary['missing']}; pending {summary['pending']}; requests {summary['requests']}.", "",
+             f"Status: {summary['status']}; completed {summary['completed']}/{summary['missing']}; pending {summary['pending']}; requests {summary['requests']}; stop reason: {summary['stop_reason'] or 'none'}.", "",
              "| Local gid / resolution | Candidate gid | Relationship | Matching samples | Candidate |", "| --- | --- | --- | --- | --- |"]
     for item in report["items"]:
         for candidate in item["candidates"]:
             lines.append(f"| {item['gid']} / {item['resolution']} | {candidate['gid']} | {candidate['relationship']} | {len(candidate['sample_matches'])} | [Inspect]({candidate['url']}) |")
         if not item["candidates"]:
             lines.append(f"| {item['gid']} / {item['resolution']} | - | {'no_visible_candidates' if item['complete'] else 'incomplete'} | - | - |")
+    diagnostics = [safe_diagnostics(item["stop_diagnostics"]) for item in report["items"] if item.get("stop_diagnostics")]
+    if diagnostics:
+        lines += ["", "## Stopped Response", "", "```json", json.dumps(diagnostics, ensure_ascii=True, indent=2), "```"]
     lines += ["", "## Limits", ""] + ["- " + value for value in report["limitations"]]
     return "\n".join(lines) + "\n"

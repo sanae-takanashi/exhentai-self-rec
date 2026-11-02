@@ -55,7 +55,7 @@ class SearchTest(unittest.TestCase):
             self.assertEqual(result["outcome"], "no_visible_hits")
 
     def test_missing_results_auth_challenges_and_rate_bans_stop(self):
-        cases = [('', 'unrecognized_search_page'), ('<h1>Unknown response</h1>', 'unrecognized_search_page'),
+        cases = [('', 'empty_search_response'), ('<h1>Unknown response</h1>', 'unrecognized_search_page'),
                  ('<form><input name="password"></form>No hits found', 'access_required'),
                  ('<form id="challenge-form">No hits found</form>', 'access_required'),
                  ('Sad Panda', 'access_required'), ('cf-chl-test No hits found', 'access_required'),
@@ -73,6 +73,34 @@ class SearchTest(unittest.TestCase):
     def test_empty_and_nonempty_results_cannot_be_mixed(self):
         with self.assertRaises(recovery.RecoveryError):
             recovery.parse_search('No hits found<a class="glink" href="/g/1/abcdef/">Title</a>')
+
+    def test_unknown_page_diagnostics_are_fixed_markers_and_counts_only(self):
+        text = '<html><title>FAKE_SECRET</title><form action="https://private.invalid/?secret=FAKE_SECRET"><input name="f_search" value="FAKE_SECRET"></form><a href="/g/1/abc">FAKE_SECRET</a><img src="FAKE_SECRET"></html>'
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            recovery.parse_search(text, {"http_status": 200, "response_bytes": 500, "raw": "FAKE_SECRET"})
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(str(raised.exception), "unrecognized_search_page")
+        self.assertEqual(diagnostics["http_status"], 200)
+        self.assertEqual(diagnostics["response_bytes"], 500)
+        self.assertEqual(diagnostics["forms"], 1)
+        self.assertEqual(diagnostics["gallery_anchors"], 1)
+        self.assertEqual(diagnostics["canonical_candidates"], 0)
+        self.assertEqual(diagnostics["missing_slash_candidates"], 1)
+        self.assertTrue(diagnostics["search_form"])
+        self.assertNotIn("FAKE_SECRET", json.dumps(diagnostics))
+        self.assertNotIn("private.invalid", json.dumps(diagnostics))
+
+    def test_login_wording_is_stopped_and_never_treated_as_empty_results(self):
+        for text in ("This page requires you to log on.", "You must be logged in to search. No hits found"):
+            with self.subTest(text=text), self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.parse_search(text)
+            self.assertEqual(str(raised.exception), "access_required")
+            self.assertTrue(raised.exception.diagnostics["login_marker"])
+
+    def test_diagnostic_allowlist_rejects_strings_invalid_counts_and_statuses(self):
+        self.assertEqual(recovery.safe_diagnostics({"raw": "FAKE_SECRET", "forms": True, "images": -1,
+            "http_status": 999, "anchors": "FAKE_SECRET", "search_form": 1, "text_chars": 100000000}), {})
+        self.assertEqual(recovery.safe_diagnostics("FAKE_SECRET"), {})
 
 
 class Response(io.BytesIO):
@@ -199,6 +227,24 @@ class TransportTest(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery.RecoveryClient("fake=secret", interval=float("nan"))
 
+    def test_transport_attaches_status_and_size_without_exporting_html(self):
+        with patch.object(urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = Response(b"<html>FAKE_SECRET</html>")
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.RecoveryClient("fake=FAKE_SECRET").lookup("gid", "1")
+        self.assertEqual(raised.exception.diagnostics["http_status"], 200)
+        self.assertEqual(raised.exception.diagnostics["response_bytes"], 24)
+        self.assertNotIn("FAKE_SECRET", json.dumps(raised.exception.diagnostics))
+
+    def test_empty_http_200_is_a_stopped_response_not_an_empty_search_result(self):
+        with patch.object(urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = Response(b"")
+            with self.assertRaises(recovery.RecoveryError) as raised:
+                recovery.RecoveryClient("fake=FAKE_SECRET").lookup("gid", "1")
+        self.assertEqual(str(raised.exception), "empty_search_response")
+        self.assertEqual(raised.exception.diagnostics["http_status"], 200)
+        self.assertEqual(raised.exception.diagnostics["response_bytes"], 0)
+
 
 class PlanAndRecoveryTest(unittest.TestCase):
     def setUp(self):
@@ -301,6 +347,23 @@ class PlanAndRecoveryTest(unittest.TestCase):
         self.assertEqual(result["summary"]["requests"], 1)
         self.assertEqual(result["summary"]["status"], "stopped")
         self.assertEqual(result["summary"]["stop_reason"], "rate_limited")
+
+    def test_stop_diagnostics_are_resanitized_before_report_and_event_write(self):
+        events = []
+        def lookup(*args):
+            error = recovery.RecoveryError("unrecognized_search_page")
+            error.diagnostics = {"raw": "FAKE_SECRET", "forms": 2, "http_status": 200, "login_marker": False}
+            raise error
+        result = recovery.recover(self.plan(), lookup, record=events.append)
+        expected = {"forms": 2, "http_status": 200, "login_marker": False}
+        self.assertEqual(events[0]["diagnostics"], expected)
+        self.assertEqual(result["items"][0]["stop_diagnostics"], expected)
+        self.assertEqual(result["summary"]["requests"], 1)
+        self.assertNotIn("FAKE_SECRET", json.dumps([result, events]))
+        markdown = recovery.markdown_report(result)
+        self.assertIn("unrecognized_search_page", markdown)
+        self.assertIn('"http_status": 200', markdown)
+        self.assertNotIn("FAKE_SECRET", markdown)
 
     def test_request_budget_is_explicitly_partial(self):
         result = recovery.recover(self.plan(), lambda kind, value: found(), max_requests=1)
