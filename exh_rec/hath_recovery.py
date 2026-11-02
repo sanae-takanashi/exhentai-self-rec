@@ -122,9 +122,10 @@ class RecoveryClient:
         elif parsed.scheme in {"socks5", "socks5h"}:
             import socks
             context = patched_socks_create_connection(
-                socks, parsed.hostname, parsed.port or 1080, True,
-                urllib.parse.unquote(parsed.username) if parsed.username else None,
-                urllib.parse.unquote(parsed.password) if parsed.password else None)
+                socks, parsed.hostname, parsed.port or 1080,
+                username=urllib.parse.unquote(parsed.username) if parsed.username else None,
+                password=urllib.parse.unquote(parsed.password) if parsed.password else None,
+                rdns=True)
         try:
             with context:
                 opener = urllib.request.build_opener(proxy_handler, NoRedirect())

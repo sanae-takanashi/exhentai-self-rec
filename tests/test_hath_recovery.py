@@ -6,12 +6,15 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import socket
+import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from exh_rec import hath_recovery as recovery
 from exh_rec.local_pages import LocalPageLibrary, SCHEMA
@@ -84,6 +87,25 @@ class Response(io.BytesIO):
 
 
 class TransportTest(unittest.TestCase):
+    def test_socks_credentials_and_remote_dns_reach_existing_adapter_correctly(self):
+        original = socket.create_connection
+        for proxy, username, password in [
+            ("socks5://proxy.invalid:1080", None, None),
+            ("socks5h://fake%40user:FAKE%3Apassword@proxy.invalid:1080", "fake@user", "FAKE:password"),
+        ]:
+            with self.subTest(proxy=proxy):
+                sock = Mock()
+                fake_socks = types.SimpleNamespace(SOCKS5=2, socksocket=lambda: sock)
+                def open_response(*args, **kwargs):
+                    socket.create_connection(("exhentai.org", 443), timeout=30)
+                    return Response()
+                with patch.dict(sys.modules, {"socks": fake_socks}), patch.object(urllib.request, "build_opener") as build:
+                    build.return_value.open.side_effect = open_response
+                    self.assertEqual(recovery.RecoveryClient("fake=FAKE_SECRET", proxy).lookup("gid", "1")["outcome"], "no_visible_hits")
+                sock.set_proxy.assert_called_once_with(2, "proxy.invalid", 1080, rdns=True, username=username, password=password)
+                sock.connect.assert_called_once_with(("exhentai.org", 443))
+                self.assertIs(socket.create_connection, original)
+
     def test_only_saved_cookie_goes_to_constructed_main_site_get(self):
         with patch.object(urllib.request, "build_opener") as build:
             build.return_value.open.return_value = Response()
