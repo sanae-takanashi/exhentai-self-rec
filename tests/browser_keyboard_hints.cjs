@@ -98,7 +98,7 @@ async function scenario(viewport, colorScheme) {
     assert.equal(await status.textContent(), "");
     assert.match(await host.locator(".items").innerText(), /f Link hints/);
     assert.match(await host.locator(".items").innerText(), /j\/k Page down \/ up/);
-    assert.doesNotMatch(await host.locator(".items").innerText(), /download/);
+    assert.match(await host.locator(".items").innerText(), /d Archive Download/);
     assert.equal(await page.locator("table").innerHTML(), nativeHTML);
     await checkBounds();
     await page.screenshot({ path: path.join(output, `${viewport.width}-${viewport.height}-${colorScheme}-gallery.png`) });

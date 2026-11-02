@@ -1,0 +1,13 @@
+# Review exclusion (Excluded URLs and keys):
+# Pattern: :http://127.0.0.1:18787/
+# Keys: 1 2 3 4 5 <left> <right> a d j k o q s w z
+# Merge these mappings with existing custom mappings; retain unrelated settings.
+
+# D on a gallery opens its native Archive Download dialog.
+# D in the Archiver focuses a numeric H@H option; Enter confirms.
+env exGallery host=":https://exhentai.org/g/"
+env exArchive host=":https://exhentai.org/archiver.php?"
+map d runKey expect={"exGallery":"<v-exarchive>","exArchive":"<v-ex1280>"} keys="<v-defaultd>"
+map <v-defaultd> scrollPageDown
+map <v-exarchive> LinkHints.activate direct="em=a[onclick*=\"archiver.php\"];em=a[href*=\"archiver.php\"]"
+map <v-ex1280> LinkHints.activateFocus direct="em=a[onclick*=\"do_hathdl('1280')\"];em=a[onclick*=\"do_hathdl('800')\"];em=a[onclick*=\"do_hathdl('1920')\"];em=a[onclick*=\"do_hathdl('2560')\"]"

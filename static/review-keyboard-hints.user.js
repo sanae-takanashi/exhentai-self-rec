@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Review Keyboard Hints
 // @namespace    exhentai-self-rec
-// @version      1.1.0
+// @version      1.2.0
 // @description  Read-only keyboard reminders for the native gallery and Archiver.
 // @match        https://exhentai.org/g/*
 // @match        https://exhentai.org/archiver.php*
@@ -39,7 +39,7 @@
     </style>
     <details class="dock" open aria-label="Keyboard hints">
       <summary title="Toggle keyboard hints" aria-label="Toggle keyboard hints"><svg aria-hidden="true" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M8 16h8"/></svg></summary>
-      <div class="items">${archive ? '<span><kbd>d</kbd> Nearest 1280x</span><span><kbd>Enter</kbd> Confirm download</span>' : '<span><kbd>f</kbd> Link hints</span>'}<span><kbd>j</kbd>/<kbd>k</kbd> Page down / up</span><span><kbd>x</kbd> Close</span><span><kbd>Ctrl+W</kbd> Close (browser)</span></div>
+      <div class="items">${archive ? '<span><kbd>d</kbd> Nearest 1280x</span><span><kbd>Enter</kbd> Confirm download</span>' : '<span><kbd>d</kbd> Archive Download</span><span><kbd>f</kbd> Link hints</span>'}<span><kbd>j</kbd>/<kbd>k</kbd> Page down / up</span><span><kbd>x</kbd> Close</span><span><kbd>Ctrl+W</kbd> Close (browser)</span></div>
       <div class="status" role="status" aria-live="polite"></div>
     </details>`;
   document.body.append(host);

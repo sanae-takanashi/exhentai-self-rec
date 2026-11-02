@@ -20,21 +20,25 @@ to toggle it without a mouse. Collapse state survives card changes, not reloads.
 ## Native Gallery And Archiver
 
 Vimium C supplies link hints (F) and closes the current tab/window (X).
-Ctrl+W remains the browser-native close shortcut. In the Archiver, the custom D
+On a gallery-detail page, D opens the existing native Archive Download link in
+one keypress. It activates the site's own link and popup handler. Ctrl+W remains
+the browser-native close shortcut. In the Archiver, the custom D
 mapping focuses an available H@H resolution nearest 1280x, in this order:
 1280, 800, 1920, 2560. It never falls back to Original. Enter is a separate,
 explicit native download submission and may consume site credits.
 
-The Archive focus mapping was exercised with Vimium C 2.12.3 on Zen. Add these
+The mappings use Vimium C 2.12.3 on Zen. Add these
 to existing custom mappings without replacing unrelated settings. The new J/K
 configuration still needs to be saved and verified in the user's browser;
 headless app tests do not load the installed extension or change its settings.
 
 ```text
-# ExHentai Archiver: focus only; Enter confirms the native action.
+# Gallery: open native Archive Download. Archiver: focus only; Enter confirms.
+env exGallery host=":https://exhentai.org/g/"
 env exArchive host=":https://exhentai.org/archiver.php?"
-map d runKey expect={"exArchive":"<v-ex1280>"} keys="<v-defaultd>"
+map d runKey expect={"exGallery":"<v-exarchive>","exArchive":"<v-ex1280>"} keys="<v-defaultd>"
 map <v-defaultd> scrollPageDown
+map <v-exarchive> LinkHints.activate direct="em=a[onclick*=\"archiver.php\"];em=a[href*=\"archiver.php\"]"
 # ExHentai only: a screen per J/K; retain default line scrolling elsewhere.
 env exSite host=":https://exhentai.org/"
 map j runKey expect={"exSite":"<v-exnext>"} keys="<v-defaultj>"
@@ -51,12 +55,20 @@ For Review, preserve the existing Vimium exclusion that passes through
 Add Q/W to that rule's pass-through keys before trying them in Vimium. The app
 cannot override keys intercepted by an extension; changing app code alone does
 not update this rule. R is intentionally not a Review binding.
-Other sites retain Vimium's D page-down behavior. Link-hint labels vary per page;
-use the label currently shown for Archive Download, not a fixed label.
+Other sites retain Vimium's D page-down behavior. The gallery mapping targets
+the actual Archive Download link, so it does not depend on a changing hint label.
+The portable Gallery/Archiver mappings and Review pass-through keys are also in
+`static/review-vimium.txt`. Merge them with existing settings.
+
+If Review D scrolls or makes the page jump instead of voting, inspect the saved
+Review exclusion first: it must contain `d`. The full list above also includes
+`a`, `j` and `k`. Save the rule, then reload the Review tab. The app's existing
+Focus shortcut already submits `vote: 1`; a browser extension can intercept the
+key before the page receives it. Inputs and dialogs intentionally block ratings.
 
 Applying the app code does not update Vimium settings or the installed copy of
 the userscript. Update the Review exclusion and custom mappings above, then
-update Review Keyboard Hints to 1.1.0 through the existing script manager and
+update Review Keyboard Hints to 1.2.0 through the existing script manager and
 reload the relevant tabs. Keep unrelated exclusions (such as Gmail) intact.
 
 ## Optional On-Screen Reminders

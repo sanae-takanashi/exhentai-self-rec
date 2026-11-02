@@ -349,6 +349,23 @@ test("Focus: shortcuts ignore composition, editable targets and repeat", async (
   assert.equal(f.run('reviewCurrentUrl'), items[1].url);
 });
 
+test("Focus: D records an upvote and advances only after successful feedback", async () => {
+  const f = focusFixture();
+  f.run(`reviewKeydown({ key: 'd', target: { closest: () => null }, preventDefault() {} })`);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].url, "/api/feedback");
+  const body = JSON.parse(f.requests[0].options.body);
+  assert.equal(body.gallery_url, items[0].url);
+  assert.equal(body.vote, 1);
+  assert.equal(Object.hasOwn(body, "score"), false);
+  assert.equal(f.run("reviewCurrentUrl"), items[0].url);
+  f.respond(0, undoResponse());
+  await new Promise(setImmediate);
+  assert.deepEqual(f.urls(), [items[1].url]);
+  assert.equal(f.run("reviewCurrentUrl"), items[1].url);
+  assert.equal(f.run("reviewBusy()"), false);
+});
+
 test("Focus: left-hand keys dispatch navigation and native votes, not score aliases", () => {
   const f = focusFixture();
   f.run(`globalThis.actions = [];
