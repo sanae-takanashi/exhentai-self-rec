@@ -601,6 +601,44 @@ login/access challenges and unrecognized pages; an empty search never verifies
 login or proves gallery absence. Restart through the normal launcher when loading
 updated backend diagnostics; this CLI does not restart the application.
 
+### Confirmed Metadata Repair
+
+`scripts/apply_hath_metadata.py` is a separate, explicitly confirmed workflow.
+Its default preview is offline. It rebuilds candidate evidence from the private
+journal and rehashes current local samples; a report's completion labels alone
+cannot authorize a repair. The index, journal and staged metadata must still
+match, and search evidence and stages expire after 24 hours.
+
+```powershell
+.\.venv\Scripts\python.exe scripts/apply_hath_metadata.py --evidence data/hath-recovery-rest --output data/metadata-preview
+.\.venv\Scripts\python.exe scripts/apply_hath_metadata.py --evidence data/hath-recovery-rest --output data/metadata-pilot --fetch --confirmed --limit 2
+.\.venv\Scripts\python.exe scripts/apply_hath_metadata.py --evidence data/hath-recovery-rest --stage data/metadata-pilot/metadata.json --output data/metadata-rest --fetch --confirmed --limit 25
+.\.venv\Scripts\python.exe scripts/apply_hath_metadata.py --evidence data/hath-recovery-rest --stage data/metadata-pilot/metadata.json --stage data/metadata-rest/metadata.json --output data/metadata-apply --apply --confirmed
+```
+
+Keep ordinary fetching idle and allow at least five seconds between separate
+CLI runs; there is no cross-process rate limiter. Each fetch issues at most one
+official gdata API request (up to 25 galleries), with saved login/proxy settings,
+no redirects or retries, bounded responses and exact gid/token validation. It
+does not request cover bytes, page images, downloads or parent-chain metadata.
+Inspect the pilot before proceeding. A failed fetch leaves `failure.json` with
+only a fixed reason code when its output directory was created; no raw response
+or exception is saved. Stop on failures and investigate before another request.
+
+All selected identities must have valid staged metadata before apply. Apply
+reserves a new private SQLite backup and receipt, takes a write lock, backs up
+the last committed database through SQLite's backup API and checks its integrity
+before inserting. Existing gids or URLs are never overwritten, including rows
+created since staging. Restored rows are metadata-only and `review_excluded=1`;
+no feature snapshots, preference labels, embeddings or training are generated.
+Existing database triggers can fill previously null H@H download links for the
+same gid and invalidate caches. Independently verify those expected changes,
+unchanged existing rows/protected tables and the live Local Pages catalog and
+comparisons. Do not automatically restore a whole backup over later user work.
+The backup contains private settings, including saved authentication; keep every
+output under ignored `data/` and never publish it. This standalone workflow does
+not need a service restart.
+
 For a stopped search response, `stop_diagnostics` and the corresponding event
 contain only allowlisted boolean markers and bounded counts, such as HTTP
 status, response size, search-form presence and gallery-link counts. No page
