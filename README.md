@@ -531,6 +531,43 @@ and 43 paired galleries in the fixed 2026-10-31 snapshot. Synthetic browser
 checks cover desktop and two mobile sizes with all external networking blocked;
 screenshots/results remain in ignored `data/browser-validation`.
 
+## Missing Metadata Candidates
+
+The recovery tool investigates missing gallery links for existing local-library
+samples. It is separate from H@H transport: it uses normal, authenticated
+ExHentai search pages, not CDN cache probing or an arbitrary image-download API.
+The default only generates a plan and never reads saved authentication settings.
+
+```powershell
+.\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-plan --limit 3
+.\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-pilot --limit 3 --max-requests 9 --execute
+```
+
+Use a new output directory each time. `--database` and `--library` override
+the existing launcher database and local library paths. Execution internally
+reuses saved login/proxy settings, sends main-site GET requests at least five
+seconds apart, inspects only the first result page, and stops without retrying
+on access challenges, redirects, rate limits or unrecognized responses. Check
+that ordinary fetching is idle before executing; this standalone CLI does not
+coordinate a shared rate limiter with other processes.
+
+Each selected record searches its gid, then SHA-1 hashes of up to two verified
+local samples, preferring non-first files. Candidate URLs come from allowlisted
+local database columns and parsed search links. A gid search may identify a
+newer update-chain member; a shared image does not prove gallery identity.
+Local filename positions are not verified site page numbers. Resized files,
+visibility, saved filters and search indexing can prevent matches, so
+`no_visible_hits` never means a gallery does not exist.
+
+`plan.json`, durable per-lookup `events.jsonl`, `report.json` and `report.md`
+stay private under ignored `data/`; they contain candidate links and file
+fingerprints, not cookies, HTML, titles or response bodies. Events are evidence,
+not automatic cross-run resume. Interrupted outputs are retained, never
+overwritten. `partial`/`stopped` reports retain pending counts; `completed_scope`
+means the selected work covered all missing records, not exhaustive search
+pagination. No production URL repair, preference labels, model updates,
+gallery-detail requests, image downloads or service restarts occur.
+
 ## Safety notes
 
 This is a personal tool. Cookies are stored in plaintext SQLite so the scraper can reuse them. Keep the data directory private and do not commit it.
