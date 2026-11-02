@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import json
 import math
 import random
@@ -366,31 +365,26 @@ def _prospective_outcomes(
     visible_only: bool = False,
 ) -> list[dict]:
     timestamp = "visible_at" if visible_only else "created_at"
-    impressions_by_gallery: dict[str, list[sqlite3.Row]] = {}
-    for row in conn.execute(
-        f"""
-        SELECT gallery_url, {timestamp} AS created_at, ranking_context_json
-        FROM recommendation_impressions
-        WHERE {timestamp} >= ?
-          AND (? IS NULL OR {timestamp} < ?)
-        ORDER BY gallery_url, {timestamp}, id
-        """,
-        (window_start, window_end, window_end),
-    ):
-        impressions_by_gallery.setdefault(str(row["gallery_url"]), []).append(row)
     outcomes = []
     for gallery_url, events in _outcome_events(conn).items():
-        impressions = impressions_by_gallery.get(gallery_url) or []
-        if not impressions:
-            continue
-        impression_times = [str(row["created_at"]) for row in impressions]
         for event_at, positive in events:
-            if window_end is not None and event_at >= window_end:
+            if event_at < window_start or (window_end is not None and event_at >= window_end):
                 continue
-            index = bisect.bisect_right(impression_times, event_at) - 1
-            if index < 0:
+            # Fetch only the exposure used by this outcome, not every context
+            # ever delivered to the gallery. The id breaks timestamp ties.
+            row = conn.execute(
+                f"""
+                SELECT {timestamp} AS created_at, ranking_context_json
+                FROM recommendation_impressions
+                WHERE gallery_url = ? AND {timestamp} >= ? AND {timestamp} <= ?
+                  AND (? IS NULL OR {timestamp} < ?)
+                ORDER BY {timestamp} DESC, id DESC
+                LIMIT 1
+                """,
+                (gallery_url, window_start, event_at, window_end, window_end),
+            ).fetchone()
+            if row is None:
                 continue
-            row = impressions[index]
             try:
                 context = json.loads(row["ranking_context_json"] or "{}")
             except json.JSONDecodeError:
@@ -497,7 +491,7 @@ def low_interest_audit_report(
     threshold_exposures: dict[tuple[str, float], set[str]] = {}
     for row in conn.execute(
         """
-        SELECT gallery_url, ranking_context_json
+        SELECT DISTINCT gallery_url, ranking_context_json
         FROM recommendation_impressions
         WHERE created_at >= ? AND created_at < ?
         """,

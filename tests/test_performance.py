@@ -284,6 +284,22 @@ class PerformanceTest(unittest.TestCase):
             self.assertEqual(len(result), len(items))
             self.assertEqual(keys.call_count, len(items))
 
+    def test_related_feedback_index_does_not_decode_unused_visual_data(self):
+        url = "https://exhentai.org/g/1000/a/"
+        self.conn.execute("UPDATE galleries SET url=?, parent_url=?, visual_embedding_json=? WHERE gid='0'",
+                          (url, "https://exhentai.org/g/999/a/", json.dumps([0.5] * 4096)))
+        self.conn.execute("INSERT INTO feedback(gallery_url,vote,score) VALUES (?,1,5)", (url,))
+        self.conn.execute("INSERT INTO gallery_marks(gallery_url,kind) VALUES (?,'favorite')", (url,))
+        self.conn.commit()
+        with patch.object(recommender, "parse_visual_embedding", side_effect=AssertionError("unused vector decoded")):
+            index = recommender._build_related_feedback_reference_index(self.conn)
+        reference = index[recommender.parent_repeat_key(url)][0]
+        self.assertEqual(reference["url"], url)
+        self.assertEqual(reference["title"], "Gallery 0")
+        self.assertEqual(reference["user_score"], 5)
+        self.assertEqual(reference["user_mark_kind"], "favorite")
+        self.assertTrue(any(key.startswith("title-identity:") for key in index))
+
 
 if __name__ == "__main__":
     unittest.main()

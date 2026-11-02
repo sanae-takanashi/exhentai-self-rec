@@ -131,6 +131,7 @@ let hathPackStatusPayload = null;
 let hathCleanupOnly = false;
 let hathPackPreviewVersion = 0;
 let lastRenderedFetchId = null;
+let initialPageLoading = true;
 let currentView = "review";
 let reviewExploreSeed = "";
 let recommendationRequestId = 0;
@@ -3293,6 +3294,7 @@ function applyGalleryPage(payload, append = false) {
 }
 
 async function reloadRecommendationsAfterFetch(statusPayload) {
+  if (initialPageLoading) return;
   const fetchState = statusPayload.fetch || {};
   const lastFetch = statusPayload.last_fetch;
   if (fetchState.running || !lastFetch || !lastFetch.id || lastFetch.id === lastRenderedFetchId) {
@@ -3890,16 +3892,22 @@ localPagesContent.addEventListener("error", (event) => {
   if (event.target instanceof HTMLImageElement) { event.target.hidden = true; event.target.parentElement.title = "Local image unavailable"; }
 }, true);
 
+// The local catalog can load alongside settings; status/counts are not needed
+// to render the queue and must not trigger a second initial recommendation.
+const initialLocalPageCatalog = loadLocalPageCatalog().catch(() => {});
 loadSettings()
-  .then(loadStatus)
-  .then(() => loadLocalPageCatalog().catch(() => {}))
+  .then(() => initialLocalPageCatalog)
   .then(async () => {
     setActiveView(currentView);
-    const counts = loadQueueCounts();
-    const hathStatus = loadHathStatus({ announce: false }).catch(() => null);
-    await loadCurrentPage();
-    await Promise.all([counts, hathStatus]);
-    if (localPagesPreview) await openLocalPages();
+    try {
+      await loadCurrentPage();
+      if (localPagesPreview) await openLocalPages();
+    } finally {
+      initialPageLoading = false;
+      loadStatus().catch(() => {});
+      loadQueueCounts();
+      loadHathStatus({ announce: false }).catch(() => {});
+    }
   })
   .catch((error) => setStatus(error.message, true));
 

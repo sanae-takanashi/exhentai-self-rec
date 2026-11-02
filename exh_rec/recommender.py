@@ -2826,7 +2826,9 @@ def related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list
 def _build_related_feedback_reference_index(conn: sqlite3.Connection) -> dict[str, list[dict]]:
     rows = conn.execute(
         """
-        SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
+        SELECT g.url, g.title, g.title_jpn, g.parent_url, g.category,
+               g.uploader, g.page_count, g.tags_json,
+               f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
                f.feedback_created_at,
                m.kind AS user_mark_kind, m.created_at AS mark_created_at, m.updated_at AS mark_updated_at
         FROM galleries g
@@ -2856,7 +2858,9 @@ def _build_related_feedback_reference_index(conn: sqlite3.Connection) -> dict[st
     index: dict[str, list[dict]] = {}
     rated_payloads: list[tuple[str, dict]] = []
     for row in rows:
-        gallery = apply_feedback_state(gallery_item_from_row(row))
+        gallery = dict(row)
+        gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
+        apply_feedback_state(gallery)
         payload = related_feedback_payload(gallery)
         gallery_url = normalize_gallery_url(gallery.get("url"))
         if gallery_url:
