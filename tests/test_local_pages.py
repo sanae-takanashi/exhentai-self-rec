@@ -63,6 +63,25 @@ class LocalPagesTest(unittest.TestCase):
         self.assertEqual(item["metadata_status"], "ambiguous")
         self.assertIsNone(item["url"])
 
+    def test_confirmed_metadata_is_visible_without_rebuilding_local_samples(self):
+        before_index = (self.root / "index.json").read_bytes()
+        before = self.library.compare("2-1280", self.conn)["item"]
+        self.assertEqual(before["metadata_status"], "missing")
+        self.conn.execute("INSERT INTO galleries VALUES ('2', 'Fetched metadata', 'https://exhentai.org/g/2/abc/')")
+        self.conn.commit()
+        changes = self.conn.total_changes
+        after = self.library.compare("2-1280", self.conn)["item"]
+        catalog_item = next(item for item in self.library.catalog(self.conn)["items"] if item["gid"] == "2")
+        self.assertEqual(after["metadata_status"], "matched")
+        self.assertEqual(after["title"], "Fetched metadata")
+        self.assertEqual(after["url"], "https://exhentai.org/g/2/abc/")
+        self.assertEqual(catalog_item, after)
+        self.assertEqual(after["pages"], before["pages"])
+        self.assertEqual(after["cover"], before["cover"])
+        self.assertEqual(self.library.image(self.digest)[0], self.blob)
+        self.assertEqual((self.root / "index.json").read_bytes(), before_index)
+        self.assertEqual(self.conn.total_changes, changes)
+
     def test_invalid_site_url_never_becomes_link(self):
         self.conn.execute("UPDATE galleries SET url='javascript:alert(1)'")
         self.assertIsNone(self.library.catalog(self.conn)["items"][0]["url"])

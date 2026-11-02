@@ -541,6 +541,8 @@ The default only generates a plan and never reads saved authentication settings.
 ```powershell
 .\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-plan --limit 3
 .\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-pilot --limit 3 --max-requests 9 --execute
+.\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-rest-plan --limit 100 --reuse data/hath-recovery-pilot
+.\.venv\Scripts\python.exe scripts/recover_hath_metadata.py --output data/hath-recovery-rest --limit 100 --max-requests 39 --reuse data/hath-recovery-pilot --execute
 ```
 
 Use a new output directory each time. `--database` and `--library` override
@@ -559,14 +561,45 @@ Local filename positions are not verified site page numbers. Resized files,
 visibility, saved filters and search indexing can prevent matches, so
 `no_visible_hits` never means a gallery does not exist.
 
-`plan.json`, durable per-lookup `events.jsonl`, `report.json` and `report.md`
+`--reuse DIRECTORY` (repeatable, up to ten explicit directories) replays only
+validated successful lookups from that directory's `plan.json` and durable
+`events.jsonl`. No `report.json` is required after interruption. The current
+library index and selected sample hashes must match; evidence older than 24
+hours, conflicting results, malformed/truncated journals, unknown query types
+and unsafe URLs fail closed before reading saved login settings. Legacy events
+use the source plan timestamp; replay preserves original observation times and
+cannot refresh expired evidence. Changed login visibility or search filters may
+make cached results stale even within 24 hours; omit `--reuse` for fresh evidence.
+This is explicitly selected local evidence, not a current-site verification.
+
+Dry-run counts show `reusable_queries` and `new_queries`. The request budget
+counts only new network requests; the report counts unique `reused_lookups`
+and fully `reused_records` separately. Reused successes are durably journaled in
+the new output too, so later runs need only that checkpoint. A fully cached
+execution reads no saved authentication settings and creates no network client.
+The example budget of 39 assumes sixteen three-query records with nine reusable
+lookups; use the current dry-run counts rather than assuming that budget fits.
+
+`plan.json`, durable per-lookup `events.jsonl`, `report.json`, `report.md`,
+`repair-preview.json` and `repair-preview.md`
 stay private under ignored `data/`; they contain candidate links and file
-fingerprints, not cookies, HTML, titles or response bodies. Events are evidence,
-not automatic cross-run resume. Interrupted outputs are retained, never
-overwritten. `partial`/`stopped` reports retain pending counts; `completed_scope`
+fingerprints, not cookies, HTML, titles or response bodies. Interrupted outputs
+are retained, never overwritten. `partial`/`stopped` reports retain pending counts; `completed_scope`
 means the selected work covered all missing records, not exhaustive search
 pagination. No production URL repair, preference labels, model updates,
 gallery-detail requests, image downloads or service restarts occur.
+
+The repair preview rechecks the database and lists a candidate for a later
+normal metadata fetch only when all queries completed, no result page was
+truncated, the original gid and two distinct local samples corroborate one
+unambiguous original URL. Update-chain and shared-image matches remain manual
+review candidates. This is not a database patch: explicit confirmation, a real
+metadata fetch, fresh identity checks and a recoverable apply/readback workflow
+are still required. No titles, tags or parent/version relationships are invented.
+The Settings login check distinguishes empty responses, explicit visible misses,
+login/access challenges and unrecognized pages; an empty search never verifies
+login or proves gallery absence. Restart through the normal launcher when loading
+updated backend diagnostics; this CLI does not restart the application.
 
 For a stopped search response, `stop_diagnostics` and the corresponding event
 contain only allowlisted boolean markers and bounded counts, such as HTTP

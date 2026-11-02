@@ -370,6 +370,33 @@ class ParserTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["gallery_count"], 0)
 
+    def test_check_access_distinguishes_empty_miss_access_and_unknown_without_echoing_body(self):
+        cases = [("", "empty_response"), ("  \n", "empty_response"),
+                 ("No hits found", "no_visible_hits"), ("No unfiltered results found", "no_visible_hits"),
+                 ("Sad Panda", "access_required"), ("You must be logged in", "access_required"),
+                 ('<input name="password">', "access_required"),
+                 ('<form id="challenge-form">', "access_challenge"),
+                 ("Temporarily banned due to an excessive request rate", "rate_limited"),
+                 ("<html>FAKE_SECRET unknown page</html>", "unrecognized_page")]
+        for html, reason in cases:
+            with self.subTest(reason=reason), patch("exh_rec.exhentai.fetch_page", return_value=html):
+                result = check_access("fake=FAKE_SECRET")
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], reason)
+            self.assertNotIn("FAKE_SECRET", str(result))
+
+    def test_check_access_challenge_is_not_success_even_with_gallery_links(self):
+        html = '<a class="glink" href="https://exhentai.org/g/1/abcdef/">Gallery</a><form id="challenge-form">'
+        with patch("exh_rec.exhentai.fetch_page", return_value=html):
+            result = check_access("fake=secret")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "access_challenge")
+
+    def test_check_access_does_not_mistake_gallery_title_for_login_failure(self):
+        html = '<a class="glink" href="https://exhentai.org/g/1/abcdef/">Sad Panda challenge-form</a>'
+        with patch("exh_rec.exhentai.fetch_page", return_value=html):
+            self.assertTrue(check_access("fake=secret")["ok"])
+
     def test_normalize_cookie_header_keeps_regular_cookie_header(self):
         self.assertEqual(
             normalize_cookie_header("Cookie: ipb_member_id=123; ipb_pass_hash=abc; sk=xyz"),

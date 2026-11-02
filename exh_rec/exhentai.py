@@ -560,13 +560,25 @@ def format_posted(posted: str) -> str:
 
 def check_access(cookie_header: str, proxy_url: str = "") -> dict:
     page_html = fetch_page(cookie_header, BASE_URL, timeout=15, proxy_url=proxy_url)
+    def failure(reason, message):
+        return {"ok": False, "gallery_count": 0, "reason": reason, "message": message}
+
+    if not page_html.strip():
+        return failure("empty_response", "The site returned an empty response; login could not be verified")
+    if temporary_ban_detected(page_html):
+        return failure("rate_limited", "The site reported a request-rate limit; stop requests and try later")
+    if re.search(r"cf-chl-|verify you are human|id\s*=\s*['\"]?challenge-form\b|name\s*=\s*['\"]?captcha\b", page_html, re.I):
+        return failure("access_challenge", "The site returned an access challenge; login could not be verified")
+    if re.search(r"name\s*=\s*['\"]?password\b", page_html, re.I):
+        return failure("access_required", "The site requested login or access verification; check saved login locally")
     galleries = parse_gallery_list(page_html)
-    lower_html = page_html.lower()
     if galleries:
-        return {"ok": True, "gallery_count": len(galleries), "message": f"Access ok; saw {len(galleries)} galleries"}
-    if "exhentai.org" in lower_html and ("login" in lower_html or "sad panda" in lower_html):
-        return {"ok": False, "gallery_count": 0, "message": "Cookie did not expose gallery listings"}
-    return {"ok": False, "gallery_count": 0, "message": "Fetched page, but no gallery listings were found"}
+        return {"ok": True, "gallery_count": len(galleries), "reason": "visible_galleries", "message": f"Access ok; saw {len(galleries)} galleries"}
+    if re.search(r"sad\s*panda|you are not logged in|requires? you to log (?:on|in)|must be logged (?:on|in)", page_html, re.I):
+        return failure("access_required", "The site requested login or access verification; check saved login locally")
+    if re.search(r"\bNo hits found\b|\bNo unfiltered results found\b", page_html, re.I):
+        return failure("no_visible_hits", "The search returned no visible results; this does not verify login or prove galleries are absent")
+    return failure("unrecognized_page", "The response was not a recognized gallery listing; login could not be verified")
 
 
 def fetch_gallery_detail(cookie_header: str, gallery: Gallery, delay: float = 1.0, proxy_url: str = "") -> Gallery:

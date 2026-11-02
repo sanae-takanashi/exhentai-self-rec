@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 
 from .exhentai import LinkTitleParser, normalize_cookie_header, valid_cookie_header
-from .local_pages import LocalPageLibrary, MAX_INDEX, read_regular
+from .local_pages import ASSET, KEY, LocalPageLibrary, MAX_INDEX, read_regular
 from .net import normalize_proxy_url, patched_socks_create_connection, temporary_ban_detected
 
 
@@ -34,6 +34,10 @@ DIAGNOSTIC_FLAGS = frozenset({"listing_marker", "search_form", "login_marker", "
 DIAGNOSTIC_COUNTS = frozenset({"response_bytes", "text_chars", "html_tags", "forms", "images",
                                "anchors", "gallery_anchors", "canonical_candidates", "missing_slash_candidates",
                                "http_gallery_candidates"})
+STOP_REASONS = frozenset({"rate_limited", "access_required", "redirect_blocked", "empty_search_response",
+                          "unrecognized_search_page", "http_error", "transport_failed", "response_limit",
+                          "unsupported_response_encoding", "invalid_search_evidence", "lookup_failed"})
+MAX_REUSE_AGE_SECONDS = 24 * 60 * 60
 
 
 def safe_diagnostics(value):
@@ -272,10 +276,124 @@ def summarize_candidate(gid, candidate):
     return "shared_sample_other_gid"
 
 
-def recover(plan, lookup, max_requests=12, record=lambda result: None):
+def query_keys(row):
+    return [("gid", row["gid"])] + [("sha1", sample["sha1"]) for sample in row["samples"]]
+
+
+def search_evidence(result):
+    found = []
+    if not isinstance(result["candidates"], list):
+        raise RecoveryError("invalid_search_evidence")
+    for candidate in result["candidates"]:
+        url = candidate["url"]
+        gid = gallery_identity(url)
+        if candidate.get("gid", gid) != gid:
+            raise RecoveryError("invalid_search_evidence")
+        found.append({"url": url, "gid": gid})
+    if (len(found) > 100 or len({row["url"] for row in found}) != len(found)
+            or type(result["has_more"]) is not bool
+            or result["outcome"] != ("candidates" if found else "no_visible_hits")
+            or (not found and result["has_more"])):
+        raise RecoveryError("invalid_search_evidence")
+    return {"candidates": found, "has_more": result["has_more"], "outcome": result["outcome"]}
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RecoveryError("invalid_reuse_evidence")
+        result[key] = value
+    return result
+
+
+def recent_timestamp(value, now):
+    stamp = datetime.fromisoformat(value)
+    if stamp.tzinfo is None or not -300 <= (now - stamp).total_seconds() <= MAX_REUSE_AGE_SECONDS:
+        raise RecoveryError("stale_reuse_evidence")
+    return stamp.isoformat()
+
+
+def load_reuse(directories, plan, now=None):
+    """Rebuild successful lookups, not completion labels, from explicit private journals."""
+    if len(directories) > 10:
+        raise RecoveryError("invalid_reuse_evidence")
+    now = now or datetime.now(timezone.utc)
+    current = {row["key"]: row for row in plan["selected"]}
+    cache, sources = {}, []
+    for directory in directories:
+        directory = Path(directory).absolute()
+        if str(directory).startswith(("\\\\", "//")):
+            raise RecoveryError("invalid_reuse_evidence")
+        try:
+            plan_bytes = read_regular(directory / "plan.json", MAX_INDEX)
+            journal = read_regular(directory / "events.jsonl", MAX_INDEX)
+            old = json.loads(plan_bytes, object_pairs_hook=unique_object)
+            if (old["schema"] != SCHEMA or old["read_only"] is not True
+                    or old["library_index_sha256"] != plan["library_index_sha256"]
+                    or not isinstance(old["selected"], list) or not 0 < len(old["selected"]) <= 100):
+                raise RecoveryError("invalid_reuse_evidence")
+            created_at = recent_timestamp(old["created_at"], now)
+            allowed, relevant, seen = set(), set(), set()
+            for row in old["selected"]:
+                if (not KEY.fullmatch(row["key"]) or row["key"] != f"{row['gid']}-{row['resolution']}"
+                        or row["key"] in seen or not isinstance(row["samples"], list)
+                        or not 1 <= len(row["samples"]) <= 2):
+                    raise RecoveryError("invalid_reuse_evidence")
+                seen.add(row["key"])
+                for sample in row["samples"]:
+                    if (not ASSET.fullmatch(sample["sha256"]) or type(sample["position"]) is not int
+                            or sample["position"] <= 0):
+                        raise RecoveryError("invalid_reuse_evidence")
+                pairs = query_keys(row)
+                for kind, value in pairs:
+                    search_url(kind, value)
+                allowed.update(pairs)
+                active = current.get(row["key"])
+                if active is not None:
+                    if row["samples"] != active["samples"]:
+                        raise RecoveryError("changed_reuse_samples")
+                    relevant.update(pairs)
+            source = hashlib.sha256(journal).hexdigest()
+            lines = journal.splitlines()
+            if len(lines) > 301 or (journal and not journal.endswith(b"\n")):
+                raise RecoveryError("invalid_reuse_evidence")
+            events = [json.loads(line, object_pairs_hook=unique_object) for line in lines]
+            stopped, reused = False, 0
+            for event in events:
+                pair = event["kind"], event["value"]
+                if stopped or pair not in allowed:
+                    raise RecoveryError("invalid_reuse_evidence")
+                if event["status"] == "stopped":
+                    if event["reason"] not in STOP_REASONS:
+                        raise RecoveryError("invalid_reuse_evidence")
+                    stopped = True
+                    continue
+                if event["status"] != "ok":
+                    raise RecoveryError("invalid_reuse_evidence")
+                evidence = search_evidence(event)
+                observed_at = recent_timestamp(event.get("observed_at", created_at), now)
+                if pair in relevant:
+                    if pair in cache and search_evidence(cache[pair]) != evidence:
+                        raise RecoveryError("conflicting_reuse_evidence")
+                    cache[pair] = {**evidence, "observed_at": observed_at, "reused_from": source}
+                    reused += 1
+            sources.append({"plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
+                            "events_sha256": source, "created_at": created_at, "reusable_events": reused})
+        except RecoveryError:
+            raise
+        except Exception:
+            raise RecoveryError("invalid_reuse_evidence") from None
+    return cache, sources
+
+
+def recover(plan, lookup, max_requests=12, record=lambda result: None, reuse=None):
     if type(max_requests) is not int or not 1 <= max_requests <= 300:
         raise RecoveryError("invalid_request_limit")
-    cache, items, request_count, stopped = {}, [], 0, None
+    cache = {pair: {**search_evidence(value), "observed_at": value["observed_at"],
+                    "reused_from": value["reused_from"]} for pair, value in (reuse or {}).items()}
+    reused_keys, recorded = set(cache), set()
+    items, request_count, stopped, used_reuse = [], 0, None, set()
     for row in plan["selected"]:
         item = {**row, "lookups": [], "candidates": [], "complete": False}
         items.append(item)
@@ -291,7 +409,7 @@ def recover(plan, lookup, max_requests=12, record=lambda result: None):
 
         for url in row["local_candidates"]:
             add(url, "local_url")
-        queries = [("gid", row["gid"])] + [("sha1", sample["sha1"]) for sample in row["samples"]]
+        queries = query_keys(row)
         for kind, value in queries:
             search_url(kind, value)
             if (kind, value) not in cache:
@@ -301,30 +419,22 @@ def recover(plan, lookup, max_requests=12, record=lambda result: None):
                 request_count += 1
                 try:
                     result = lookup(kind, value)
-                    # Persist only the allowlisted response shape, never raw transport data.
-                    found = []
-                    if not isinstance(result["candidates"], list):
-                        raise RecoveryError("invalid_search_evidence")
-                    for candidate in result["candidates"]:
-                        url = candidate["url"]
-                        found.append({"url": url, "gid": gallery_identity(url)})
-                    if (len(found) > 100 or len({row["url"] for row in found}) != len(found)
-                            or type(result["has_more"]) is not bool
-                            or result["outcome"] != ("candidates" if found else "no_visible_hits")
-                            or (not found and result["has_more"])):
-                        raise RecoveryError("invalid_search_evidence")
-                    cache[kind, value] = {"candidates": found, "has_more": result["has_more"], "outcome": result["outcome"]}
+                    cache[kind, value] = {**search_evidence(result), "observed_at": datetime.now(timezone.utc).isoformat()}
                 except Exception as exc:
-                    reasons = {"rate_limited", "access_required", "redirect_blocked", "empty_search_response", "unrecognized_search_page", "http_error", "transport_failed", "response_limit", "unsupported_response_encoding", "invalid_search_evidence"}
-                    stopped = str(exc) if isinstance(exc, RecoveryError) and str(exc) in reasons else "lookup_failed"
+                    stopped = str(exc) if isinstance(exc, RecoveryError) and str(exc) in STOP_REASONS else "lookup_failed"
                     diagnostics = safe_diagnostics(exc.diagnostics) if isinstance(exc, RecoveryError) else {}
                     if diagnostics:
                         item["stop_diagnostics"] = diagnostics
                     record({"kind": kind, "value": value, "status": "stopped", "reason": stopped, **({"diagnostics": diagnostics} if diagnostics else {})})
                     break
-                # A failed durable write must abort, not turn into search evidence.
+            # Journal reused successes too, so a later run has a self-contained checkpoint.
+            # A failed durable write must abort before issuing any later request.
+            if (kind, value) not in recorded:
                 record({"kind": kind, "value": value, "status": "ok", **cache[kind, value]})
+                recorded.add((kind, value))
             evidence = cache[kind, value]
+            if (kind, value) in reused_keys:
+                used_reuse.add((kind, value))
             item["lookups"].append({"kind": kind, "value": value, **evidence})
             for candidate in evidence["candidates"]:
                 add(candidate["url"], kind, value if kind == "sha1" else None)
@@ -335,9 +445,12 @@ def recover(plan, lookup, max_requests=12, record=lambda result: None):
     complete = sum(item["complete"] for item in items)
     return {"schema": SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(), "read_only": True,
             "library_index_sha256": plan["library_index_sha256"], "items": items,
+            "reuse_sources": plan.get("reuse_sources", []),
             "summary": {"status": "stopped" if stopped and stopped != "request_budget" else "partial" if complete < plan["missing"] else "completed_scope",
                         "stop_reason": stopped, "missing": plan["missing"], "selected": len(plan["selected"]),
                         "completed": complete, "pending": plan["missing"] - complete, "requests": request_count,
+                        "reused_lookups": len(used_reuse),
+                        "reused_records": sum(item["complete"] and all(pair in reused_keys for pair in query_keys(item)) for item in items),
                         "with_candidates": sum(bool(item["candidates"]) for item in items),
                         "relationships": dict(Counter(candidate["relationship"] for item in items for candidate in item["candidates"]))},
             "limitations": ["Candidates only; no production writes, model changes, labels, downloads or gallery-detail fetches.",
@@ -352,6 +465,63 @@ def write_new(path, value):
     with Path(path).open("x", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=True, indent=2)
         stream.write("\n")
+
+
+def repair_preview(report, database):
+    """Classify evidence for a later, explicitly confirmed normal metadata fetch."""
+    exact_urls = {}
+    for item in report["items"]:
+        for candidate in item["candidates"]:
+            if candidate["gid"] == item["gid"]:
+                exact_urls.setdefault(item["gid"], set()).add(candidate["url"])
+    rows = []
+    with closing(connect_read_only(database)) as conn:
+        conn.execute("BEGIN")
+        for item in report["items"]:
+            known = conn.execute("SELECT COUNT(*) FROM galleries WHERE gid=?", (item["gid"],)).fetchone()[0]
+            exact = [candidate for candidate in item["candidates"]
+                     if summarize_candidate(item["gid"], candidate) == "exact_gid_and_sample"
+                     and len(set(candidate["sample_matches"])) >= 2]
+            paginated = any(lookup["has_more"] for lookup in item["lookups"])
+            url = None
+            if known:
+                action, reason = "already_present", "metadata_now_present"
+            elif not item["complete"]:
+                action, reason = "needs_review", "incomplete_queries"
+            elif paginated:
+                action, reason = "needs_review", "candidate_enumeration_partial"
+            elif len(exact_urls.get(item["gid"], ())) > 1:
+                action, reason = "needs_review", "conflicting_original_urls"
+            elif len(exact) == 1:
+                action, reason = "fetch_metadata_after_confirmation", "same_gid_and_two_distinct_samples"
+                url = exact[0]["url"]
+            elif item["candidates"]:
+                action, reason = "needs_review", "identity_not_sufficiently_corroborated"
+            else:
+                action, reason = "no_visible_candidates", "not_proof_of_absence"
+            rows.append({"key": item["key"], "gid": item["gid"], "resolution": item["resolution"],
+                         "action": action, "reason": reason, "candidate_url": url,
+                         "relationships": dict(Counter(candidate["relationship"] for candidate in item["candidates"]))})
+    return {"schema": "hath-metadata-repair-preview-v1", "created_at": datetime.now(timezone.utc).isoformat(),
+            "production_read_only": True, "requires_confirmation": True, "can_apply": False,
+            "library_index_sha256": report["library_index_sha256"], "items": rows,
+            "summary": {"records": len(rows), "unprocessed": report["summary"]["pending"],
+                        "actions": dict(Counter(row["action"] for row in rows)),
+                        "unique_ready_galleries": len({row["gid"] for row in rows if row["candidate_url"]})},
+            "limitations": ["Preview only: candidate evidence is not gallery metadata or a database patch.",
+                            "After confirmation, fetch real metadata through the normal site path; do not fabricate titles or tags.",
+                            "Do not relink an original gallery to an update-chain or shared-image candidate.",
+                            "Recheck missing metadata, source samples and candidate identity before applying any later change."]}
+
+
+def markdown_repair_preview(preview):
+    lines = ["# Metadata Repair Preview", "", "No production changes. Explicit confirmation is required before metadata fetching or applying changes.", "",
+             "| Local gid / resolution | Action | Reason | Candidate |", "| --- | --- | --- | --- |"]
+    for row in preview["items"]:
+        candidate = f"[Inspect]({row['candidate_url']})" if row["candidate_url"] else "-"
+        lines.append(f"| {row['gid']} / {row['resolution']} | {row['action']} | {row['reason']} | {candidate} |")
+    lines += ["", "## Limits", ""] + ["- " + value for value in preview["limitations"]]
+    return "\n".join(lines) + "\n"
 
 
 def validate_output_directory(path):
@@ -373,7 +543,7 @@ def validate_output_directory(path):
 def markdown_report(report):
     summary = report["summary"]
     lines = ["# H@H Recovery Candidates", "", "Read-only evidence. No links were written back to the production database.", "",
-             f"Status: {summary['status']}; completed {summary['completed']}/{summary['missing']}; pending {summary['pending']}; requests {summary['requests']}; stop reason: {summary['stop_reason'] or 'none'}.", "",
+             f"Status: {summary['status']}; completed {summary['completed']}/{summary['missing']}; pending {summary['pending']}; new requests {summary['requests']}; reused lookups {summary.get('reused_lookups', 0)}; stop reason: {summary['stop_reason'] or 'none'}.", "",
              "| Local gid / resolution | Candidate gid | Relationship | Matching samples | Candidate |", "| --- | --- | --- | --- | --- |"]
     for item in report["items"]:
         for candidate in item["candidates"]:

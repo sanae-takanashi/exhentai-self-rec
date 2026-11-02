@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exh_rec.hath_recovery import RecoveryClient, markdown_report, recover, recovery_plan, runtime_settings, validate_output_directory, write_new
+from exh_rec.hath_recovery import RecoveryClient, load_reuse, markdown_repair_preview, markdown_report, query_keys, recover, recovery_plan, repair_preview, runtime_settings, validate_output_directory, write_new
 from exh_rec.local_pages import LocalPageLibrary, read_regular
 
 
@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--max-requests", type=int, default=12)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--reuse", type=Path, action="append", default=[], metavar="DIRECTORY",
+                        help="Reuse validated successful lookups from a prior plan/journal (24-hour maximum age).")
     args = parser.parse_args()
     try:
         args.output = validate_output_directory(args.output)
@@ -35,23 +37,33 @@ def main():
                 directory = ROOT / directory
             database = directory / "recommender.sqlite3"
         plan = recovery_plan(LocalPageLibrary(args.library), database, args.limit)
-        client = RecoveryClient(*runtime_settings(database)) if args.execute else None
+        reuse, sources = load_reuse(args.reuse, plan)
+        plan["reuse_sources"] = sources
+        plan["reusable_queries"] = len(reuse)
+        plan["new_queries"] = len({pair for row in plan["selected"] for pair in query_keys(row)} - reuse.keys())
+        client = RecoveryClient(*runtime_settings(database)) if args.execute and plan["new_queries"] else None
         validate_output_directory(args.output)
         args.output.mkdir(parents=True, exist_ok=False)
         write_new(args.output / "plan.json", plan)
-        if client is None:
-            print(json.dumps({"ok": True, "mode": "plan", "missing": plan["missing"], "selected": len(plan["selected"]), "unselected": plan["unselected"]}))
+        if not args.execute:
+            print(json.dumps({"ok": True, "mode": "plan", "missing": plan["missing"], "selected": len(plan["selected"]), "unselected": plan["unselected"],
+                              "reusable_queries": plan["reusable_queries"], "new_queries": plan["new_queries"]}))
             return 0
         with (args.output / "events.jsonl").open("x", encoding="utf-8") as stream:
             def record(event):
                 stream.write(json.dumps(event, ensure_ascii=True) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            report = recover(plan, client.lookup, args.max_requests, record)
+            report = recover(plan, client.lookup if client else None, args.max_requests, record, reuse)
         write_new(args.output / "report.json", report)
         with (args.output / "report.md").open("x", encoding="utf-8") as stream:
             stream.write(markdown_report(report))
-        print(json.dumps({"ok": True, "mode": "execute", "read_only": True, "summary": report["summary"]}))
+        preview = repair_preview(report, database)
+        write_new(args.output / "repair-preview.json", preview)
+        with (args.output / "repair-preview.md").open("x", encoding="utf-8") as stream:
+            stream.write(markdown_repair_preview(preview))
+        print(json.dumps({"ok": True, "mode": "execute", "read_only": True, "summary": report["summary"],
+                          "repair_preview": preview["summary"]}))
         return 0
     except Exception:
         print('{"ok": false, "error": "recovery_failed"}')

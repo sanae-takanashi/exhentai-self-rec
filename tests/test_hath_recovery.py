@@ -1,4 +1,5 @@
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
@@ -461,12 +462,235 @@ class PlanAndRecoveryTest(unittest.TestCase):
             code, result = self.run_cli(output, "--limit", "1", "--execute")
         self.assertEqual(code, 0)
         self.assertEqual(result["summary"]["status"], "partial")
-        self.assertEqual({path.name for path in output.iterdir()}, {"plan.json", "events.jsonl", "report.json", "report.md"})
+        self.assertEqual({path.name for path in output.iterdir()}, {"plan.json", "events.jsonl", "report.json", "report.md", "repair-preview.json", "repair-preview.md"})
         events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
         self.assertEqual(len(events), 3)
         self.assertNotIn("https://", json.dumps(result))
         self.assertTrue(all("FAKE_SECRET" not in path.read_text() for path in output.iterdir()))
         self.assertEqual(before, hashlib.sha256(self.database.read_bytes()).hexdigest())
+
+    def checkpoint(self, name="prior", limit=1, max_requests=12, lookup=None):
+        directory = self.root / name
+        directory.mkdir()
+        plan, events = self.plan(limit), []
+        recovery.recover(plan, lookup or (lambda *args: found()), max_requests, events.append)
+        recovery.write_new(directory / "plan.json", plan)
+        (directory / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        return directory
+
+    def test_reuse_completes_prior_records_without_spending_new_request_budget(self):
+        directory = self.checkpoint()
+        plan = self.plan()
+        cache, sources = recovery.load_reuse([directory], plan)
+        plan["reuse_sources"] = sources
+        calls, events = [], []
+        def lookup(kind, value):
+            calls.append((kind, value))
+            return found("2")
+        result = recovery.recover(plan, lookup, 3, events.append, cache)
+        self.assertEqual(result["summary"]["status"], "completed_scope")
+        self.assertEqual(result["summary"]["requests"], 3)
+        self.assertEqual(result["summary"]["reused_lookups"], 3)
+        self.assertEqual(result["summary"]["reused_records"], 1)
+        self.assertEqual(len(events), 6)
+        self.assertTrue(all("reused_from" in event for event in events[:3]))
+        self.assertTrue(all(pair not in cache for pair in calls))
+        self.assertEqual(result["reuse_sources"], sources)
+
+    def test_reuse_recovers_successes_from_interrupted_run_without_report(self):
+        directory = self.checkpoint(max_requests=1)
+        cache, _ = recovery.load_reuse([directory], self.plan())
+        result = recovery.recover(self.plan(), lambda *args: found(), 5, reuse=cache)
+        self.assertEqual(result["summary"]["status"], "completed_scope")
+        self.assertEqual(result["summary"]["requests"], 5)
+        self.assertEqual(result["summary"]["reused_lookups"], 1)
+        self.assertEqual(result["summary"]["reused_records"], 0)
+
+    def test_reuse_never_promotes_stopped_events_to_successes(self):
+        def stopped(*args):
+            raise recovery.RecoveryError("access_required")
+        directory = self.checkpoint(lookup=stopped)
+        cache, _ = recovery.load_reuse([directory], self.plan())
+        self.assertEqual(cache, {})
+
+    def test_full_cached_cli_does_not_read_auth_or_construct_network_client(self):
+        directory = self.checkpoint()
+        before = hashlib.sha256(self.database.read_bytes()).hexdigest()
+        output = self.root / "all-cached"
+        with patch.object(cli, "runtime_settings", side_effect=AssertionError("no auth")), patch.object(cli, "RecoveryClient", side_effect=AssertionError("no network")):
+            code, result = self.run_cli(output, "--limit", "1", "--reuse", str(directory), "--execute")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["summary"]["requests"], 0)
+        self.assertEqual(result["summary"]["reused_lookups"], 3)
+        self.assertEqual(before, hashlib.sha256(self.database.read_bytes()).hexdigest())
+        cache, _ = recovery.load_reuse([output], self.plan())
+        original, _ = recovery.load_reuse([directory], self.plan())
+        self.assertEqual([value["observed_at"] for value in cache.values()], [value["observed_at"] for value in original.values()])
+
+    def test_dry_run_reuse_reports_new_work_without_authentication(self):
+        directory = self.checkpoint()
+        with patch.object(cli, "runtime_settings", side_effect=AssertionError("no auth")):
+            code, result = self.run_cli(self.root / "reuse-plan", "--reuse", str(directory))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["reusable_queries"], 3)
+        self.assertEqual(result["new_queries"], 3)
+
+    def test_reuse_rejects_changed_index_or_sample_bindings(self):
+        for field in ("library_index_sha256", "samples"):
+            with self.subTest(field=field):
+                directory = self.checkpoint(field)
+                path = directory / "plan.json"
+                old = json.loads(path.read_text())
+                if field == "samples":
+                    old["selected"][0]["samples"][0]["sha256"] = "a" * 64
+                else:
+                    old[field] = "b" * 64
+                path.write_text(json.dumps(old), encoding="utf-8")
+                with self.assertRaises(recovery.RecoveryError):
+                    recovery.load_reuse([directory], self.plan())
+
+    def test_reuse_bounds_sources_and_rejects_linked_input_before_auth_reads(self):
+        directory = self.checkpoint()
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.load_reuse([directory] * 11, self.plan())
+        plan = self.plan()
+        with patch.object(recovery, "read_regular", side_effect=ValueError("linked_local_asset")):
+            with self.assertRaisesRegex(recovery.RecoveryError, "invalid_reuse_evidence"):
+                recovery.load_reuse([directory], plan)
+        path = directory / "plan.json"
+        original = json.loads(path.read_text())
+        for mutation in ({"schema": "unknown"}, {"read_only": False}, {"selected": []}):
+            path.write_text(json.dumps({**original, **mutation}), encoding="utf-8")
+            with patch.object(cli, "runtime_settings", side_effect=AssertionError("no auth")):
+                code, result = self.run_cli(self.root / "invalid-plan", "--reuse", str(directory), "--execute")
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"], "recovery_failed")
+            self.assertFalse((self.root / "invalid-plan").exists())
+
+    def test_reuse_rejects_stale_future_or_naive_timestamps(self):
+        now = datetime.now(timezone.utc)
+        stamps = [(now - timedelta(hours=25)).isoformat(), (now + timedelta(hours=1)).isoformat(), "2026-11-02T00:00:00"]
+        for index, stamp in enumerate(stamps):
+            directory = self.checkpoint("timestamp-" + str(index))
+            path = directory / "plan.json"
+            old = json.loads(path.read_text())
+            old["created_at"] = stamp
+            path.write_text(json.dumps(old), encoding="utf-8")
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.load_reuse([directory], self.plan(), now)
+
+    def test_replayed_evidence_cannot_refresh_its_original_observation_time(self):
+        directory = self.checkpoint()
+        path = directory / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        events[0]["observed_at"] = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        with self.assertRaisesRegex(recovery.RecoveryError, "stale_reuse_evidence"):
+            recovery.load_reuse([directory], self.plan())
+
+    def test_reuse_supports_legacy_events_without_observation_timestamps(self):
+        directory = self.checkpoint()
+        path = directory / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        for event in events:
+            event.pop("observed_at")
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        cache, _ = recovery.load_reuse([directory], self.plan())
+        self.assertEqual(len(cache), 3)
+        created = json.loads((directory / "plan.json").read_text())["created_at"]
+        self.assertTrue(all(value["observed_at"] == created for value in cache.values()))
+
+    def test_reuse_rejects_conflicting_successful_results(self):
+        first = self.checkpoint("first")
+        second = self.checkpoint("second", lookup=lambda *args: found("9"))
+        with self.assertRaisesRegex(recovery.RecoveryError, "conflicting_reuse_evidence"):
+            recovery.load_reuse([first, second], self.plan())
+
+    def test_reuse_rejects_malformed_truncated_duplicate_and_unplanned_events(self):
+        directory = self.checkpoint()
+        path = directory / "events.jsonl"
+        original = path.read_text()
+        event = json.loads(original.splitlines()[0])
+        unplanned = {**event, "value": "999"}
+        bad_gid = {**event, "candidates": [{**hit(), "gid": "2"}]}
+        invalid_url = {**event, "candidates": [{"url": "https://evil.invalid/g/1/abc/"}]}
+        events = [original.rstrip(), '{"kind":"gid","kind":"sha1"}\n', '{bad\n',
+                  json.dumps(unplanned) + "\n", json.dumps(bad_gid) + "\n", json.dumps(invalid_url) + "\n",
+                  json.dumps({**event, "status": "stopped", "reason": "access_required"}) + "\n" + original]
+        for text in events:
+            with self.subTest(text_length=len(text)):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(recovery.RecoveryError):
+                    recovery.load_reuse([directory], self.plan())
+
+    def test_reuse_strips_arbitrary_fields_instead_of_persisting_them(self):
+        directory = self.checkpoint()
+        path = directory / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        for event in events:
+            event["raw"] = "FAKE_SECRET"
+            event["candidates"][0]["title"] = "FAKE_SECRET"
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        cache, sources = recovery.load_reuse([directory], self.plan())
+        self.assertNotIn("FAKE_SECRET", json.dumps([list(cache.values()), sources]))
+
+    def test_reuse_retains_pagination_and_visible_miss_semantics(self):
+        for name, response in [("paginated", found(more=True)), ("miss", {"candidates": [], "has_more": False, "outcome": "no_visible_hits"})]:
+            directory = self.checkpoint(name, lookup=lambda *args: response)
+            cache, _ = recovery.load_reuse([directory], self.plan(1))
+            result = recovery.recover(self.plan(1), None, reuse=cache)
+            self.assertEqual(result["summary"]["requests"], 0)
+            self.assertEqual(result["items"][0]["lookups"][0]["outcome"], response["outcome"])
+            self.assertEqual(result["items"][0]["lookups"][0]["has_more"], response["has_more"])
+
+    def test_reused_journal_write_failure_prevents_later_network_calls(self):
+        cache, _ = recovery.load_reuse([self.checkpoint()], self.plan())
+        lookup = Mock()
+        def broken(event):
+            raise OSError("synthetic write failure")
+        with self.assertRaises(OSError):
+            recovery.recover(self.plan(), lookup, record=broken, reuse=cache)
+        lookup.assert_not_called()
+
+    def test_repair_preview_requires_confirmation_and_never_writes_metadata(self):
+        before = hashlib.sha256(self.database.read_bytes()).hexdigest()
+        result = recovery.recover(self.plan(1), lambda *args: found())
+        preview = recovery.repair_preview(result, self.database)
+        self.assertTrue(preview["production_read_only"])
+        self.assertTrue(preview["requires_confirmation"])
+        self.assertFalse(preview["can_apply"])
+        self.assertEqual(preview["summary"]["actions"], {"fetch_metadata_after_confirmation": 1})
+        self.assertEqual(preview["summary"]["unique_ready_galleries"], 1)
+        self.assertEqual(before, hashlib.sha256(self.database.read_bytes()).hexdigest())
+
+    def test_repair_preview_blocks_shared_sample_update_chain_and_partial_results(self):
+        cases = [recovery.recover(self.plan(1), lambda kind, value: found("9" if kind == "gid" else "8")),
+                 recovery.recover(self.plan(1), lambda *args: found(more=True)),
+                 recovery.recover(self.plan(1), lambda *args: found(), max_requests=2)]
+        for result in cases:
+            preview = recovery.repair_preview(result, self.database)
+            self.assertEqual(preview["items"][0]["action"], "needs_review")
+            self.assertIsNone(preview["items"][0]["candidate_url"])
+
+    def test_repair_preview_needs_two_distinct_samples_and_no_conflicting_original_urls(self):
+        plan = self.plan(1)
+        plan["selected"][0]["samples"] = [plan["selected"][0]["samples"][0]] * 2
+        result = recovery.recover(plan, lambda *args: found())
+        self.assertEqual(recovery.repair_preview(result, self.database)["items"][0]["action"], "needs_review")
+        def conflict(*args):
+            return {**found(), "candidates": [hit(), {"gid": "1", "url": "https://exhentai.org/g/1/bbcdef/"}]}
+        result = recovery.recover(self.plan(1), conflict)
+        preview = recovery.repair_preview(result, self.database)
+        self.assertEqual(preview["items"][0]["reason"], "conflicting_original_urls")
+
+    def test_repair_preview_rechecks_database_and_never_calls_missing_hits_absent(self):
+        result = recovery.recover(self.plan(1), lambda *args: found())
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.execute("INSERT INTO galleries VALUES ('1')")
+            conn.commit()
+        self.assertEqual(recovery.repair_preview(result, self.database)["items"][0]["action"], "already_present")
+        result = recovery.recover(self.plan(), lambda *args: {"candidates": [], "has_more": False, "outcome": "no_visible_hits"})
+        self.assertEqual(recovery.repair_preview(result, self.database)["items"][0]["reason"], "not_proof_of_absence")
 
     def test_cli_refuses_existing_output_and_hides_exception_details(self):
         with patch.object(cli, "runtime_settings", side_effect=AssertionError("no settings")):
