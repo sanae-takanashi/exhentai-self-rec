@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--limit", type=int, default=2)
     args = parser.parse_args()
     output_created = False
+    client = None
     try:
         if (args.fetch and args.apply) or ((args.fetch or args.apply) and not args.confirmed) or not 1 <= args.limit <= 25:
             raise RecoveryError("explicit_confirmation_required")
@@ -50,10 +51,12 @@ def main():
             batch = [target for target in missing if target["gid"] not in done][:args.limit]
             if not batch:
                 raise RecoveryError("no_pending_metadata")
-            entries = MetadataClient(*runtime_settings(database)).fetch(batch)
+            client = MetadataClient(*runtime_settings(database))
+            entries = client.fetch(batch)
             write_new(output / "metadata.json", {"schema": SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(),
                                                  "evidence": evidence, "entries": entries})
             result = {"ok": True, "mode": "fetch", "fetched": len(entries), "production_read_only": True}
+            write_new(output / "transport.json", client.diagnostics)
         elif args.apply:
             if len(staged) != len(targets):
                 raise RecoveryError("incomplete_metadata_stage")
@@ -67,6 +70,8 @@ def main():
     except Exception as exc:
         reason = str(exc) if isinstance(exc, RecoveryError) else "metadata_repair_failed"
         failure = {"ok": False, "error": reason}
+        if client is not None and client.diagnostics:
+            failure["diagnostics"] = client.diagnostics
         if output_created:
             try:
                 write_new(output / "failure.json", failure)

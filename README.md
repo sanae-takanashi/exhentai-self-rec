@@ -621,9 +621,15 @@ CLI runs; there is no cross-process rate limiter. Each fetch issues at most one
 official gdata API request (up to 25 galleries), with saved login/proxy settings,
 no redirects or retries, bounded responses and exact gid/token validation. It
 does not request cover bytes, page images, downloads or parent-chain metadata.
-Inspect the pilot before proceeding. A failed fetch leaves `failure.json` with
-only a fixed reason code when its output directory was created; no raw response
-or exception is saved. Stop on failures and investigate before another request.
+Inspect the pilot before proceeding. Text MIME types are accepted only when the
+bounded body is valid gdata JSON with every requested gid/token exactly matched;
+HTML challenge pages remain errors. A successful fetch writes `transport.json`.
+A failed fetch leaves `failure.json` with a fixed reason code and available
+boolean/count diagnostics (HTTP status, response size, MIME and JSON-shape
+markers) when its output directory was created. No raw response, headers,
+credentials or exception text is saved. Empty responses and API errors are
+distinguished from malformed JSON. Stop on failures and investigate before
+another request.
 
 All selected identities must have valid staged metadata before apply. Apply
 reserves a new private SQLite backup and receipt, takes a write lock, backs up
@@ -638,6 +644,15 @@ comparisons. Do not automatically restore a whole backup over later user work.
 The backup contains private settings, including saved authentication; keep every
 output under ignored `data/` and never publish it. This standalone workflow does
 not need a service restart.
+
+With the optional Playwright dependency used by `tests/browser_local_pages.cjs`,
+`node tests/browser_metadata_repair.cjs TARGETS_JSON OUTPUT_JSON [LOOPBACK_ORIGIN]`
+checks restored titles, native gallery links and loaded local images at desktop
+and mobile widths. The private targets document has a `targets` array containing
+`key` and `url` for each restored record. It runs headlessly, forwards only static
+and local-page GET requests, mocks settings and recommendations, and blocks all
+production mutations and external image requests. This verifies the Review-to-
+Local-Pages display path, not production recommendation ranking or label writes.
 
 For a stopped search response, `stop_diagnostics` and the corresponding event
 contain only allowlisted boolean markers and bounded counts, such as HTTP

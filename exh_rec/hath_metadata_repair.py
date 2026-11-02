@@ -17,7 +17,7 @@ from .hath_recovery import (
     load_reuse, recent_timestamp, recover, unique_object,
 )
 from .local_pages import MAX_INDEX, read_regular
-from .net import patched_socks_create_connection
+from .net import patched_socks_create_connection, temporary_ban_detected
 
 SCHEMA = "hath-metadata-stage-v1"
 FIELDS = ("gid", "token", "title", "title_jpn", "category", "uploader", "posted",
@@ -103,10 +103,20 @@ def validated_entry(entry, target):
     return result
 
 
-def parse_response(body, targets):
+def parse_response(body, targets, diagnostics=None):
     try:
+        if not body.strip():
+            raise RecoveryError("empty_metadata_response")
+        if temporary_ban_detected(body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body):
+            raise RecoveryError("rate_limited")
         response = json.loads(body, object_pairs_hook=unique_object)
+        if diagnostics is not None:
+            diagnostics["json_object"] = isinstance(response, dict)
+        if isinstance(response, dict) and response.get("error"):
+            raise RecoveryError("metadata_api_error")
         entries = response["gmetadata"]
+        if diagnostics is not None:
+            diagnostics["metadata_array"] = isinstance(entries, list)
         if not isinstance(entries, list) or len(entries) != len(targets):
             raise RecoveryError("incomplete_metadata_batch")
         by_gid = {}
@@ -126,7 +136,12 @@ def parse_response(body, targets):
 class MetadataClient(RecoveryClient):
     """Same saved transport policy, fixed official API origin; never visits a CDN."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diagnostics = {}
+
     def fetch(self, targets):
+        self.diagnostics = {}
         if not 0 < len(targets) <= 25:
             raise RecoveryError("invalid_metadata_batch")
         for target in targets:
@@ -156,14 +171,21 @@ class MetadataClient(RecoveryClient):
                 with opener.open(request, timeout=30) as response:
                     if response.geturl() != EH_API_URL:
                         raise RecoveryError("redirect_blocked")
-                    if response.headers.get_content_type() != "application/json":
-                        raise RecoveryError("unrecognized_metadata_response")
+                    media_type = response.headers.get_content_type()
+                    self.diagnostics = {"http_status": int(getattr(response, "status", 200)),
+                                        "json_content_type": media_type in {"application/json", "text/json"},
+                                        "html_content_type": media_type == "text/html"}
+                    if media_type not in {"application/json", "text/json", "text/plain", "text/html"}:
+                        raise RecoveryError("unsupported_metadata_media_type")
                     if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                         raise RecoveryError("unsupported_response_encoding")
                     body = response.read(MAX_RESPONSE + 1)
+                    self.diagnostics["response_bytes"] = len(body)
                     if len(body) > MAX_RESPONSE:
                         raise RecoveryError("response_limit")
-            return parse_response(body, targets)
+            # Some PHP API responses use a text MIME type. Only a valid, identity-checked
+            # gdata JSON document is accepted; HTML challenges still fail closed.
+            return parse_response(body, targets, self.diagnostics)
         except urllib.error.HTTPError as exc:
             reason = ("rate_limited" if exc.code in {429, 509} else "redirect_blocked" if 300 <= exc.code < 400
                       else "access_required" if exc.code in {401, 403} else "http_error")

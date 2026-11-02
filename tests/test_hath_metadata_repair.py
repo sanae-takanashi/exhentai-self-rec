@@ -63,7 +63,7 @@ class MetadataTransportTest(unittest.TestCase):
 
     def test_response_guards_and_sanitized_failures(self):
         cases = [(self.response(url="https://evil.invalid"), "redirect_blocked"),
-                    (self.response(content_type="text/html"), "unrecognized_metadata_response"),
+                    (self.response(content_type="image/png"), "unsupported_metadata_media_type"),
                     (fixtures.Response(b"x" * (repair.MAX_RESPONSE + 1), "application/json", repair.EH_API_URL), "response_limit")]
         encoded = self.response()
         encoded.headers["Content-Encoding"] = "gzip"
@@ -89,6 +89,27 @@ class MetadataTransportTest(unittest.TestCase):
             repair.MetadataClient("fake=FAKE_SECRET", "socks5h://proxy.invalid:1080").fetch([target()])
             self.assertEqual(socks.call_args.args[1:], ("proxy.invalid", 1080))
             self.assertTrue(socks.call_args.kwargs["rdns"])
+
+    def test_text_mime_requires_valid_json_and_exact_identities(self):
+        for media_type in ("text/html", "text/plain", "text/json"):
+            with self.subTest(media_type=media_type), patch.object(urllib.request, "build_opener") as build:
+                build.return_value.open.return_value = self.response(content_type=media_type)
+                client = repair.MetadataClient("fake=FAKE_SECRET")
+                self.assertEqual(client.fetch([target()]), [entry()])
+                self.assertTrue(client.diagnostics["json_object"])
+                self.assertTrue(client.diagnostics["metadata_array"])
+                self.assertNotIn("FAKE_SECRET", json.dumps(client.diagnostics))
+        for body, reason in [(b"", "empty_metadata_response"), (b"<html>FAKE_SECRET</html>", "unrecognized_metadata_response"),
+                             (b"Temporarily banned due to an excessive request rate", "rate_limited"),
+                             (b'{"error":"FAKE_SECRET"}', "metadata_api_error")]:
+            with self.subTest(reason=reason), patch.object(urllib.request, "build_opener") as build:
+                build.return_value.open.return_value = fixtures.Response(body, "text/html", repair.EH_API_URL)
+                client = repair.MetadataClient("fake=FAKE_SECRET")
+                with self.assertRaisesRegex(recovery.RecoveryError, "^" + reason + "$"):
+                    client.fetch([target()])
+                self.assertTrue(client.diagnostics["html_content_type"])
+                self.assertEqual(client.diagnostics["response_bytes"], len(body))
+                self.assertNotIn("FAKE_SECRET", json.dumps(client.diagnostics))
 
 
 class EvidenceTest(unittest.TestCase):
@@ -151,6 +172,22 @@ class EvidenceTest(unittest.TestCase):
         failure = json.loads((output / "failure.json").read_text(encoding="utf-8"))
         self.assertEqual(failure, {"ok": False, "error": "rate_limited"})
         self.assertFalse((output / "metadata.json").exists())
+
+    def test_cli_failure_retains_safe_transport_markers(self):
+        output = self.fixture.root / "transport-failure"
+        diagnostics = {"http_status": 200, "html_content_type": True, "json_content_type": False, "response_bytes": 18}
+        def fail(client, targets):
+            client.diagnostics = diagnostics
+            raise recovery.RecoveryError("unrecognized_metadata_response")
+        with patch.object(cli, "runtime_settings", return_value=("fake=FAKE_SECRET", "", 5)), \
+             patch.object(cli.MetadataClient, "fetch", fail), \
+             patch("sys.argv", ["apply_hath_metadata.py", "--evidence", str(self.directory), "--library", str(self.fixture.library_root),
+                                "--database", str(self.fixture.database), "--output", str(output), "--fetch", "--confirmed"]), \
+             patch.object(cli, "missing_targets", return_value=[target(), target("2")]), patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli.main(), 1)
+        failure = json.loads((output / "failure.json").read_text(encoding="utf-8"))
+        self.assertEqual(failure["diagnostics"], diagnostics)
+        self.assertNotIn("FAKE_SECRET", json.dumps(failure))
 
 
 class InsertTest(unittest.TestCase):
