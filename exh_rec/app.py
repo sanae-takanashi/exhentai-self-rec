@@ -159,6 +159,13 @@ class ApiError(Exception):
 class Handler(BaseHTTPRequestHandler):
     server_version = "ExhRec/0.1"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Refresh/navigation can cancel request reads or the final flush.
+            self.close_connection = True
+
     def do_HEAD(self) -> None:
         try:
             path = urllib.parse.urlparse(self.path).path
@@ -773,11 +780,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.send_bytes(data, "application/json; charset=utf-8", status=status)
 
     def send_bytes(
         self,
@@ -785,14 +788,20 @@ class Handler(BaseHTTPRequestHandler):
         content_type: str,
         status: HTTPStatus = HTTPStatus.OK,
         cache_control: str | None = None,
+        body: bool = True,
     ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        if cache_control:
-            self.send_header("Cache-Control", cache_control)
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            if cache_control:
+                self.send_header("Cache-Control", cache_control)
+            self.end_headers()
+            if body:
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The browser is gone; do not attempt a second (500) response.
+            self.close_connection = True
 
     def serve_thumbnail(self, thumb_url: str, gallery_url: str) -> None:
         data, content_type = cached_thumbnail(thumb_url, gallery_url)
@@ -808,13 +817,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.NOT_FOUND, "Not found")
         data = path.read_bytes()
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache, must-revalidate")
-        self.end_headers()
-        if body:
-            self.wfile.write(data)
+        self.send_bytes(data, content_type, cache_control="no-cache, must-revalidate", body=body)
 
     def handle_error(self, exc: Exception) -> None:
         if isinstance(exc, ApiError):
