@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 from exh_rec import app, db, exhentai
 from exh_rec.exhentai import Gallery, GalleryBatch
+from exh_rec.recency import recent_gallery_cutoff
 
 
 def gallery(gid):
-    return Gallery(url=f"https://exhentai.org/g/{gid}/abcdef/", gid=str(gid), token="abcdef", title=f"Gallery {gid}")
+    return Gallery(url=f"https://exhentai.org/g/{gid}/abcdef/", gid=str(gid), token="abcdef", title=f"Gallery {gid}",
+                   posted_at=recent_gallery_cutoff())
 
 
 def listing(gid, following=None, query=""):
@@ -275,6 +277,103 @@ class CatchUpTest(unittest.TestCase):
         self.assertEqual(state["anchors"], [gallery(10).url])
         self.assertIsNone(state["resume_url"])
         self.assertFalse(state["caught_up"])
+
+    def test_age_boundary_stops_without_three_anchor_matches_and_preserves_history(self):
+        fresh, boundary, old = gallery(40), gallery(30), gallery(20)
+        fresh.posted_at, boundary.posted_at, old.posted_at = "2026-11-03", "2026-08-03", "2026-08-02"
+        with db.connect() as conn:
+            app.store_galleries(conn, [old])
+            app.save_fetch_query_state(conn, {"query": None, "source": "recent"},
+                                       [gallery(gid).url for gid in (12, 11, 10)], True, 1)
+        with patch.object(app, "recent_gallery_cutoff", return_value="2026-08-03"), patch.object(
+            app, "fetch_galleries", return_value=GalleryBatch([fresh, boundary, old], next_url="https://exhentai.org/?next=19")
+        ) as fetch:
+            result = app.fetch_and_store()
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["stored"], 2)
+        self.assertTrue(self.state()["caught_up"])
+        self.assertIsNone(self.state()["resume_url"])
+        self.assertEqual(self.state()["anchors"], [fresh.url, boundary.url])
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM galleries").fetchone()[0], 3)
+        activity = app.FETCH_ACTIVITY.snapshot()["activity"]
+        self.assertEqual(activity["min_posted_date"], "2026-08-03")
+        self.assertTrue(activity["queries"][0]["age_limit_reached"])
+
+    def test_all_old_resume_finishes_and_next_run_starts_at_head(self):
+        old = gallery(20)
+        old.posted_at = "2026-07-15"
+        with db.connect() as conn:
+            app.store_galleries(conn, [old])
+            app.save_fetch_query_state(conn, {"query": None, "source": "recent"}, [old.url], False, 25,
+                                       resume_url="https://exhentai.org/?next=20", pending_anchors=[old.url])
+        with patch.object(app, "recent_gallery_cutoff", return_value="2026-08-03"), patch.object(
+            app, "fetch_galleries", return_value=GalleryBatch([old], next_url="https://exhentai.org/?next=19")
+        ) as fetch:
+            result = app.fetch_and_store()
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["stored"], 0)
+        self.assertEqual(self.state()["anchors"], [])
+        self.assertIsNone(self.state()["resume_url"])
+        with patch.object(app, "fetch_galleries", return_value=GalleryBatch([gallery(50)])) as fetch:
+            app.fetch_and_store()
+        self.assertIsNone(fetch.call_args.kwargs["next_url"])
+
+    def test_missing_publication_date_does_not_advance_or_store(self):
+        unknown = gallery(30)
+        unknown.posted_at = None
+        before = self.state()
+        with patch.object(app, "fetch_galleries", return_value=GalleryBatch([unknown], next_url="https://exhentai.org/?next=29")):
+            result = app.fetch_and_store()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(self.state(), before)
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM galleries").fetchone()[0], 0)
+
+    def test_missing_publication_date_can_be_resolved_before_filtering(self):
+        unknown = gallery(30)
+        unknown.posted_at = None
+
+        def metadata(_cookie, galleries, **_kwargs):
+            for item in galleries:
+                item.posted_at = "2026-07-01"
+            return len(galleries)
+
+        with patch.object(app, "recent_gallery_cutoff", return_value="2026-08-03"), patch.object(
+            app, "fetch_galleries", return_value=GalleryBatch([unknown], next_url="https://exhentai.org/?next=29")
+        ), patch.object(app, "enrich_covers_via_api", side_effect=metadata):
+            result = app.fetch_and_store()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["stored"], 0)
+        self.assertIsNone(self.state()["resume_url"])
+
+    def test_manual_search_also_stops_at_age_limit_without_touching_auto_state(self):
+        before = self.state()
+        old = gallery(20)
+        old.posted_at = "2026-07-01"
+        with patch.object(app, "recent_gallery_cutoff", return_value="2026-08-03"), patch.object(
+            app, "fetch_galleries", return_value=GalleryBatch([old], next_url="https://exhentai.org/?next=19&f_search=artist%3Atest")
+        ) as fetch:
+            result = app.fetch_and_store(force_query="artist:test")
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["stored"], 0)
+        self.assertEqual(self.state(), before)
+
+    def test_missing_listing_date_uses_known_database_date_without_metadata_request(self):
+        stored, undated = gallery(10), gallery(10)
+        undated.posted_at = None
+        with db.connect() as conn:
+            app.store_galleries(conn, [stored])
+        with patch.object(app, "fetch_galleries", return_value=GalleryBatch([undated])), patch.object(
+            app, "enrich_covers_via_api", return_value=0
+        ) as metadata:
+            result = app.fetch_and_store()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(undated.posted_at, stored.posted_at)
+        self.assertEqual(metadata.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from .audit import (
 )
 from .db import cache_revision, snapshot_gallery_features, visual_embedding_digest
 from .exhentai import Gallery
+from .recency import gallery_posted_date
 from .visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION, normalize_embedding
 from .personalized import (
     hath_download_signal_weight,
@@ -1529,6 +1530,7 @@ def _score_recommendation_candidates(
         continuing_updates = continuing_update_series_index(training_conn) if exclude_short_repeats and not include_rated else {}
     overrides = classification_overrides(training_conn)
     unrated_where = "AND f.feedback_id IS NULL AND m.kind IS NULL AND hd.gallery_url IS NULL" if not include_rated else ""
+    posted_where = "AND g.posted_at >= ?" if posted_after else ""
     rows = conn.execute(
         f"""
         SELECT g.*, f.feedback_id, f.user_score, COALESCE(f.vote, 0) AS user_vote,
@@ -1553,10 +1555,11 @@ def _score_recommendation_candidates(
         ) hd ON hd.gallery_url = g.url
         WHERE g.review_excluded = 0
         {unrated_where}
+        {posted_where}
         ORDER BY g.last_seen_at DESC
         LIMIT ?
         """,
-        (candidate_limit,),
+        (posted_after, candidate_limit) if posted_after else (candidate_limit,),
     ).fetchall()
 
     scored = []
@@ -1751,6 +1754,7 @@ def recommend_page(
     count_only: bool = False,
     training_conn: sqlite3.Connection | None = None,
     review_ranking_mode: str | None = None,
+    min_posted_date: str | None = None,
 ) -> dict:
     # Temporal replay can freeze learned preferences independently of candidate features.
     limit = max(1, min(10000, int(limit)))
@@ -1763,6 +1767,8 @@ def recommend_page(
     language_filter_values = normalize_language_filter(language_filter)
     model_mode = normalize_model_mode(model_mode)
     posted_after = normalize_posted_after(posted_after)
+    min_posted_date = normalize_posted_after(min_posted_date)
+    candidate_posted_after = max(posted_after, min_posted_date)
     low_interest_percent = max(0, min(50, int(low_interest_percent)))
     low_interest_max_percent = max(
         low_interest_percent,
@@ -1776,7 +1782,7 @@ def recommend_page(
     def build_scores():
         return _score_recommendation_candidates(
             conn, candidate_limit, include_rated, filter_text, model_mode,
-            language_filter_values, freshness_weight, require_bootstrap_match, posted_after,
+            language_filter_values, freshness_weight, require_bootstrap_match, candidate_posted_after,
             exclude_short_repeats, continuing_updates, personalized_artifact,
             training_conn,
         )
@@ -1787,7 +1793,7 @@ def recommend_page(
         fingerprint = (
             revision, _model_file_versions(), candidate_limit, include_rated, filter_text, model_mode,
             tuple(sorted(language_filter_values)), freshness_weight,
-            require_bootstrap_match, posted_after, exclude_short_repeats,
+            require_bootstrap_match, candidate_posted_after, exclude_short_repeats,
         )
         # Only one score snapshot per database; serialize misses across list/count requests.
         with SCORE_CACHE_LOCK:
@@ -1906,6 +1912,7 @@ def recommend_page(
         "candidate_limit": candidate_limit,
         "bootstrap_explore_count": bootstrap_explore_count,
         "require_bootstrap_match": bool(require_bootstrap_match),
+        "min_posted_date": min_posted_date,
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
         "personalized_model": personalized_status,
@@ -2001,6 +2008,7 @@ def discovery_page(
     candidate_limit: int = 2000,
     language_filter: list[str] | str | None = None,
     seed: str | None = None,
+    min_posted_date: str | None = None,
 ) -> dict:
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
@@ -2016,6 +2024,7 @@ def discovery_page(
         language_filter=language_filter,
         model_mode=MODEL_MODE_HYBRID,
         require_bootstrap_match=False,
+        min_posted_date=min_posted_date,
     )
     candidates = page["items"]
     if not (
@@ -2207,10 +2216,8 @@ def normalize_posted_after(value: str | None) -> str:
 
 
 def gallery_posted_on_or_after(gallery: dict, posted_after: str) -> bool:
-    posted_at = str(gallery.get("posted_at") or "").strip()
-    if not posted_at:
-        return False
-    return posted_at[:10] >= posted_after
+    posted_at = gallery_posted_date(gallery.get("posted_at"))
+    return posted_at is not None and posted_at >= posted_after
 
 
 def normalize_model_mode(value: object) -> str:

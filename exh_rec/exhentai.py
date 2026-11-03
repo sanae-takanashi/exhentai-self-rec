@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
 from .net import open_url, open_url_with_retry, pause_after_temporary_ban, temporary_ban_detected
+from .recency import gallery_posted_date
 
 
 BASE_URL = "https://exhentai.org/"
@@ -154,6 +155,38 @@ def parse_search_next_url(page_html: str, current_url: str, query: str | None = 
     if current_cursor and int(next_cursor) >= int(current_cursor[0]):
         raise RuntimeError("Gallery pagination did not advance")
     return next_url
+
+
+class PostedDateParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dates: dict[str, str] = {}
+        self.gid: str | None = None
+        self.depth = 0
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if self.gid is not None:
+            if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr"}:
+                self.depth += 1
+            return
+        identifier = dict(attrs).get("id") or ""
+        if identifier.startswith("posted_") and identifier[7:].isdigit():
+            self.gid, self.depth, self.text = identifier[7:], 1, []
+
+    def handle_data(self, data) -> None:
+        if self.gid is not None:
+            self.text.append(data)
+
+    def handle_endtag(self, tag) -> None:
+        if self.gid is None:
+            return
+        self.depth -= 1
+        if self.depth == 0:
+            text = " ".join("".join(self.text).split())
+            if gallery_posted_date(text):
+                self.dates[self.gid] = text
+            self.gid = None
 
 
 class LinkTitleParser(HTMLParser):
@@ -767,6 +800,8 @@ def normalize_sample_thumb(url: str) -> str:
 def parse_gallery_list(page_html: str, source_query: str | None = None) -> list[Gallery]:
     parser = LinkTitleParser()
     parser.feed(page_html)
+    posted = PostedDateParser()
+    posted.feed(page_html)
 
     titles_by_url: dict[str, str] = {}
     for href, text, classes in parser.links:
@@ -797,6 +832,7 @@ def parse_gallery_list(page_html: str, source_query: str | None = None) -> list[
             title=title,
             category=strip_html_match(CAT_RE.search(block)),
             uploader=strip_html_match(UPLOADER_RE.search(block)),
+            posted_at=posted.dates.get(gid),
             thumb_url=extract_thumb(block),
             rating=rating,
             tags=tags,

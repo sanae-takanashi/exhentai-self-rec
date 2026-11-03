@@ -305,8 +305,19 @@ successful page and its continuation are committed together, so a later response
 failure does not discard previously fetched pages. Incomplete HTTP bodies receive
 up to three rate-limited attempts.
 
-A cursor advances only after its old anchors are reached or the search reaches
-the end. If the catch-up limit is reached first, the run is `partial`, its old
+A rolling three-calendar-month publication limit applies to normal and one-off
+fetches, Review, Low Interest, Discovery, and automatic recommendation detail
+selection. The cutoff uses the local UTC+08 date, inclusive (2026-11-03 means
+2026-08-03 and newer). Dates are read from listing metadata, with database/API
+fallback; an unresolved date fails the page without advancing its continuation.
+Over-age listings are not stored or selected for detail enrichment. Existing history, ratings,
+downloads, and parent metadata are retained. The limit is applied before the
+recommendation candidate cap and cannot be weakened by a preview date filter.
+
+A cursor advances after its old anchors are reached, the publication limit is
+crossed, or the search reaches the end. Reaching the age boundary clears the
+continuation even with fewer than three anchor matches; the next run starts at
+the head. If the catch-up page limit is reached first, the run is `partial`, its old
 anchors are preserved, and the plan reports `resume pending`. The next normal
 `Fetch` continues from the saved next page, rather than rescanning the head. The
 head captured when that catch-up started remains frozen until completion; newer
@@ -317,7 +328,7 @@ To recover missed history after a pagination repair, restart the app, leave the
 one-off query blank, and use normal `Fetch` repeatedly until all planned queries
 have no pending catch-up and the run is successful. Existing anchors from the old
 database are preserved automatically. The first repaired run starts at the head;
-subsequent partial runs resume deeper into history. Keep the existing request
+subsequent partial runs resume within the three-month window. Keep the existing request
 delay and ban pause; increasing `Catch-up` changes only the bounded batch size.
 Run one additional normal fetch after completing the backlog to collect uploads
 that arrived during catch-up. Do not reset data or clear cursors for this recovery.

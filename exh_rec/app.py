@@ -22,6 +22,7 @@ from typing import Any
 
 from . import db
 from .fetch_activity import FetchActivity
+from .recency import gallery_posted_date, recent_gallery_cutoff
 from .audit import low_interest_audit_report, record_visible_impressions
 from .exhentai import (
     Gallery,
@@ -1543,6 +1544,7 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
         "learned_query_limit": learned_limit,
         "recommend_candidate_limit": recommend_candidate_limit(conn),
         "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
+        "min_posted_date": recent_gallery_cutoff(),
     }
 
 
@@ -1792,6 +1794,16 @@ def get_access_check(conn) -> dict | None:
         return None
 
 
+def recent_fetch_anchors(conn, anchors: list[str], cutoff: str) -> list[str]:
+    recent = []
+    for url in anchors:
+        row = conn.execute("SELECT posted_at FROM galleries WHERE url = ?", (url,)).fetchone()
+        posted = gallery_posted_date(row[0]) if row else None
+        if posted and posted >= cutoff:
+            recent.append(url)
+    return recent
+
+
 def fetch_and_store(
     force_query: str | None = None,
     trigger: str = "manual",
@@ -1815,6 +1827,7 @@ def fetch_and_store(
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
     query_plan = build_query_plan(tags, learned_tags, force_query=force_query)
+    cutoff = recent_gallery_cutoff()
     try:
         with db.connect() as conn:
             activity_plan = []
@@ -1851,6 +1864,7 @@ def fetch_and_store(
         detail_limit=detail_limit,
         sample_extra_pages=sample_pages,
         started_at=current_timestamp(),
+        min_posted_date=cutoff,
         fetched=0,
         stored=0,
         enriched=0,
@@ -1880,10 +1894,14 @@ def fetch_and_store(
                 query_galleries: list[Gallery] = []
                 query_seen: set[str] = set()
                 head_anchors: list[str] = list(cursor_state["pending_anchors"]) if next_url else []
+                if head_anchors:
+                    with db.connect() as conn:
+                        head_anchors = recent_fetch_anchors(conn, head_anchors, cutoff)
                 pages_fetched = 0
                 cursor_caught_up = False
                 seen_page_digests = {cursor_state["last_page_digest"]} if next_url else set()
                 batch_stored = 0
+                age_limit_reached = False
                 anchor_match_target = min(FETCH_CURSOR_MATCH_COUNT, len(old_anchors))
                 update_fetch_progress(
                     "query started",
@@ -1895,6 +1913,7 @@ def fetch_and_store(
                     cursor_active=cursor_active,
                     cursor_resuming=bool(next_url),
                     cursor_caught_up=cursor_caught_up,
+                    age_limit_reached=False,
                     cursor_matches=len(matched_anchors),
                     cursor_match_target=anchor_match_target,
                     page_start=0,
@@ -1929,6 +1948,17 @@ def fetch_and_store(
                         ).hexdigest()
                         if page_galleries and page_digest in seen_page_digests:
                             raise RuntimeError("Gallery pagination repeated a result page")
+                        with db.connect() as conn:
+                            for gallery in page_galleries:
+                                if gallery_posted_date(gallery.posted_at) is None:
+                                    row = conn.execute("SELECT posted_at FROM galleries WHERE url = ?", (gallery.url,)).fetchone()
+                                    if row and gallery_posted_date(row[0]):
+                                        gallery.posted_at = row[0]
+                        undated = [gallery for gallery in page_galleries if gallery_posted_date(gallery.posted_at) is None]
+                        if undated:
+                            enrich_covers_via_api(cookie, undated, proxy_url=proxy_url)
+                        if any(gallery_posted_date(gallery.posted_at) is None for gallery in page_galleries):
+                            raise RuntimeError("Gallery publication date unavailable; pagination boundary not advanced")
                     except Exception as exc:
                         errors.append(f"query {display_query(query)}: {exc}")
                         update_fetch_progress("query page failed", stage="error", error=str(exc), errors=list(errors))
@@ -1936,6 +1966,10 @@ def fetch_and_store(
                     seen_page_digests.add(page_digest)
                     pages_fetched += 1
                     fetched += len(page_galleries)
+                    fetched_batch = len(page_galleries)
+                    next_url = getattr(page_galleries, "next_url", None)
+                    age_limit_reached = any(gallery_posted_date(gallery.posted_at) < cutoff for gallery in page_galleries)
+                    page_galleries = [gallery for gallery in page_galleries if gallery_posted_date(gallery.posted_at) >= cutoff]
                     if not head_anchors:
                         head_anchors = [gallery.url for gallery in page_galleries[:FETCH_CURSOR_ANCHOR_LIMIT]]
                     for gallery in page_galleries:
@@ -1944,19 +1978,19 @@ def fetch_and_store(
                             query_seen.add(gallery.url)
                         if gallery.url in old_anchors:
                             matched_anchors.add(gallery.url)
-                    next_url = getattr(page_galleries, "next_url", None)
                     cursor_caught_up = (
-                        not next_url
+                        age_limit_reached
+                        or not next_url
                         or (cursor_active and len(matched_anchors) >= anchor_match_target)
                         or (not cursor_active and page_number + 1 == page_limit)
                     )
                     # Commit the listing and its continuation atomically before requesting another page.
                     with db.connect() as conn:
                         page_stored = store_galleries(conn, page_galleries)
-                        if cursor_enabled_for(entry) and (head_anchors or old_anchor_list):
+                        if cursor_enabled_for(entry):
                             save_fetch_query_state(
                                 conn, entry,
-                                head_anchors if cursor_caught_up and head_anchors else old_anchor_list,
+                                head_anchors if cursor_caught_up else old_anchor_list,
                                 caught_up=cursor_caught_up, page_count=pages_fetched,
                                 resume_url=next_url, pending_anchors=head_anchors,
                                 matched_anchors=sorted(matched_anchors), last_page_digest=page_digest,
@@ -1967,13 +2001,15 @@ def fetch_and_store(
                         "query page fetched",
                         stage="fetching_pages",
                         current_query=display_query(query),
-                        fetched_batch=len(page_galleries),
+                        fetched_batch=fetched_batch,
                         fetched=fetched,
                         stored=stored,
                         stored_page=page_stored,
                         cursor_matches=len(matched_anchors),
                         cursor_match_target=anchor_match_target,
                     )
+                    if age_limit_reached:
+                        update_fetch_progress("query age limit reached", age_limit_reached=True)
                     if cursor_caught_up:
                         break
 
@@ -2018,6 +2054,7 @@ def fetch_and_store(
                     cursor_matches=len(matched_anchors),
                     cursor_match_target=anchor_match_target,
                     pages_fetched=pages_fetched,
+                    age_limit_reached=age_limit_reached,
                 )
                 if cursor_enabled_for(entry) and not cursor_caught_up:
                     cursor_incomplete_queries.append(display_query(query))
@@ -2127,6 +2164,7 @@ def fetch_and_store(
                 include_rated=include_rated,
                 filter_text=filter_text,
                 candidate_limit=recommend_candidate_limit(conn),
+                min_posted_date=recent_gallery_cutoff(),
             )
         update_fetch_progress(
             "fetch finished",
@@ -2311,6 +2349,7 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                 include_rated=include_rated,
                 filter_text=filter_text,
                 candidate_limit=recommend_candidate_limit(conn),
+                min_posted_date=recent_gallery_cutoff(),
             )
         update_fetch_progress(
             "enrichment finished",
@@ -3116,6 +3155,7 @@ def select_recommendation_detail_candidates(
         include_rated=include_rated,
         filter_text=filter_text,
         candidate_limit=recommend_candidate_limit(conn),
+        min_posted_date=recent_gallery_cutoff(),
     )
     candidates: list[Gallery] = []
     ranked = sorted(
@@ -3489,6 +3529,7 @@ def recommendation_payload(
         model_mode=model_mode,
         require_bootstrap_match=require_bootstrap_match,
         posted_after=posted_after,
+        min_posted_date=recent_gallery_cutoff(),
         low_interest_percent=review_low_interest_percent(conn),
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),
@@ -3569,6 +3610,7 @@ def discovery_payload(
         candidate_limit=recommend_candidate_limit(conn),
         language_filter=language_filter,
         seed=seed,
+        min_posted_date=recent_gallery_cutoff(),
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     page["request_id"] = hashlib.sha256(
@@ -3699,6 +3741,7 @@ def queue_counts_payload(conn) -> dict[str, int]:
         language_filter=configured_language_filter(conn),
         model_mode=configured_model_mode(conn),
         require_bootstrap_match=configured_review_require_bootstrap_match(conn),
+        min_posted_date=recent_gallery_cutoff(),
         low_interest_percent=review_low_interest_percent(conn),
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),

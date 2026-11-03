@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import tempfile
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import patch
@@ -91,7 +92,8 @@ from exh_rec.app import (
     continuing_update_payload,
     thumbnail_referer,
 )
-from exh_rec.exhentai import Gallery, GalleryBatch
+from exh_rec.exhentai import Gallery as GalleryRecord, GalleryBatch
+from exh_rec.recency import recent_gallery_cutoff
 from exh_rec.recommender import (
     learned_query_tags,
     parse_bootstrap_tags,
@@ -102,6 +104,10 @@ from exh_rec.recommender import (
     upsert_bootstrap_tags,
 )
 from exh_rec.visual import DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION
+
+
+# Live-queue fixtures need known publication dates; parser tests cover missing dates.
+Gallery = partial(GalleryRecord, posted_at=recent_gallery_cutoff())
 
 
 class AppTest(unittest.TestCase):

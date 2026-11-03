@@ -11,6 +11,7 @@ MESSAGES = {
     "query started": "Query started",
     "fetching query page": "Requesting list page",
     "query page fetched": "List page stored",
+    "query age limit reached": "Three-month publication limit reached",
     "query page failed": "List page failed",
     "cover metadata checked": "Cover metadata checked",
     "cover metadata failed": "Cover metadata failed",
@@ -87,6 +88,7 @@ class FetchActivity:
             data["model_retrained"] = state.get("model_retrained") is True
             data["current_item"] = display_text(state.get("current_gallery_title")) if data["stage"] == "enriching_details" else ""
             data["started_at"] = state.get("started_at", "")
+            data["min_posted_date"] = state.get("min_posted_date", "")
             data["updated_at"] = datetime.now(timezone.utc).isoformat()
             index = data["query_index"]
             if 0 < index <= len(data["queries"]):
@@ -105,6 +107,7 @@ class FetchActivity:
                     row["incomplete"] = not state.get("cursor_caught_up") and row["source"] in {"recent", "bootstrap", "learned"}
                 row["anchor_matches"] = number(state.get("cursor_matches"))
                 row["anchor_target"] = number(state.get("cursor_match_target"))
+                row["age_limit_reached"] = state.get("age_limit_reached") is True
             data["queries_done"] = sum(row["state"] in {"done", "partial", "failed"} for row in data["queries"])
             data["pages_done"] = sum(row["pages_done"] for row in data["queries"])
             data["page_budget"] = sum(row["page_budget"] for row in data["queries"])
