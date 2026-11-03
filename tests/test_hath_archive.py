@@ -1,6 +1,10 @@
+import ntpath
+import os
+import posixpath
+from pathlib import PurePosixPath, PureWindowsPath
 import unittest
 import subprocess
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from hath_observer.archive import (
     ArchiveCommandError,
@@ -257,7 +261,7 @@ class HathArchiveHelperTest(unittest.TestCase):
 
         self.assertEqual(
             delete.call_args_list,
-            [call("/archives/.trash/job-one"), call("/archives/.trash/job-two")],
+            [call(os.path.join("/archives", ".trash", name)) for name in ("job-one", "job-two")],
         )
         self.assertEqual(emit.call_args_list[-1][0], ("result",))
         self.assertEqual(emit.call_args_list[-1][1]["result"]["freed_bytes"], 800)
@@ -298,7 +302,7 @@ class HathArchiveHelperTest(unittest.TestCase):
 
         self.assertEqual(
             delete.call_args_list,
-            [call("/downloads/Gallery One"), call("/archives/batch.zip")],
+            [call(os.path.join("/downloads", "Gallery One")), call("/archives/batch.zip")],
         )
         self.assertEqual(
             run.call_args_list[2:],
@@ -314,7 +318,7 @@ class HathArchiveHelperTest(unittest.TestCase):
                     [
                         "zip",
                         "-r",
-                        "/archives/.staging/job/Gallery One.zip",
+                        os.path.join("/archives", ".staging", "job", "Gallery One.zip"),
                         "--",
                         "Gallery One",
                     ],
@@ -325,11 +329,11 @@ class HathArchiveHelperTest(unittest.TestCase):
                         "zip",
                         "-0",
                         "-m",
-                        "/archives/.batch.zip.job.partial",
+                        os.path.join("/archives", ".batch.zip.job.partial"),
                         "--",
                         "Gallery One.zip",
                     ],
-                    cwd="/archives/.staging/job",
+                    cwd=os.path.join("/archives", ".staging", "job"),
                 ),
             ],
         )
@@ -374,8 +378,8 @@ class HathArchiveHelperTest(unittest.TestCase):
             execute_plan(plan, "/downloads", "/archives")
 
         stage_zip.assert_called_once_with(
-            "/downloads/Existing.zip",
-            "/archives/.staging/job/Existing.zip",
+            os.path.join("/downloads", "Existing.zip"),
+            os.path.join("/archives", ".staging", "job", "Existing.zip"),
         )
         self.assertEqual(
             run.call_args_list[-1],
@@ -384,12 +388,12 @@ class HathArchiveHelperTest(unittest.TestCase):
                     "zip",
                     "-0",
                     "-m",
-                    "/archives/.batch.zip.job.partial",
+                    os.path.join("/archives", ".batch.zip.job.partial"),
                     "--",
                     "Gallery One.zip",
                     "Existing.zip",
                 ],
-                cwd="/archives/.staging/job",
+                cwd=os.path.join("/archives", ".staging", "job"),
             ),
         )
 
@@ -428,6 +432,82 @@ class HathArchiveHelperTest(unittest.TestCase):
                 execute_plan(plan, "/downloads", "/archives")
 
         delete.assert_not_called()
+
+
+class ArchivePathFlavourTest(unittest.TestCase):
+    def test_local_archive_paths_and_posix_mega_path_on_both_platforms(self):
+        for path_module, root in (
+            (ntpath, PureWindowsPath("C:/H@H Data")),
+            (posixpath, PurePosixPath("/srv/H@H Data")),
+        ):
+            with self.subTest(platform=path_module.__name__):
+                download = root / "downloads"
+                archives = root / "archives"
+                staging = archives / ".staging" / "job"
+                partial = archives / ".batch.zip.job.partial"
+                archive_path = str(archives / "batch.zip")
+                plan = {
+                    "request": {
+                        "selected": ["Gallery One", "Existing.zip"],
+                        "archive_name": "batch.zip", "upload": True,
+                        "mega_destination": "/H@H Archives/Batch", "trash_sources": True,
+                        "trash_archive_after_upload": True, "cleanup_mode": "delete",
+                    },
+                    "archive_path": archive_path,
+                    "selected_count": 2,
+                    "selected": [
+                        {"name": "Gallery One", "kind": "gallery", "archive_member": "Gallery One.zip"},
+                        {"name": "Existing.zip", "kind": "zip", "archive_member": "Existing.zip"},
+                    ],
+                }
+                # Replace only this module's OS facade; no real I/O or global path changes.
+                local_os = Mock(spec=os)
+                local_os.path = Mock(wraps=path_module)
+                local_os.path.isdir.return_value = True
+                local_os.path.exists.return_value = False
+                operations = Mock()
+                with patch("hath_observer.archive.os", local_os), patch(
+                    "hath_observer.archive.job_identifier", return_value="job"
+                ), patch("hath_observer.archive.command_path", side_effect=lambda name: name), patch(
+                    "hath_observer.archive.run_checked", return_value=""
+                ) as run, patch("hath_observer.archive.stage_existing_zip") as stage_zip, patch(
+                    "hath_observer.archive.permanently_delete"
+                ) as delete, patch("hath_observer.archive.emit") as emit:
+                    operations.attach_mock(run, "run")
+                    operations.attach_mock(delete, "delete")
+                    execute_plan(plan, str(download), str(archives))
+
+                stage_zip.assert_called_once_with(str(download / "Existing.zip"), str(staging / "Existing.zip"))
+                self.assertEqual(operations.mock_calls, [
+                    call.run(["zip", "-r", str(staging / "Gallery One.zip"), "--", "Gallery One"], cwd=str(download)),
+                    call.run(["zip", "-0", "-m", str(partial), "--", "Gallery One.zip", "Existing.zip"], cwd=str(staging)),
+                    call.run(["mega-mkdir", "-p", "/H@H Archives/Batch"]),
+                    call.run(["mega-put", archive_path, "/H@H Archives/Batch/batch.zip"]),
+                    call.delete(str(download / "Gallery One")),
+                    call.delete(str(download / "Existing.zip")),
+                    call.delete(archive_path),
+                ])
+                local_os.rename.assert_called_once_with(str(partial), archive_path)
+                result = emit.call_args_list[-1][1]["result"]
+                self.assertEqual(result["mega_upload_path"], "/H@H Archives/Batch/batch.zip")
+
+    def test_trash_targets_are_exact_on_both_platforms(self):
+        plan = {"request": {"selected": ["job-one", "job-two"]}, "input_bytes": 800, "input_files": 6}
+        for path_module, root in (
+            (ntpath, PureWindowsPath("C:/H@H Data/archives")),
+            (posixpath, PurePosixPath("/srv/H@H Data/archives")),
+        ):
+            with self.subTest(platform=path_module.__name__):
+                local_os = Mock(spec=os)
+                local_os.path = path_module
+                with patch("hath_observer.archive.os", local_os), patch(
+                    "hath_observer.archive.permanently_delete"
+                ) as delete, patch("hath_observer.archive.emit"):
+                    execute_trash_plan(plan, str(root))
+                self.assertEqual(delete.call_args_list, [
+                    call(str(root / ".trash" / "job-one")),
+                    call(str(root / ".trash" / "job-two")),
+                ])
 
 
 if __name__ == "__main__":
