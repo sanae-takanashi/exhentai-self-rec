@@ -3,8 +3,8 @@ import unittest
 
 from exh_rec import db
 from scripts.evaluate_recommender import (
-    confidence_interval, gallery_payload, materialize_history, non_overlapping_starts,
-    restrict_temporal_training_data,
+    confidence_interval, evaluation_windows, gallery_payload, latest_feedback, materialize_history,
+    non_overlapping_starts, restrict_candidate_visual_history, restrict_temporal_training_data,
 )
 
 
@@ -96,6 +96,44 @@ class TemporalEvaluationTest(unittest.TestCase):
         starts = non_overlapping_starts(973, 100)
         self.assertEqual(starts, [473, 573, 673, 773, 873])
         self.assertTrue(all(right - left >= 100 for left, right in zip(starts, starts[1:])))
+
+    def test_duplicate_update_is_not_a_negative_preference_label(self):
+        url = "https://exhentai.org/g/1/token/"
+        self.conn.execute("INSERT INTO feedback(gallery_url,vote,reason_code,created_at) VALUES (?, -1, 'duplicate_update', '2026-02-01')", (url,))
+        self.assertNotIn(url, [row["gallery_url"] for row in latest_feedback(self.conn)])
+
+    def test_serving_visual_statistics_cannot_read_future_or_undated_images(self):
+        url = "https://exhentai.org/g/1/token/"
+        for index, at in enumerate(("2026-01-01", "2026-02-01", "2026-03-01", "unknown")):
+            self.conn.execute("""INSERT INTO gallery_visual_images(
+                gallery_url,image_key,embedding_json,embedding_version,created_at) VALUES (?, ?, '[1,0]', 'test', ?)""",
+                (url, str(index), at))
+        count = restrict_candidate_visual_history(self.conn, [{"url": url, "feature_snapshot_at": "2026-02-01"}])
+        self.assertEqual(count, 2)
+        self.assertEqual([row[0] for row in self.conn.execute("SELECT image_key FROM gallery_visual_images ORDER BY image_key")], ["0", "1"])
+
+    def test_explicit_test_range_preserves_training_prefix_and_all_new_labels(self):
+        feedback = [{"created_at": f"2026-10-{day:02d} 00:00:00"}
+                    for day in range(1, 32) for _ in range(10)]
+        windows = evaluation_windows(feedback, 75, "2026-10-09", "2026-10-31")
+        self.assertEqual(windows, [(80, 155), (155, 230), (230, 300)])
+        self.assertEqual(sum(end - start for start, end in windows), 220)
+
+    def test_short_tail_is_merged_not_silently_dropped(self):
+        feedback = [{"created_at": "2026-11-01"} for _ in range(160)]
+        self.assertEqual(evaluation_windows(feedback, 75, "2026-11-01"), [(0, 75), (75, 160)])
+
+    def test_range_can_be_empty_without_falling_back_to_old_labels(self):
+        feedback = [{"created_at": "2026-10-01"} for _ in range(100)]
+        self.assertEqual(evaluation_windows(feedback, 75, "2026-11-01"), [])
+
+    def test_range_normalizes_timezone_and_rejects_reversed_bounds(self):
+        feedback = [{"created_at": "2026-11-01 00:00:00"} for _ in range(30)]
+        self.assertEqual(evaluation_windows(feedback, 75, "2026-11-01T08:00:00+08:00"), [(0, 30)])
+        with self.assertRaises(ValueError):
+            evaluation_windows(feedback, 75, "2026-11-02", "2026-11-01")
+        with self.assertRaises(ValueError):
+            evaluation_windows(feedback, 0)
 
     def test_confidence_interval_is_reported_for_multiple_folds(self):
         interval = confidence_interval([0.7, 0.8, 0.9])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -42,6 +43,7 @@ def latest_feedback(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         JOIN (SELECT gallery_url, MAX(id) AS id FROM feedback GROUP BY gallery_url) latest
           ON latest.id = f.id
         WHERE f.vote != 0
+          AND COALESCE(f.reason_code, '') != 'duplicate_update'
         ORDER BY f.created_at, f.id
         """
     ).fetchall()
@@ -79,6 +81,37 @@ def non_overlapping_starts(count: int, window: int, max_folds: int = 5) -> list[
         window = available
     first = count - fold_count * window
     return [first + index * window for index in range(fold_count)]
+
+
+def normalized_time(value: str) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.isoformat(sep=" ")
+
+
+def evaluation_windows(feedback, window: int, test_since: str | None = None,
+                       test_until: str | None = None) -> list[tuple[int, int]]:
+    if window < 20:
+        raise ValueError("evaluation windows require at least 20 labels")
+    since = normalized_time(test_since) if test_since is not None else None
+    until = normalized_time(test_until) if test_until is not None else None
+    if since is not None and until is not None and since >= until:
+        raise ValueError("test-since must precede test-until")
+    if since is None and until is None:
+        return [(start, min(len(feedback), start + window))
+                for start in non_overlapping_starts(len(feedback), window)]
+    selected = [index for index, row in enumerate(feedback)
+                if (since is None or normalized_time(row["created_at"]) >= since)
+                and (until is None or normalized_time(row["created_at"]) < until)]
+    if not selected:
+        return []
+    first, end = selected[0], selected[-1] + 1
+    windows = [(start, min(start + window, end)) for start in range(first, end, window)]
+    # Keep a short tail in its preceding fold, without dropping new outcomes.
+    if len(windows) > 1 and windows[-1][1] - windows[-1][0] < 20:
+        windows[-2:] = [(windows[-2][0], windows[-1][1])]
+    return windows
 
 
 def baseline_scores(galleries: list[dict]) -> dict[str, list[float]]:
@@ -224,6 +257,21 @@ def materialize_history(conn: sqlite3.Connection, cutoff: str) -> dict:
     return {"source_galleries": total, "historical_galleries": known, "complete_galleries": complete}
 
 
+def restrict_candidate_visual_history(conn: sqlite3.Connection, galleries: list[dict]) -> int:
+    removed = 0
+    for gallery in galleries:
+        cutoff = gallery.get("feature_snapshot_at")
+        if cutoff:
+            # Serving rebuilds candidate dictionaries from galleries and cannot
+            # carry feature_snapshot_at into its per-image feature attachment.
+            removed += conn.execute(
+                """DELETE FROM gallery_visual_images WHERE gallery_url = ? AND
+                (julianday(created_at) IS NULL OR julianday(created_at) > julianday(?))""",
+                (gallery["url"], cutoff),
+            ).rowcount
+    return removed
+
+
 def paired_serving_metrics(conn, galleries, labels, artifact, modules, training_conn=None) -> dict:
     urls = [gallery["url"] for gallery in galleries]
     conn.execute("UPDATE galleries SET review_excluded = 1")
@@ -232,6 +280,7 @@ def paired_serving_metrics(conn, galleries, labels, artifact, modules, training_
         snapshot["tags_json"] = json.dumps(gallery["tags"])
         snapshot["tag_weights_json"] = json.dumps(gallery["tag_weights"])
         materialize_snapshot(conn, gallery["url"], snapshot)
+    excluded_image_rows = restrict_candidate_visual_history(conn, galleries)
     candidate = deepcopy(artifact)
     # Exercise the challenger serving path only inside this private replay.
     # This flag never reaches production or the persisted artifact.
@@ -246,7 +295,7 @@ def paired_serving_metrics(conn, galleries, labels, artifact, modules, training_
     indices = [index for index, url in enumerate(urls) if url in left and url in right]
     result = {"requested": len(urls), "paired": len(indices), "filtered": len(urls) - len(indices),
               "challenger_count": len(left), "legacy_count": len(right), "personalized": None, "legacy": None,
-              "baselines": {}}
+              "baselines": {}, "excluded_future_image_rows": excluded_image_rows}
     if not indices:
         return result
     paired_labels = [labels[index] for index in indices]
@@ -261,20 +310,21 @@ def paired_serving_metrics(conn, galleries, labels, artifact, modules, training_
     return result
 
 
-def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) -> dict:
+def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True,
+             test_since: str | None = None, test_until: str | None = None) -> dict:
     modules = sklearn_modules()
     source = sqlite3.connect(":memory:")
     source.row_factory = sqlite3.Row
     with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as live:
         live.backup(source)
     feedback = latest_feedback(source)
-    starts = non_overlapping_starts(len(feedback), window)
+    windows = evaluation_windows(feedback, window, test_since, test_until)
     folds = []
     eligible_test_count = 0
     requested_test_count = 0
     skipped_folds = []
-    for start in starts:
-        test = feedback[start : start + window]
+    for start, end in windows:
+        test = feedback[start:end]
         if not test:
             continue
         conn = sqlite3.connect(":memory:")
@@ -337,6 +387,7 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
                 ranking_scores=[item["rank_score"] for item in predictions]),
             "served_count": replay["paired"],
             "serving_coverage": {key: replay[key] for key in ("requested", "paired", "filtered", "challenger_count", "legacy_count")},
+            "excluded_future_image_rows": replay["excluded_future_image_rows"],
             "history": history,
             "historical_serving_state_complete": (
                 history["historical_galleries"] > 0
@@ -364,8 +415,13 @@ def evaluate(db_path: Path, window: int = 100, strict_snapshots: bool = True) ->
             fold.get("historical_serving_state_complete") is True for fold in folds
         ) or not folds,
         "feature_schema": FEATURE_SCHEMA,
+        "visual_history_policy": "candidate-snapshot-cutoff-v1",
+        "label_policy": "explicit-nonneutral-excluding-duplicate-update",
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "sample_count": len(feedback),
+        "test_range": {"since_inclusive": test_since, "until_exclusive": test_until,
+                       "window": window, "requested_labels": requested_test_count,
+                       "eligible_labels": eligible_test_count},
         "database": str(db_path),
         "folds": folds,
         "skipped_folds": skipped_folds,
@@ -505,6 +561,8 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=db.DB_PATH)
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--test-since", help="inclusive UTC test-label cutoff; training retains the earlier prefix")
+    parser.add_argument("--test-until", help="exclusive UTC test-label cutoff, for a separate development cohort")
     parser.add_argument(
         "--allow-current-features",
         action="store_true",
@@ -516,6 +574,8 @@ def main() -> int:
             args.db.resolve(),
             window=max(20, min(500, args.window)),
             strict_snapshots=not args.allow_current_features,
+            test_since=args.test_since,
+            test_until=args.test_until,
         )
     except PersonalizedModelUnavailable as exc:
         report = {"database": str(args.db.resolve()), "error": str(exc), "acceptance": {"passed": False}}
