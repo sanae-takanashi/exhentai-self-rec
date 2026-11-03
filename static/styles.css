@@ -1996,6 +1996,7 @@ dd {
 }
 
 .review-mode-controls.hidden,
+.review-ranking-controls.hidden,
 .review-session-toolbar.hidden {
   display: none;
 }

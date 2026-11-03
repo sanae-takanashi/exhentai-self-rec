@@ -17,7 +17,10 @@ not inject or install it, and the script does not submit downloads or feedback.
 
 ## First Version
 
-- A Grid / Focus segmented control is available only on the Review view.
+- A Grid / Focus segmented control is available on Review and Low Interest.
+  Both views use the same rating, reason, bookmark, classification, metadata,
+  navigation and single-level undo controls, samples, tags and detail sections.
+  Low Interest retains its band badge; the ranking trial switch stays Review-only.
   Grid remains the initial default. The chosen layout and current URL are
   remembered in tab-local session storage when available; no labels, cookies,
   candidate snapshots or browsing history are stored there. A remembered URL
@@ -80,7 +83,7 @@ new candidates into the bounded recommendation pool. A failed continuation
 does not undo or resubmit the successful action; Next, Load More and Refresh
 remain available to retry, and Focus rating undo remains valid.
 
-Review list reads bypass the browser cache and have a 30-second deadline for
+Review and Low Interest list reads bypass the browser cache and have a 30-second deadline for
 the entire continuation scan, including response bodies and duplicate pages.
 Loading is shown separately from an exhausted queue. A stalled read releases
 the controls at the deadline, preserves committed feedback and the undo slot,
@@ -93,6 +96,10 @@ replacing or reordering existing queued cards. Duplicate-only pages are skipped
 until an unseen URL or actual exhaustion is found. Non-advancing/out-of-range
 cursors fail with a retryable error. Existing delivery contexts are preserved;
 new deliveries still require independent viewport visibility confirmation.
+
+Review may finish while Low Interest still contains galleries. Retained tail
+memberships never promote a gallery just to keep one ordinary Review item.
+The bounded daily audit protocol remains unchanged; it is not an exhaustion refill.
 
 ## Implementation
 

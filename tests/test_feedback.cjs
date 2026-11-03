@@ -233,8 +233,8 @@ test("normal pagination and newer list requests still work", async () => {
   assert.deepEqual(f.urls(), [items[1].url, items[0].url]);
 });
 
-function focusFixture() {
-  const f = fixture();
+function focusFixture(view = "review") {
+  const f = fixture(view);
   f.run('reviewLayout = "focus"; renderGalleryCards(renderedGalleryItems);');
   return f;
 }
@@ -574,9 +574,9 @@ test("classification completed after a view switch cannot apply the old queue", 
 const nextItem = { ...items[1], url: "https://example.test/g/next/token/" };
 const tick = () => new Promise(setImmediate);
 
-for (const action of ["vote(url, 1)", "score(url, 5)", "skip(url)"]) {
-  test(`Focus: ${action} continues across two complete 40-gallery batches`, async () => {
-    const f = focusFixture();
+for (const view of ["review", "low-interest"]) for (const action of ["vote(url, 1)", "score(url, 5)", "skip(url)"]) {
+  test(`${view} Focus: ${action} continues across two complete 40-gallery batches`, async () => {
+    const f = focusFixture(view);
     f.run(`globalThis.batchItems = Array.from({ length: 81 }, (_, index) => ({
       ...fixtureItems[0], url: 'https://example.test/g/batch-' + index + '/token/',
     }));
@@ -594,6 +594,7 @@ for (const action of ["vote(url, 1)", "score(url, 5)", "skip(url)"]) {
         const next = f.requests[requestIndex + 1];
         assert(next.url.startsWith("/api/recommendations?"));
         assert.equal(new URL(next.url, "https://local.test").searchParams.get("offset"), "0");
+        assert.equal(new URL(next.url, "https://local.test").searchParams.get("interest_band"), view === "review" ? "primary" : "low");
         assert.equal(f.run("reviewLoading"), true);
         const remaining = f.run(`JSON.stringify(batchItems.slice(${index + 1}))`);
         const eligible = JSON.parse(remaining);
@@ -623,8 +624,35 @@ function useManualDeadline(f) {
   `);
 }
 
-test("Focus: a stalled continuation times out without resubmitting the committed rating", async () => {
-  const f = focusFixture();
+test("Low Interest Focus: a pending undo cannot insert its gallery into Review", async () => {
+  const f = focusFixture("low-interest");
+  const saving = f.run("score(fixtureItems[0].url, 5)");
+  f.respond(0, undoResponse());
+  await saving;
+  const undoing = f.run("undoReviewRating()");
+  f.run('setActiveView("review"); renderGalleryCards([]);');
+  f.respond(1, { ok: true });
+  await tick();
+  assert.equal(new URL(f.requests[2].url, "https://local.test").searchParams.get("interest_band"), "primary");
+  f.respond(2, page([nextItem]));
+  await undoing;
+  assert.deepEqual(f.urls(), [nextItem.url]);
+  assert.equal(f.run("reviewUndo"), null);
+  assert.equal(f.run("reviewBusy()"), false);
+});
+
+test("Low Interest Grid: exposes scores, reasons, bookmarks and metadata actions", () => {
+  const f = fixture("low-interest");
+  const buttons = f.buttons();
+  for (const score of ["1", "2", "3", "4", "5"]) assert(buttons.some((button) => button.dataset.score === score));
+  for (const mark of ["favorite", "ban"]) assert(buttons.some((button) => button.dataset.mark === mark));
+  assert(buttons.some((button) => button.dataset.refreshGallery));
+  assert(buttons.some((button) => button.dataset.classification === "updates"));
+  assert.match(f.run('document.querySelector("#recommendations").children[0].innerHTML'), /data-reason-for/);
+});
+
+for (const view of ["review", "low-interest"]) test(`${view} Focus: a stalled continuation times out without resubmitting the committed rating`, async () => {
+  const f = focusFixture(view);
   useManualDeadline(f);
   f.run("applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false })");
   const saving = f.run("score(fixtureItems[0].url, 5)");
@@ -667,9 +695,9 @@ test("Focus: one deadline bounds the entire duplicate-page scan and late results
   assert.equal(f.run("fixtureDeadlineCleared"), true);
 });
 
-for (const layout of ["focus", "grid"]) {
-  test(`${layout}: consuming the final card rechecks inventory even after No More`, async () => {
-    const f = fixture();
+for (const view of ["review", "low-interest"]) for (const layout of ["focus", "grid"]) {
+  test(`${view} ${layout}: consuming the final card rechecks inventory even after No More`, async () => {
+    const f = fixture(view);
     f.run(`reviewLayout = "${layout}"; applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false });`);
     const saving = f.run("skip(fixtureItems[0].url)");
     f.respond(0, undoResponse());

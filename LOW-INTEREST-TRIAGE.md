@@ -17,10 +17,11 @@ The app uses dynamic triage instead of automatically recording negative feedback
 - Each opening day has a frozen budget of 5-10 audit slots. Still-eligible, unexposed pending items within the 35-day horizon are resumed first; remaining slots sample the current and retained Low Interest union. Resumed items retain their original audit ID, selection probability, score snapshot and date. No missed-day catch-up or same-day completion top-up occurs.
 - Periodic personalized-model training also searches temporal out-of-fold predictions for a safe absolute `like_probability` threshold.
 - A learned threshold can add galleries outside the bottom percentage, but only when the personalized model is accepted, calibrated, probability-scaled, the threshold belongs to the same model version, and the prospective audit gate passes.
-- Learned-threshold additions are capped at 35% by default. Retained percentage memberships may exceed that share while a backlog is drained, and the implementation still retains at least one Review item.
+- Learned-threshold additions are capped at 35% by default. Retained percentage memberships may exceed that share while a backlog is drained, including the entire remaining pool. Review then finishes instead of repeatedly promoting one retained item.
 - New percentile membership is calculated from the active `rank_score` before pagination; earlier memberships for the same policy are then retained.
 - Percentile cards show `Bottom N%`, retained cards show `Kept Low`, and learned-threshold cards show `Very Low` with the probability cutoff.
 - Ignoring the Low Interest tab does not alter training data.
+- Low Interest supports the same Grid/Focus layouts, samples, details and feedback controls as Review, including score, reason, votes, Skip, Favorite, Ban, classification and Focus undo. The Review ranking trial switch does not change Low Interest ordering.
 - Retraining and metadata enrichment can add newly low-ranked galleries without returning retained tail assignments to normal Review. An explicit action, audit promotion, or eligibility-policy change can move a retained gallery out of the active Low Interest view.
 - Setting `Low-interest %` to `0` restores one unsplit Review queue.
 

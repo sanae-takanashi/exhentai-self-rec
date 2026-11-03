@@ -2297,11 +2297,7 @@ def annotate_interest_bands(
         if str(item.get("url") or "") in retained_urls
     }
     selected_indices = set(percentile_indices | retained_indices)
-    # A fully drained backlog may consist almost entirely of galleries that were
-    # already in the tail. Keep one ordinary Review item as an escape hatch.
-    if total > 0 and len(selected_indices) >= total:
-        selected_indices.discard(0)
-        retained_indices.discard(0)
+    # Retained tail memberships may exhaust Review; they stay accessible in Low Interest.
     policy = dict(threshold_policy or {})
     threshold = optional_float(policy.get("threshold")) if policy.get("active") else None
     threshold_indices: set[int] = set()

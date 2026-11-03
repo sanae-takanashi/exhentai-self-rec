@@ -16,7 +16,7 @@ async function until(check) {
   }
 }
 
-async function scenario(viewport) {
+async function scenario(viewport, view = "review") {
   const context = await browser.newContext({ viewport });
   await context.addInitScript(() => sessionStorage.setItem("review-layout", "focus"));
   const page = await context.newPage();
@@ -39,6 +39,8 @@ async function scenario(viewport) {
     tags: ["artist:fixture", "language:english", "synthetic:color-study"], reasons: ["Synthetic match"],
     visual_embedding_version: "canvas-rgb-8x8-v1", visual_embedding_at: "fixture",
     page_count: 40, category: "Illustration", uploader: "Fixture uploader", like_probability: 0.78,
+    low_interest_reason: "retained-percentile", low_interest_cutoff_percent: 20,
+    interest_rank: index + 1, interest_total: 3,
   }));
   const removed = new Set();
   const refillItem = { ...items[2], url: "https://example.test/g/refill/token/", title: "Synthetic replenished inventory" };
@@ -69,6 +71,9 @@ async function scenario(viewport) {
     }
     if (pathname === "/api/settings") return json(route, { bootstrap_tags: [], visual_encoder: "simple", recommend_language_filter: "all" });
     if (pathname === "/api/recommendations") {
+      if (view === "low-interest" && url.searchParams.get("interest_band") !== "low") {
+        return json(route, { items: [], total: 0, has_more: false });
+      }
       listCalls++;
       const remaining = items.filter((item) => !removed.has(item.url));
       if (refillAvailable && !removed.has(refillItem.url)) remaining.push(refillItem);
@@ -120,7 +125,13 @@ async function scenario(viewport) {
   });
   try {
     await page.goto("http://review.test/");
+    if (view === "low-interest") {
+      await page.waitForFunction(() => !initialPageLoading && !reviewBusy());
+      await page.locator("#lowInterestTab").click();
+    }
     await page.locator(".focus-card").waitFor();
+    assert(await page.locator("#reviewModeControls").isVisible());
+    if (view === "low-interest") assert.equal(await page.locator("#reviewRankingSwitch").isVisible(), false);
     const current = () => page.locator(".focus-card").getAttribute("data-gallery-url");
     assert.equal(await current(), items[0].url);
     assert.equal(await page.locator(".focus-card").count(), 1);
@@ -280,6 +291,11 @@ async function scenario(viewport) {
 
     await page.locator('label[for="reviewGridMode"]').click();
     assert.equal(await page.locator("[data-gallery-url]").count(), 3);
+    assert.equal(await page.locator('[data-score="5"]').count(), 3);
+    assert.equal(await page.locator('[data-reason-for]').count(), 3);
+    assert.equal(await page.locator('[data-refresh-gallery]').count(), 3);
+    assert.equal(await page.locator('[data-mark="favorite"]').count(), 3);
+    assert.equal(await page.locator('.samples img').count(), 3);
     await page.locator('label[for="reviewFocusMode"]').click();
     assert.equal(await current(), items[0].url);
     assert.equal(listCalls, 1);
@@ -299,7 +315,7 @@ async function scenario(viewport) {
     const imageBounds = await page.locator(".thumb img").boundingBox();
     assert(Math.abs(imageBounds.height - coverBounds.height) <= 1, "cover image overflows its frame");
     const bodyBounds = await page.locator(".focus-card .body").boundingBox();
-    await page.screenshot({ path: path.join(output, `${viewport.width}-focus.png`) });
+    await page.screenshot({ path: path.join(output, `${view}-${viewport.width}-focus.png`) });
     assert(bodyBounds.y + bodyBounds.height <= bounds.y,
       `rating footer overlaps gallery details: ${JSON.stringify({ viewport, bounds, bodyBounds })}`);
     for (const selector of ['select[data-reason-for]', '[data-mark="favorite"]', '[data-mark="ban"]', '[data-classification="updates"]']) {
@@ -311,7 +327,7 @@ async function scenario(viewport) {
         `${selector} is outside the viewport`);
       if (selector.startsWith('[')) await control.click({ trial: true });
     }
-    await page.screenshot({ path: path.join(output, `${viewport.width}-focus.png`) });
+    await page.screenshot({ path: path.join(output, `${view}-${viewport.width}-focus.png`) });
 
     ratingMode = "success";
     await page.locator("body").click({ position: { x: 4, y: 4 } });
@@ -360,13 +376,15 @@ async function scenario(viewport) {
     assert.equal(feedbackCalls, 6);
     assert.equal(external.length, 1);
     assert.deepEqual(errors, []);
-    return { viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };
+    assert.match(await page.locator("#recommendations .hint").innerText(), view === "review" ? /Review complete/ : /low-interest band/);
+    assert.equal(lastRating.surface, view);
+    return { view, viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };
   } finally {
     await context.close();
   }
 }
 
-async function batchScenario(viewport) {
+async function batchScenario(viewport, view = "review") {
   const context = await browser.newContext({ viewport });
   await context.addInitScript(() => {
     sessionStorage.setItem("review-layout", "focus");
@@ -400,6 +418,9 @@ async function batchScenario(viewport) {
     }
     if (url.pathname === "/api/settings") return json(route, { bootstrap_tags: [], visual_encoder: "simple", recommend_language_filter: "all" });
     if (url.pathname === "/api/recommendations") {
+      if (view === "low-interest" && url.searchParams.get("interest_band") !== "low") {
+        return json(route, { items: [], total: 0, has_more: false });
+      }
       listCalls++;
       if (listCalls === 2) { stalled = true; return; }
       const eligible = items.filter((item) => !removed.has(item.url));
@@ -420,6 +441,10 @@ async function batchScenario(viewport) {
   });
   try {
     await page.goto("http://review-batch.test/");
+    if (view === "low-interest") {
+      await page.waitForFunction(() => !initialPageLoading && !reviewBusy());
+      await page.locator("#lowInterestTab").click();
+    }
     await page.locator(".focus-card").waitFor();
     for (let index = 0; index < 81; index++) {
       assert.equal(await page.locator(".focus-card").getAttribute("data-gallery-url"), items[index].url);
@@ -429,7 +454,7 @@ async function batchScenario(viewport) {
         assert.equal(await page.locator("#recommendations").getAttribute("aria-busy"), "true");
         assert.equal(await page.locator("#recommendations .hint").innerText(), "Loading galleries...");
         assert(await page.locator("#reviewNextBtn").isDisabled());
-        await page.screenshot({ path: path.join(output, `${viewport.width}-batch-loading.png`) });
+        await page.screenshot({ path: path.join(output, `${view}-${viewport.width}-batch-loading.png`) });
         await page.evaluate(() => window.fixtureDeadline());
         await page.waitForFunction(() => !reviewBusy());
         await until(() => aborted);
@@ -444,7 +469,7 @@ async function batchScenario(viewport) {
         await page.locator("#reviewNextBtn").blur();
         assert.equal(feedbackCalls, 40);
         assert.equal(await page.locator(".focus-card").getAttribute("data-gallery-url"), items[40].url);
-        await page.screenshot({ path: path.join(output, `${viewport.width}-batch-recovered.png`) });
+        await page.screenshot({ path: path.join(output, `${view}-${viewport.width}-batch-recovered.png`) });
       } else {
         await page.waitForFunction(() => !reviewBusy());
       }
@@ -455,7 +480,7 @@ async function batchScenario(viewport) {
     assert(await page.locator("#reviewNextBtn").isDisabled());
     assert.equal(await page.locator("#loadMoreBtn").innerText(), "No More");
     assert.deepEqual(errors, []);
-    return { viewport, feedbackCalls, listCalls, timeout_recovered: true, passed: true };
+    return { view, viewport, feedbackCalls, listCalls, timeout_recovered: true, passed: true };
   } finally {
     await context.close();
   }
@@ -466,6 +491,8 @@ async function batchScenario(viewport) {
   const results = [];
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }, { width: 320, height: 568 }]) results.push(await scenario(viewport));
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) results.push(await batchScenario(viewport));
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }, { width: 320, height: 568 }]) results.push(await scenario(viewport, "low-interest"));
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) results.push(await batchScenario(viewport, "low-interest"));
   fs.writeFileSync(path.join(output, "results.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify({ passed: results.length, evidence: output }));
 })().catch((error) => { console.error(error); process.exitCode = 1; })

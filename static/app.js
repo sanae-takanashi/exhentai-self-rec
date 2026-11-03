@@ -162,8 +162,12 @@ try {
   reviewCurrentUrl = sessionStorage.getItem("review-current") || "";
 } catch (_) { /* Storage may be unavailable in private browser contexts. */ }
 
+function isReviewView(view = currentView) {
+  return view === "review" || view === "low-interest";
+}
+
 function isFocusReview() {
-  return currentView === "review" && reviewLayout === "focus";
+  return isReviewView() && reviewLayout === "focus";
 }
 
 function reviewBusy() {
@@ -184,18 +188,19 @@ function saveReviewPosition() {
 function reviewEmptyText() {
   if (reviewLoading) return "Loading galleries...";
   if (hasMoreRecommendations || reviewPaginationDirty) return "No galleries loaded.";
-  return viewCopy("review").empty;
+  return viewCopy(currentView).empty;
 }
 
 function updateReviewControls() {
   const focus = isFocusReview();
   document.body?.classList.toggle("focus-review", focus);
-  document.querySelector("#reviewModeControls")?.classList.toggle("hidden", currentView !== "review");
+  document.querySelector("#reviewModeControls")?.classList.toggle("hidden", !isReviewView());
   document.querySelector("#reviewSessionToolbar")?.classList.toggle("hidden", !focus);
   document.querySelector("#reviewGridMode").checked = reviewLayout === "grid";
   document.querySelector("#reviewFocusMode").checked = reviewLayout === "focus";
   for (const id of ["reviewGridMode", "reviewFocusMode"]) document.querySelector(`#${id}`).disabled = reviewBusy();
-  document.querySelector("#reviewRankingSwitch").disabled = reviewBusy() || !reviewRankingSupported;
+  document.querySelector(".review-ranking-controls").classList.toggle("hidden", currentView !== "review");
+  document.querySelector("#reviewRankingSwitch").disabled = currentView !== "review" || reviewBusy() || !reviewRankingSupported;
   document.querySelector("#reviewLegacyRanking").checked = reviewRankingMode === "legacy";
   document.querySelector("#reviewTrialRanking").checked = reviewRankingMode === "personalized_trial";
   const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
@@ -207,12 +212,12 @@ function updateReviewControls() {
   refresh.disabled = reviewBusy();
   refresh.classList.toggle("updates-available", reviewUpdatesAvailable);
   refresh.title = reviewUpdatesAvailable ? "New updates available; refresh review queue" : "Refresh review queue";
-  recommendationsEl.setAttribute("aria-busy", String(currentView === "review" && reviewLoading));
-  if (currentView === "review") {
+  recommendationsEl.setAttribute("aria-busy", String(isReviewView() && reviewLoading));
+  if (isReviewView()) {
     const empty = !renderedGalleryItems.length && recommendationsEl.querySelector(".hint");
     if (empty) empty.textContent = reviewEmptyText();
   }
-  if (currentView === "review") {
+  if (isReviewView()) {
     for (const button of recommendationsEl.querySelectorAll("button[data-url]")) {
       if (focus) button.disabled = reviewBusy();
       else if (reviewRankingPending && !button.disabled) {
@@ -299,7 +304,7 @@ function deferFocusRefresh() {
 }
 
 function rememberReviewRating(payload, context) {
-  if (!context?.item || context.epoch !== reviewQueueEpoch || currentView !== "review") return;
+  if (!context?.item || context.epoch !== reviewQueueEpoch || currentView !== context.view) return;
   const id = payload.feedback_update?.latest_feedback_id;
   reviewUndo = payload.feedback_undo_supported === true && Number.isInteger(id) && id > 0
     ? { ...context, feedbackId: id } : null;
@@ -316,7 +321,7 @@ async function undoReviewRating() {
       method: "POST",
       body: JSON.stringify({ gallery_url: undo.item.url, feedback_id: undo.feedbackId }),
     });
-    if (undo.epoch !== reviewQueueEpoch || currentView !== "review") {
+    if (undo.epoch !== reviewQueueEpoch || currentView !== undo.view) {
       reviewUndoPending = false;
       await loadCurrentPage();
       return;
@@ -344,7 +349,7 @@ async function undoReviewRating() {
 }
 
 async function flushDeferredReviewReload() {
-  if (currentView === "review" && reviewReloadQueued && !reviewBusy()) {
+  if (isReviewView() && reviewReloadQueued && !reviewBusy()) {
     reviewReloadQueued = false;
     await loadCurrentPage();
   }
@@ -933,7 +938,7 @@ function viewCopy(view) {
   return {
     title: "Review Queue",
     subtitle: "Unrated galleries with a few random bootstrap-seed picks mixed in.",
-    empty: "No unrated galleries yet. Save cookies and bootstrap tags, then fetch.",
+    empty: "Review complete. No galleries left in this queue.",
     loaded: "review recommendations loaded",
   };
 }
@@ -2065,10 +2070,11 @@ async function loadRecommendations(offset = 0, append = false) {
     return;
   }
   const requestedView = currentView;
-  if (requestedView === "review" && append && reviewPaginationDirty) offset = 0;
+  const reviewView = isReviewView(requestedView);
+  if (reviewView && append && reviewPaginationDirty) offset = 0;
   const requestId = ++recommendationRequestId;
-  const reviewLoadId = requestedView === "review" ? ++reviewLoadSequence : null;
-  if (requestedView === "review") {
+  const reviewLoadId = reviewView ? ++reviewLoadSequence : null;
+  if (reviewView) {
     reviewReloadQueued = false;
     reviewLoading = true;
     if (!append) {
@@ -2078,7 +2084,7 @@ async function loadRecommendations(offset = 0, append = false) {
     }
     updateLoadMore();
     updateReviewControls();
-    setStatus(append ? "Loading next galleries..." : "Loading review galleries...");
+    setStatus(append ? "Loading next galleries..." : `Loading ${requestedView} galleries...`);
   }
   const localFilter = localFilterEl.value.trim();
   const includeRated = requestedView === "preview" ? "1" : "0";
@@ -2093,7 +2099,7 @@ async function loadRecommendations(offset = 0, append = false) {
   if (requestedView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
-  const controller = requestedView === "review" ? new AbortController() : null;
+  const controller = reviewView ? new AbortController() : null;
   // Bound the whole rescan, including duplicate pages and response-body reads.
   const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   let payload;
@@ -2107,7 +2113,7 @@ async function loadRecommendations(offset = 0, append = false) {
       if (requestId !== recommendationRequestId || currentView !== requestedView) return;
       // Feedback can rerank unseen items before the old offset. Rescan without
       // replacing the loaded queue, and skip pages containing only known URLs.
-      if (requestedView !== "review" || !append || !payload.has_more ||
+      if (!reviewView || !append || !payload.has_more ||
           payload.items.some((item) => item?.url && !renderedGalleryUrls.includes(item.url))) break;
       recordPageImpressions(payload, "review", offset, true);
       if (!Number.isInteger(payload.next_offset) || payload.next_offset <= offset || payload.next_offset > 10000) {
@@ -2136,7 +2142,7 @@ async function loadRecommendations(offset = 0, append = false) {
     throw error;
   } finally {
     if (timeout !== null) clearTimeout(timeout);
-    if (requestedView === "review" && reviewLoadId === reviewLoadSequence) {
+    if (reviewView && reviewLoadId === reviewLoadSequence) {
       reviewLoading = false;
       updateLoadMore();
       updateReviewControls();
@@ -2433,7 +2439,7 @@ async function applyFeedbackResult(payload, galleryUrl, requestedView = currentV
     renderedGalleryUrls = renderedGalleryUrls.filter((url) => url !== removedUrl);
     if (removedIndex >= 0) {
       nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
-      if (currentView === "review") reviewPaginationDirty = true;
+      if (isReviewView()) reviewPaginationDirty = true;
     }
     renderGalleryCards(renderedGalleryItems);
     updateLoadMore();
@@ -2962,7 +2968,7 @@ function inspectLocalImage(src, caption) {
 
 function localMediaError(event) {
   const image = event.target;
-  if (currentView !== "review" || !(image instanceof HTMLImageElement)) return;
+  if (!isReviewView() || !(image instanceof HTMLImageElement)) return;
   const card = image.closest("[data-gallery-url]");
   const item = card ? localPageForGallery(card.dataset.galleryUrl) : null;
   const index = Number(image.dataset.sampleIndex || 0);
@@ -3003,7 +3009,7 @@ function renderGalleryCards(items, append = false) {
       renderedGalleryItems.push(item);
     }
   }
-  if (mode === "review") {
+  if (isReviewView(mode)) {
     reviewCurrentUrl = currentReviewItem()?.url || "";
     saveReviewPosition();
   }
@@ -3016,7 +3022,7 @@ function renderGalleryCards(items, append = false) {
   if (!append && !items.length) {
     const emptyText = mode === "history" && localFilterEl.value.trim()
       ? "No matching reaction history found."
-      : mode === "review" ? reviewEmptyText() : viewCopy(mode).empty;
+      : isReviewView(mode) ? reviewEmptyText() : viewCopy(mode).empty;
     recommendationsEl.innerHTML = `<div class="hint">${escapeHtml(emptyText)}</div>`;
     return;
   }
@@ -3026,8 +3032,8 @@ function renderGalleryCards(items, append = false) {
   for (const item of items) {
     const card = document.createElement("article");
     card.dataset.galleryUrl = item.url;
-    card.className = focus ? "card focus-card" : lowInterestMode ? "card low-interest-card" : "card";
-    const localItem = mode === "review" ? localPageForGallery(item.url) : null;
+    card.className = focus ? "card focus-card" : "card";
+    const localItem = isReviewView(mode) ? localPageForGallery(item.url) : null;
     const localCover = localItem?.pages[0];
     const thumbContent = item.thumb_url || localCover
       ? `<img src="${escapeAttr(item.thumb_url ? thumbnailSrc(item) : localCover.src)}" alt="${item.thumb_url ? "" : `Local file ${localCover.position}`}" loading="lazy">`
@@ -3036,7 +3042,7 @@ function renderGalleryCards(items, append = false) {
       ? `<a class="thumb" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer" aria-label="Open ${escapeAttr(item.title)}">${thumbContent}</a>`
       : `<div class="thumb">${thumbContent}</div>`;
     const samples = item.samples || [];
-    const samplesPreview = samples.length && !lowInterestMode
+    const samplesPreview = samples.length
       ? `<div class="samples">${samples
           .map((thumb, index) => `<img src="${escapeAttr(sampleSrc(item.url, index))}" data-sample-index="${index}" alt="" loading="lazy">`)
           .join("")}</div>`
@@ -3138,8 +3144,6 @@ function renderGalleryCards(items, append = false) {
         </label>`;
     let feedbackControls = mode === "preview" || classifierMode
       ? ""
-      : lowInterestMode
-        ? compactFeedbackControls
       : `<div class="votes">
           <button class="down" type="button" data-vote="-1" data-url="${escapeAttr(item.url)}" title="Record a mild negative signal for this gallery.">Thumb down</button>
           <button class="skip" type="button" data-skip="1" data-url="${escapeAttr(item.url)}" title="Mark this gallery as reviewed with a neutral score so it leaves the review queue.">Skip</button>
@@ -3191,7 +3195,7 @@ function renderGalleryCards(items, append = false) {
         ${samplesPreview}
       </div>
       <div class="body">
-        ${mode === "review" ? `<div class="local-media-tools"><span class="local-media-status">${localItem && (!item.thumb_url || !samples.length) ? "Local file preview" : ""}</span>${localItem ? `<button type="button" class="clear" data-local-compare="${escapeAttr(localItem.key)}">Compare samples</button>` : ""}</div>` : ""}
+        ${isReviewView(mode) ? `<div class="local-media-tools"><span class="local-media-status">${localItem && (!item.thumb_url || !samples.length) ? "Local file preview" : ""}</span>${localItem ? `<button type="button" class="clear" data-local-compare="${escapeAttr(localItem.key)}">Compare samples</button>` : ""}</div>` : ""}
         ${lowInterestBadge}
         ${auditBadge}
         <a class="title" href="${escapeAttr(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>
@@ -3208,10 +3212,10 @@ function renderGalleryCards(items, append = false) {
         ${markStatus ? `<div class="meta">${escapeHtml(markStatus)}</div>` : ""}
         ${reactionAt ? `<div class="meta">${escapeHtml(reactionAt)}</div>` : ""}
         ${markAt ? `<div class="meta">${escapeHtml(markAt)}</div>` : ""}
-        ${lowInterestMode || focus ? "" : parentChain}
-        ${lowInterestMode ? "" : `<div class="pillrow">${tags}</div>`}
+        ${focus ? "" : parentChain}
+        <div class="pillrow">${tags}</div>
         <div class="reason">${reasons}</div>
-        ${lowInterestMode || focus ? "" : relatedFeedback}
+        ${focus ? "" : relatedFeedback}
         ${focus ? focusMore : classificationActions}
         ${focus ? "" : feedbackControls}
       </div>
@@ -3320,6 +3324,7 @@ async function withPendingFeedback(galleryUrl, action, rating = false) {
     item: renderedGalleryItems.find((item) => item.url === galleryUrl),
     index: renderedGalleryItems.findIndex((item) => item.url === galleryUrl),
     epoch: reviewQueueEpoch,
+    view: currentView,
   } : null;
   if (!rating || !isFocusReview()) reviewUndo = null;
   pendingFeedbackUrls.add(galleryUrl);
@@ -3343,7 +3348,7 @@ async function withPendingFeedback(galleryUrl, action, rating = false) {
     }
     updateReviewControls();
     await flushDeferredReviewReload();
-    if (succeeded && requestedView === "review" && currentView === requestedView && epoch === reviewQueueEpoch &&
+    if (succeeded && isReviewView(requestedView) && currentView === requestedView && epoch === reviewQueueEpoch &&
         !reviewBusy() && !renderedGalleryUrls.includes(galleryUrl) && (atReviewTail || !renderedGalleryItems.length)) {
       const previousLength = renderedGalleryItems.length;
       try {
@@ -3386,7 +3391,7 @@ function applyGalleryPage(payload, append = false) {
   updateCurrentQueueCount(payload);
   nextRecommendationOffset = payload.next_offset || 0;
   hasMoreRecommendations = Boolean(payload.has_more);
-  if (currentView === "review") reviewPaginationDirty = false;
+  if (isReviewView()) reviewPaginationDirty = false;
   updateLoadMore(payload.total || 0);
   updateReviewControls();
   if (payload.last_fetch && payload.last_fetch.id) {
@@ -3409,9 +3414,9 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
 }
 
 function updateLoadMore(total = null) {
-  const canLoad = hasMoreRecommendations || (currentView === "review" && reviewPaginationDirty);
-  loadMoreBtn.disabled = !canLoad || (currentView === "review" && reviewLoading);
-  if (currentView === "review" && reviewLoading) {
+  const canLoad = hasMoreRecommendations || (isReviewView() && reviewPaginationDirty);
+  loadMoreBtn.disabled = !canLoad || (isReviewView() && reviewLoading);
+  if (isReviewView() && reviewLoading) {
     loadMoreBtn.textContent = "Loading...";
   } else if (loadMoreBtn.textContent === "Loading...") {
     loadMoreBtn.textContent = canLoad ? "Load More" : "No More";
@@ -3859,8 +3864,8 @@ hathDownloadFilterEl.addEventListener("change", () => {
   if (hathStatusPayload) renderHathDownloadList(hathStatusPayload);
 });
 loadMoreBtn.addEventListener("click", () => {
-  if (!hasMoreRecommendations && !(currentView === "review" && reviewPaginationDirty)) return;
-  if (currentView === "review" && reviewBusy()) return;
+  if (!hasMoreRecommendations && !(isReviewView() && reviewPaginationDirty)) return;
+  if (isReviewView() && reviewBusy()) return;
   loadCurrentPage(nextRecommendationOffset, true).catch((error) => setStatus(error.message, true));
 });
 importFileEl.addEventListener("change", () => {

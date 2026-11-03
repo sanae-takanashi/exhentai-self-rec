@@ -2136,6 +2136,46 @@ class RecommenderTest(unittest.TestCase):
         self.assertTrue(all(item["very_low_interest"] for item in low))
         self.assertEqual({item["like_probability"] for item in low}, {0.35, 0.3, 0.2, 0.1})
 
+    def test_review_can_finish_without_promoting_retained_low_interest(self):
+        store_galleries(self.conn, [
+            Gallery(url=f"https://exhentai.org/g/drain-{index}/a/",
+                    gid=f"drain-{index}", token="a", title=f"Drain {index}")
+            for index in range(10)
+        ])
+        initial = recommend_page(self.conn, limit=20, low_interest_percent=20)
+        low_urls = {item["url"] for item in initial["items"] if item["low_interest"]}
+        for item in initial["items"]:
+            if not item["low_interest"]:
+                record_feedback(self.conn, item["url"], score=3, retrain=False)
+
+        for _ in range(3):
+            primary = recommend_page(self.conn, limit=20, low_interest_percent=20,
+                                     interest_band="primary")
+            low = recommend_page(self.conn, limit=20, low_interest_percent=20,
+                                 interest_band="low")
+            self.assertEqual(primary["items"], [])
+            self.assertEqual(primary["total"], 0)
+            self.assertFalse(primary["has_more"])
+            self.assertEqual({item["url"] for item in low["items"]}, low_urls)
+            self.assertEqual(low["low_interest_total"], len(low_urls))
+        for url in sorted(low_urls):
+            record_feedback(self.conn, url, score=3, retrain=False)
+            low_urls.remove(url)
+            primary = recommend_page(self.conn, low_interest_percent=20, interest_band="primary")
+            low = recommend_page(self.conn, low_interest_percent=20, interest_band="low")
+            self.assertEqual(primary["total"], 0)
+            self.assertEqual({item["url"] for item in low["items"]}, low_urls)
+
+    def test_retained_tail_can_cover_the_entire_remaining_pool(self):
+        for total in (1, 2, 5):
+            with self.subTest(total=total):
+                scored = [{"url": str(index)} for index in range(total)]
+                policy = annotate_interest_bands(scored, 20,
+                    retained_low_interest_urls={item["url"] for item in scored})
+                self.assertEqual(policy["low_interest_total"], total)
+                self.assertTrue(all(item["low_interest"] for item in scored))
+                self.assertTrue(all(item["low_interest_fallback"] for item in scored))
+
     def test_learned_threshold_requires_an_accepted_matching_probability_model(self):
         base_artifact = {
             "ready": True,
