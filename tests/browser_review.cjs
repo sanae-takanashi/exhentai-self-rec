@@ -363,10 +363,106 @@ async function scenario(viewport) {
   }
 }
 
+async function batchScenario(viewport) {
+  const context = await browser.newContext({ viewport });
+  await context.addInitScript(() => {
+    sessionStorage.setItem("review-layout", "focus");
+    const schedule = window.setTimeout.bind(window);
+    window.setTimeout = (callback, ms, ...args) => {
+      if (ms === 30000) window.fixtureDeadline = callback;
+      return schedule(callback, ms, ...args);
+    };
+  });
+  const page = await context.newPage();
+  const items = Array.from({ length: 81 }, (_, index) => ({
+    url: `https://example.test/g/batch-${index}/token/`, title: `Batch fixture ${index + 1}`,
+    tags: [], samples: [], reasons: [],
+    visual_embedding_at: "fixture", visual_embedding_version: "canvas-rgb-8x8-v1",
+  }));
+  const removed = new Set(), errors = [];
+  let listCalls = 0, feedbackCalls = 0, stalled = false, aborted = false;
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("requestfailed", (request) => {
+    if (new URL(request.url()).pathname === "/api/recommendations") aborted = true;
+  });
+  const json = (route, body) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
+  await context.route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    assert.equal(url.hostname, "review-batch.test", "unexpected external networking");
+    if (url.pathname === "/" || url.pathname.startsWith("/static/")) {
+      const name = url.pathname === "/" ? "index.html" : url.pathname.slice(8);
+      assert(["index.html", "app.js", "styles.css", "visibility.js"].includes(name));
+      return route.fulfill({ contentType: name.endsWith(".js") ? "text/javascript" : name.endsWith(".css") ? "text/css" : "text/html",
+        body: fs.readFileSync(path.join(root, "static", name)) });
+    }
+    if (url.pathname === "/api/settings") return json(route, { bootstrap_tags: [], visual_encoder: "simple", recommend_language_filter: "all" });
+    if (url.pathname === "/api/recommendations") {
+      listCalls++;
+      if (listCalls === 2) { stalled = true; return; }
+      const eligible = items.filter((item) => !removed.has(item.url));
+      const offset = Number(url.searchParams.get("offset"));
+      return json(route, { items: eligible.slice(offset, offset + 40), total: eligible.length,
+        next_offset: offset + Math.min(40, eligible.length - offset), has_more: offset + 40 < eligible.length });
+    }
+    if (url.pathname === "/api/feedback") {
+      const body = route.request().postDataJSON();
+      assert(!removed.has(body.gallery_url), "feedback was resubmitted");
+      feedbackCalls++;
+      removed.add(body.gallery_url);
+      return json(route, { ok: true, removed_gallery_url: body.gallery_url,
+        feedback_undo_supported: true, feedback_update: { latest_feedback_id: feedbackCalls } });
+    }
+    if (url.pathname === "/api/queue-counts") return json(route, { review: items.length - removed.size });
+    return json(route, {});
+  });
+  try {
+    await page.goto("http://review-batch.test/");
+    await page.locator(".focus-card").waitFor();
+    for (let index = 0; index < 81; index++) {
+      assert.equal(await page.locator(".focus-card").getAttribute("data-gallery-url"), items[index].url);
+      await page.keyboard.press(index % 2 ? "d" : "5");
+      if (index === 39) {
+        await until(() => stalled);
+        assert.equal(await page.locator("#recommendations").getAttribute("aria-busy"), "true");
+        assert.equal(await page.locator("#recommendations .hint").innerText(), "Loading galleries...");
+        assert(await page.locator("#reviewNextBtn").isDisabled());
+        await page.screenshot({ path: path.join(output, `${viewport.width}-batch-loading.png`) });
+        await page.evaluate(() => window.fixtureDeadline());
+        await page.waitForFunction(() => !reviewBusy());
+        await until(() => aborted);
+        assert.equal(feedbackCalls, 40);
+        assert.equal(await page.locator("#recommendations").getAttribute("aria-busy"), "false");
+        assert.equal(await page.locator("#recommendations .hint").innerText(), "No galleries loaded.");
+        assert(await page.locator("#reviewNextBtn").isEnabled());
+        assert(await page.locator("#reviewRefreshBtn").isEnabled());
+        assert(await page.locator("#reviewUndoBtn").isEnabled());
+        await page.locator("#reviewNextBtn").click();
+        await page.waitForFunction(() => !reviewBusy());
+        await page.locator("#reviewNextBtn").blur();
+        assert.equal(feedbackCalls, 40);
+        assert.equal(await page.locator(".focus-card").getAttribute("data-gallery-url"), items[40].url);
+        await page.screenshot({ path: path.join(output, `${viewport.width}-batch-recovered.png`) });
+      } else {
+        await page.waitForFunction(() => !reviewBusy());
+      }
+    }
+    assert.equal(feedbackCalls, 81);
+    assert.equal(listCalls, 5);
+    assert.equal(await page.locator(".focus-card").count(), 0);
+    assert(await page.locator("#reviewNextBtn").isDisabled());
+    assert.equal(await page.locator("#loadMoreBtn").innerText(), "No More");
+    assert.deepEqual(errors, []);
+    return { viewport, feedbackCalls, listCalls, timeout_recovered: true, passed: true };
+  } finally {
+    await context.close();
+  }
+}
+
 (async () => {
   browser = await chromium.launch({ channel: "msedge", headless: true });
   const results = [];
   for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }, { width: 320, height: 568 }]) results.push(await scenario(viewport));
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) results.push(await batchScenario(viewport));
   fs.writeFileSync(path.join(output, "results.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify({ passed: results.length, evidence: output }));
 })().catch((error) => { console.error(error); process.exitCode = 1; })

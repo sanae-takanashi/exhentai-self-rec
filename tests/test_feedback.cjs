@@ -64,11 +64,13 @@ function fixture(view = "review") {
   };
   const requests = [];
   const context = {
-    document, console, URLSearchParams, CSS: { escape: (value) => value },
+    document, console, URLSearchParams, AbortController, setTimeout, clearTimeout,
+    CSS: { escape: (value) => value },
     fixtureItems: items, fixtureView: view,
     fixtureApi: (url, options) => {
       const pending = deferred();
       requests.push({ url, options, ...pending });
+      options?.signal?.addEventListener("abort", () => pending.reject(options.signal.reason), { once: true });
       return pending.promise;
     },
   };
@@ -83,6 +85,7 @@ function fixture(view = "review") {
     renderLowInterestPolicy = () => {};
     renderClassifierSummary = () => {};
     currentView = fixtureView;
+    initialPageLoading = false;
     renderGalleryCards(fixtureItems);
     nextRecommendationOffset = 2;
   `, context);
@@ -570,6 +573,99 @@ test("classification completed after a view switch cannot apply the old queue", 
 
 const nextItem = { ...items[1], url: "https://example.test/g/next/token/" };
 const tick = () => new Promise(setImmediate);
+
+for (const action of ["vote(url, 1)", "score(url, 5)", "skip(url)"]) {
+  test(`Focus: ${action} continues across two complete 40-gallery batches`, async () => {
+    const f = focusFixture();
+    f.run(`globalThis.batchItems = Array.from({ length: 81 }, (_, index) => ({
+      ...fixtureItems[0], url: 'https://example.test/g/batch-' + index + '/token/',
+    }));
+    applyGalleryPage({ items: batchItems.slice(0, 40), total: 81, next_offset: 40, has_more: true });`);
+    for (let index = 0; index < 81; index++) {
+      const url = `https://example.test/g/batch-${index}/token/`;
+      assert.equal(f.run("reviewCurrentUrl"), url);
+      const requestIndex = f.requests.length;
+      f.run(`globalThis.url = batchItems[${index}].url;`);
+      const saving = f.run(action);
+      assert.equal(f.requests[requestIndex].url, "/api/feedback");
+      f.respond(requestIndex, { ...undoResponse(index + 1), removed_gallery_url: url });
+      await tick();
+      if ((index + 1) % 40 === 0 || index === 80) {
+        const next = f.requests[requestIndex + 1];
+        assert(next.url.startsWith("/api/recommendations?"));
+        assert.equal(new URL(next.url, "https://local.test").searchParams.get("offset"), "0");
+        assert.equal(f.run("reviewLoading"), true);
+        const remaining = f.run(`JSON.stringify(batchItems.slice(${index + 1}))`);
+        const eligible = JSON.parse(remaining);
+        f.respond(requestIndex + 1, {
+          items: eligible.slice(0, 40), total: eligible.length,
+          next_offset: Math.min(40, eligible.length), has_more: eligible.length > 40,
+        });
+      }
+      await saving;
+      assert.equal(f.run("reviewBusy()"), false);
+      assert.equal(f.run("reviewUndo.feedbackId"), index + 1);
+    }
+    assert.deepEqual(f.urls(), []);
+    assert.equal(f.requests.filter((request) => request.url === "/api/feedback").length, 81);
+    assert.equal(f.requests.filter((request) => request.url.startsWith("/api/recommendations?")).length, 3);
+    assert.equal(f.run('document.querySelector("#reviewNextBtn").disabled'), true);
+    assert.equal(f.run("loadMoreBtn.textContent"), "No More");
+  });
+}
+
+function useManualDeadline(f) {
+  f.run(`globalThis.fixtureDeadline = null;
+    globalThis.fixtureDeadlineMs = null;
+    globalThis.fixtureDeadlineCleared = false;
+    setTimeout = (callback, ms) => { fixtureDeadline = callback; fixtureDeadlineMs = ms; return 17; };
+    clearTimeout = (id) => { fixtureDeadlineCleared = id === 17; };
+  `);
+}
+
+test("Focus: a stalled continuation times out without resubmitting the committed rating", async () => {
+  const f = focusFixture();
+  useManualDeadline(f);
+  f.run("applyGalleryPage({ items: [fixtureItems[0]], total: 1, next_offset: 1, has_more: false })");
+  const saving = f.run("score(fixtureItems[0].url, 5)");
+  f.respond(0, undoResponse());
+  await tick();
+  assert.equal(f.run("reviewBusy()"), true);
+  assert.equal(f.run("fixtureDeadlineMs"), 30000);
+  assert.equal(f.requests[1].options.cache, "no-store");
+  f.run("fixtureDeadline()");
+  await saving;
+  assert.equal(f.run("reviewBusy()"), false);
+  assert.equal(f.run("fixtureDeadlineCleared"), true);
+  assert.deepEqual(f.urls(), []);
+  assert.equal(f.run("loadMoreBtn.textContent"), "Load More");
+  assert.equal(f.run("reviewUndo.feedbackId"), 7);
+  assert.equal(f.run('document.querySelector("#reviewNextBtn").disabled'), false);
+  const retry = f.run("navigateReview(1)");
+  f.respond(2, page([nextItem]));
+  await retry;
+  assert.equal(f.run("reviewCurrentUrl"), nextItem.url);
+  assert.equal(f.requests.filter((request) => request.url === "/api/feedback").length, 1);
+});
+
+test("Focus: one deadline bounds the entire duplicate-page scan and late results are ignored", async () => {
+  const f = focusFixture();
+  useManualDeadline(f);
+  await f.run("navigateReview(1); hasMoreRecommendations = true;");
+  const loading = f.run("navigateReview(1)");
+  f.respond(0, { items, total: 5, next_offset: 4, has_more: true });
+  await tick();
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests[0].options.signal, f.requests[1].options.signal);
+  f.run("fixtureDeadline()");
+  await assert.rejects(loading, /timed out/);
+  f.respond(1, page([nextItem]));
+  await tick();
+  assert.deepEqual(f.urls(), items.map((item) => item.url));
+  assert.equal(f.run("reviewCurrentUrl"), items[1].url);
+  assert.equal(f.run("reviewBusy()"), false);
+  assert.equal(f.run("fixtureDeadlineCleared"), true);
+});
 
 for (const layout of ["focus", "grid"]) {
   test(`${layout}: consuming the final card rechecks inventory even after No More`, async () => {

@@ -178,6 +178,12 @@ function saveReviewPosition() {
   } catch (_) { /* The review queue does not depend on browser storage. */ }
 }
 
+function reviewEmptyText() {
+  if (reviewLoading) return "Loading galleries...";
+  if (hasMoreRecommendations || reviewPaginationDirty) return "No galleries loaded.";
+  return viewCopy("review").empty;
+}
+
 function updateReviewControls() {
   const focus = isFocusReview();
   document.body?.classList.toggle("focus-review", focus);
@@ -195,6 +201,11 @@ function updateReviewControls() {
   refresh.disabled = reviewBusy();
   refresh.classList.toggle("updates-available", reviewUpdatesAvailable);
   refresh.title = reviewUpdatesAvailable ? "New updates available; refresh review queue" : "Refresh review queue";
+  recommendationsEl.setAttribute("aria-busy", String(currentView === "review" && reviewLoading));
+  if (currentView === "review") {
+    const empty = !renderedGalleryItems.length && recommendationsEl.querySelector(".hint");
+    if (empty) empty.textContent = reviewEmptyText();
+  }
   if (focus) {
     for (const button of recommendationsEl.querySelectorAll("button[data-url]")) button.disabled = reviewBusy();
   }
@@ -2014,6 +2025,7 @@ async function loadRecommendations(offset = 0, append = false) {
     }
     updateLoadMore();
     updateReviewControls();
+    setStatus(append ? "Loading next galleries..." : "Loading review galleries...");
   }
   const localFilter = localFilterEl.value.trim();
   const includeRated = requestedView === "preview" ? "1" : "0";
@@ -2028,12 +2040,17 @@ async function loadRecommendations(offset = 0, append = false) {
   if (requestedView === "review" && !append && offset === 0) {
     reviewExploreSeed = `${Date.now()}-${Math.random()}`;
   }
+  const controller = requestedView === "review" ? new AbortController() : null;
+  // Bound the whole rescan, including duplicate pages and response-body reads.
+  const timeout = controller ? setTimeout(() => controller.abort(), 30000) : null;
   let payload;
   try {
     while (true) {
       payload = await api(
-        `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`
+        `/api/recommendations?include_rated=${includeRated}&freshness_weight=${encodeURIComponent(freshnessWeight)}&posted_after=${encodeURIComponent(postedAfter)}&bootstrap_explore_count=${bootstrapExploreCount}&require_bootstrap_match=${requireBootstrapMatch}&interest_band=${encodeURIComponent(interestBand)}&explore_seed=${encodeURIComponent(reviewExploreSeed)}&language_filter=${encodeURIComponent(languageFilter)}&model_mode=${encodeURIComponent(modelMode)}&limit=${recommendationLimit}&offset=${offset}&filter=${encodeURIComponent(localFilter)}`,
+        controller ? { signal: controller.signal, cache: "no-store" } : {}
       );
+      if (controller?.signal.aborted) throw new Error("Review queue load timed out");
       if (requestId !== recommendationRequestId || currentView !== requestedView) return;
       // Feedback can rerank unseen items before the old offset. Rescan without
       // replacing the loaded queue, and skip pages containing only known URLs.
@@ -2049,7 +2066,13 @@ async function loadRecommendations(offset = 0, append = false) {
     renderLowInterestPolicy(payload.low_interest_policy, requestedView);
     recordPageImpressions(payload, requestedView === "preview" ? "preview" : "review", offset, append);
     setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(requestedView).loaded}`);
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error("Review queue load timed out. Retry Next, Load More or Refresh.");
+    }
+    throw error;
   } finally {
+    if (timeout !== null) clearTimeout(timeout);
     if (requestedView === "review" && reviewLoadId === reviewLoadSequence) {
       reviewLoading = false;
       updateLoadMore();
@@ -2917,7 +2940,7 @@ function renderGalleryCards(items, append = false) {
   if (!append && !items.length) {
     const emptyText = mode === "history" && localFilterEl.value.trim()
       ? "No matching reaction history found."
-      : viewCopy(mode).empty;
+      : mode === "review" ? reviewEmptyText() : viewCopy(mode).empty;
     recommendationsEl.innerHTML = `<div class="hint">${escapeHtml(emptyText)}</div>`;
     return;
   }
@@ -3310,7 +3333,11 @@ async function reloadRecommendationsAfterFetch(statusPayload) {
 function updateLoadMore(total = null) {
   const canLoad = hasMoreRecommendations || (currentView === "review" && reviewPaginationDirty);
   loadMoreBtn.disabled = !canLoad || (currentView === "review" && reviewLoading);
-  if (canLoad || total !== null) {
+  if (currentView === "review" && reviewLoading) {
+    loadMoreBtn.textContent = "Loading...";
+  } else if (loadMoreBtn.textContent === "Loading...") {
+    loadMoreBtn.textContent = canLoad ? "Load More" : "No More";
+  } else if (canLoad || total !== null) {
     loadMoreBtn.textContent = canLoad || !total ? "Load More" : "No More";
   }
 }

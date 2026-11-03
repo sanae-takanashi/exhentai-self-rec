@@ -80,6 +80,13 @@ new candidates into the bounded recommendation pool. A failed continuation
 does not undo or resubmit the successful action; Next, Load More and Refresh
 remain available to retry, and Focus rating undo remains valid.
 
+Review list reads bypass the browser cache and have a 30-second deadline for
+the entire continuation scan, including response bodies and duplicate pages.
+Loading is shown separately from an exhausted queue. A stalled read releases
+the controls at the deadline, preserves committed feedback and the undo slot,
+and never automatically retries a feedback POST. Late results cannot append
+after the deadline; the owner can retry the list read with Next or Load More.
+
 Feedback can also change eligibility, interest bands and ranking. The next
 append after a local removal or undo therefore scans from offset zero without
 replacing or reordering existing queued cards. Duplicate-only pages are skipped
