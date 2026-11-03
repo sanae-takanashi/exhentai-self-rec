@@ -240,6 +240,16 @@
               <input id="reviewFocusMode" type="radio" name="reviewLayout" value="focus">
               <label for="reviewFocusMode">Focus</label>
             </fieldset>
+            <div class="review-ranking-controls">
+              <fieldset id="reviewRankingSwitch" class="review-layout-switch review-ranking-switch" disabled>
+                <legend class="sr-only">Review ranking</legend>
+                <input id="reviewLegacyRanking" type="radio" name="reviewRanking" value="legacy" checked>
+                <label for="reviewLegacyRanking">Legacy</label>
+                <input id="reviewTrialRanking" type="radio" name="reviewRanking" value="personalized_trial">
+                <label for="reviewTrialRanking">v5 Trial</label>
+              </fieldset>
+              <output id="reviewRankingStatus" class="sr-only" aria-live="polite">Legacy</output>
+            </div>
             <div id="reviewSessionToolbar" class="review-session-toolbar hidden">
               <!-- Lucide icons, ISC license: LUCIDE-LICENSE.txt -->
               <button id="reviewPrevBtn" class="icon-button" type="button" aria-label="Previous gallery" title="Previous gallery (k / Left arrow)"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg></button>

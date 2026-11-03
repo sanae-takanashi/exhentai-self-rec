@@ -84,6 +84,11 @@ CREATE TABLE IF NOT EXISTS recommendation_impressions (
     UNIQUE(request_id, gallery_url, surface)
 );
 
+CREATE TABLE IF NOT EXISTS feedback_impression_links (
+    feedback_id INTEGER PRIMARY KEY REFERENCES feedback(id) ON DELETE CASCADE,
+    impression_id INTEGER NOT NULL REFERENCES recommendation_impressions(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS low_interest_audits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     audit_date TEXT NOT NULL,
@@ -482,6 +487,7 @@ def init_db() -> None:
             "updates_min_new_pages": "50",
             "recommend_language_filter": "japanese,chinese",
             "recommend_model_mode": "hybrid",
+            "review_ranking_mode": "legacy",
             "preview_freshness_weight": "8.0",
             "preview_posted_after": "",
             "review_require_bootstrap_match": "1",

@@ -151,6 +151,9 @@ let reviewReloadQueued = false;
 let reviewUpdatesAvailable = false;
 let reviewHintsExpanded = true;
 let reviewPaginationDirty = false;
+let reviewRankingMode = "legacy";
+let reviewRankingSupported = false;
+let reviewRankingPending = false;
 const reviewOpenedUrls = new Set();
 const impressionContexts = new Map();
 let disposeGalleryVisibility = () => {};
@@ -164,7 +167,7 @@ function isFocusReview() {
 }
 
 function reviewBusy() {
-  return reviewLoading || reviewUndoPending || pendingFeedbackUrls.size > 0 || pendingGalleryRefreshUrls.size > 0;
+  return reviewLoading || reviewRankingPending || reviewUndoPending || pendingFeedbackUrls.size > 0 || pendingGalleryRefreshUrls.size > 0;
 }
 
 function currentReviewItem() {
@@ -192,6 +195,9 @@ function updateReviewControls() {
   document.querySelector("#reviewGridMode").checked = reviewLayout === "grid";
   document.querySelector("#reviewFocusMode").checked = reviewLayout === "focus";
   for (const id of ["reviewGridMode", "reviewFocusMode"]) document.querySelector(`#${id}`).disabled = reviewBusy();
+  document.querySelector("#reviewRankingSwitch").disabled = reviewBusy() || !reviewRankingSupported;
+  document.querySelector("#reviewLegacyRanking").checked = reviewRankingMode === "legacy";
+  document.querySelector("#reviewTrialRanking").checked = reviewRankingMode === "personalized_trial";
   const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
   document.querySelector("#reviewPosition").textContent = `${index < 0 ? 0 : index + 1} / ${renderedGalleryItems.length}`;
   document.querySelector("#reviewPrevBtn").disabled = reviewBusy() || index <= 0;
@@ -206,13 +212,57 @@ function updateReviewControls() {
     const empty = !renderedGalleryItems.length && recommendationsEl.querySelector(".hint");
     if (empty) empty.textContent = reviewEmptyText();
   }
-  if (focus) {
-    for (const button of recommendationsEl.querySelectorAll("button[data-url]")) button.disabled = reviewBusy();
+  if (currentView === "review") {
+    for (const button of recommendationsEl.querySelectorAll("button[data-url]")) {
+      if (focus) button.disabled = reviewBusy();
+      else if (reviewRankingPending && !button.disabled) {
+        button.dataset.rankingLocked = "1";
+        button.disabled = true;
+      } else if (!reviewRankingPending && button.dataset.rankingLocked) {
+        delete button.dataset.rankingLocked;
+        button.disabled = false;
+      }
+    }
   }
   if (focus && recommendationsEl.getBoundingClientRect) {
     const top = recommendationsEl.getBoundingClientRect().top + window.scrollY;
     const footerHeight = recommendationsEl.querySelector(".focus-rating")?.getBoundingClientRect().height || 118;
     recommendationsEl.style.setProperty("--review-work-height", `${Math.max(48, window.innerHeight - top - footerHeight - 24)}px`);
+  }
+}
+
+async function setReviewRanking(mode) {
+  if (currentView !== "review" || reviewBusy() || !reviewRankingSupported || mode === reviewRankingMode) {
+    updateReviewControls();
+    return;
+  }
+  reviewRankingPending = true;
+  ++recommendationRequestId;
+  ++reviewQueueEpoch;
+  updateReviewControls();
+  document.querySelector("#reviewRankingStatus").textContent = "Switching...";
+  try {
+    const settings = await api("/api/settings", {
+      method: "POST", body: JSON.stringify({ review_ranking_mode: mode }),
+    });
+    reviewRankingMode = settings.review_ranking_mode === "personalized_trial" ? "personalized_trial" : "legacy";
+    reviewUndo = null;
+    reviewCurrentUrl = "";
+    reviewPaginationDirty = false;
+    if (currentView === "review") {
+      disposeGalleryVisibility();
+      impressionContexts.clear();
+      renderedGalleryItems = [];
+      renderedGalleryUrls = [];
+      renderGalleryCards([]);
+      await loadCurrentPage();
+    }
+  } catch (error) {
+    document.querySelector("#reviewRankingStatus").textContent = "Switch failed";
+    throw error;
+  } finally {
+    reviewRankingPending = false;
+    updateReviewControls();
   }
 }
 
@@ -708,6 +758,9 @@ async function loadSettings() {
   networkProxyEl.value = settings.network_proxy || "";
   languageFilterEl.value = settings.recommend_language_filter || "chinese,japanese";
   modelModeEl.value = settings.recommend_model_mode || "hybrid";
+  reviewRankingSupported = Object.hasOwn(settings, "review_ranking_mode");
+  reviewRankingMode = settings.review_ranking_mode === "personalized_trial" ? "personalized_trial" : "legacy";
+  updateReviewControls();
   reviewRequireBootstrapMatchEl.checked = settings.review_require_bootstrap_match !== false;
   visualEncoderEl.value = settings.visual_encoder || visualDefaultEncoder;
   dinov2DeviceEl.value = settings.dinov2_device || "auto";
@@ -2063,6 +2116,16 @@ async function loadRecommendations(offset = 0, append = false) {
       offset = payload.next_offset;
     }
     applyGalleryPage(payload, append);
+    if (requestedView === "review" && payload.review_ranking) {
+      const ranking = payload.review_ranking;
+      reviewRankingMode = ranking.requested;
+      const status = document.querySelector("#reviewRankingStatus");
+      status.textContent = ranking.active === "personalized_trial" ? "v5 Trial" : ranking.active === "visual"
+        ? "Visual" : ranking.fallback_reason ? "Legacy (v5 unavailable)" : "Legacy";
+      status.classList.toggle("sr-only", !ranking.fallback_reason);
+      status.title = [ranking.artifact_id, ranking.trained_at, ranking.fallback_reason].filter(Boolean).join(" / ");
+      updateReviewControls();
+    }
     renderLowInterestPolicy(payload.low_interest_policy, requestedView);
     recordPageImpressions(payload, requestedView === "preview" ? "preview" : "review", offset, append);
     setStatus(`${append ? nextRecommendationOffset : payload.items.length} of ${payload.total} ${viewCopy(requestedView).loaded}`);
@@ -2231,6 +2294,7 @@ async function vote(galleryUrl, voteValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         vote: voteValue,
+        ...feedbackImpression(galleryUrl),
         reason_code: voteValue < 0 ? optionalNegativeReason(galleryUrl) : null,
         surface: feedbackSurface(galleryUrl),
         view: currentView,
@@ -2254,6 +2318,7 @@ async function score(galleryUrl, scoreValue) {
       body: JSON.stringify({
         gallery_url: galleryUrl,
         score: scoreValue,
+        ...feedbackImpression(galleryUrl),
         reason_code: scoreValue < 3 ? optionalNegativeReason(galleryUrl) : null,
         surface: feedbackSurface(galleryUrl),
         view: currentView,
@@ -2440,6 +2505,11 @@ function optionalNegativeReason(galleryUrl) {
   return select && select.value ? select.value : null;
 }
 
+function feedbackImpression(galleryUrl) {
+  const context = impressionContexts.get(galleryUrl);
+  return context?.ready ? { impression_request_id: context.requestId, impression_surface: context.surface } : {};
+}
+
 function feedbackSurface(galleryUrl) {
   const item = renderedGalleryItems.find((entry) => entry && entry.url === galleryUrl);
   return item && item.audit_id ? "audit" : currentView;
@@ -2493,6 +2563,12 @@ function recordPageImpressions(payload, surface, offset = 0, preserveExisting = 
         served_model: item.served_model,
         served_rank_score: item.served_rank_score,
         served_rank: item.served_rank,
+        ranking_trial: item.ranking_trial,
+        ranking_policy: item.ranking_policy,
+        ranking_requested: item.ranking_requested,
+        ranking_fallback: item.ranking_fallback,
+        ranking_artifact_id: item.ranking_artifact_id,
+        ranking_trained_at: item.ranking_trained_at,
         legacy_score: item.legacy_score,
         legacy_rank: item.legacy_rank,
         legacy_percentile: item.legacy_percentile,
@@ -3081,7 +3157,7 @@ function renderGalleryCards(items, append = false) {
     const pageCount = item.page_count ? ` · ${item.page_count} pages` : "";
     const scoreMeta = classifierMode
       ? `${escapeHtml(item.category || "Unknown")}${escapeHtml(pageCount)}`
-      : `${escapeHtml(item.category || "Unknown")} · ${item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}`;
+      : `${escapeHtml(item.category || "Unknown")} · ${item.ranking_trial ? "v5 Trial" : item.like_probability != null && Number.isFinite(Number(item.like_probability)) ? `match ${Math.round(Number(item.like_probability) * 100)}%` : `score ${item.score}`}${escapeHtml(pageCount)}`;
     const lowInterestBadge = lowInterestMode
       ? item.low_interest_reason === "learned-threshold"
         ? `<div class="interest-badge learned-threshold-badge">Very Low · model &le; ${Math.round(Number(item.low_interest_threshold || 0) * 100)}% · rank ${Number(item.interest_rank || 0)} of ${Number(item.interest_total || 0)}</div>`
@@ -3122,7 +3198,7 @@ function renderGalleryCards(items, append = false) {
         ${focus ? `<span class="review-opened${reviewOpenedUrls.has(item.url) ? "" : " hidden"}">Opened</span>` : ""}
         <div class="meta">${scoreMeta}</div>
         ${classifierSampleMeta}
-        ${Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
+        ${item.uncertainty != null && Number.isFinite(Number(item.uncertainty)) ? `<div class="meta">Confidence ${Math.round(Number(item.confidence || 0) * 100)}% · uncertainty ${Number(item.uncertainty).toFixed(3)}</div>` : ""}
         <div class="meta">${escapeHtml([uploader, postedAt].filter(Boolean).join(" · "))}</div>
         <div class="meta">${escapeHtml(detailStatus)}</div>
         ${continuingMeta}
@@ -3142,6 +3218,8 @@ function renderGalleryCards(items, append = false) {
       ${focus ? feedbackControls : ""}
     `;
     recommendationsEl.appendChild(card);
+    const ratingPanel = focus ? card.querySelector(".focus-rating") : null;
+    if (ratingPanel) recommendationsEl.appendChild(ratingPanel);
     if (pendingFeedbackUrls.has(item.url)) {
       setGalleryFeedbackButtonsDisabled(item.url, true);
     }
@@ -3882,6 +3960,12 @@ recommendationsEl.addEventListener("click", (event) => {
 for (const input of document.querySelectorAll("input[name='reviewLayout']")) {
   input.addEventListener("change", () => {
     setReviewLayout(input.value);
+    input.blur();
+  });
+}
+for (const input of document.querySelectorAll("input[name='reviewRanking']")) {
+  input.addEventListener("change", () => {
+    setReviewRanking(input.value).catch((error) => setStatus(error.message, true));
     input.blur();
   });
 }

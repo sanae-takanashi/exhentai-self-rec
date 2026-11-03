@@ -574,6 +574,8 @@ def record_feedback(
     reason_code: str | None = None,
     surface: str | None = None,
     retrain: bool = True,
+    impression_request_id: str | None = None,
+    impression_surface: str | None = None,
 ) -> bool:
     # A vote needs its own baseline even when the gallery has not changed since
     # the previous fetch; later Updates filtering compares growth to this row.
@@ -597,6 +599,15 @@ def record_feedback(
         "INSERT INTO feedback(gallery_url, vote, score, note, reason_code, surface) VALUES (?, ?, ?, ?, ?, ?)",
         (gallery_url, signal, score, note, normalized_reason, normalize_surface(surface)),
     )
+    if isinstance(impression_request_id, str) and isinstance(impression_surface, str):
+        # Link only a known delivery of this exact gallery on this exact surface.
+        # Missing, delayed or mismatched context stays unknown; never infer the ranker.
+        conn.execute(
+            """INSERT INTO feedback_impression_links(feedback_id, impression_id)
+               SELECT ?, id FROM recommendation_impressions
+               WHERE request_id = ? AND gallery_url = ? AND surface = ?""",
+            (int(cursor.lastrowid), impression_request_id[:120], gallery_url, impression_surface[:80]),
+        )
     if signal != 0:
         complete_low_interest_audit(
             conn,
@@ -1627,6 +1638,7 @@ def _score_recommendation_candidates(
         if model_mode == MODEL_MODE_VISUAL:
             gallery["score_scale"] = "similarity"
         gallery["reasons"] = reasons[:5]
+        gallery["legacy_reasons"] = reasons[:5]
         if personalized_gallery is not None:
             personalized_inputs.append(personalized_gallery)
         scored.append(gallery)
@@ -1646,7 +1658,13 @@ def _score_recommendation_candidates(
                 conn, personalized_inputs, artifact=personalized_artifact
             )
         personalized_status = model_public_status(active_personalized_artifact)
-        predictions_ready = active_personalized_artifact.get("ready") and len(predictions) == len(scored)
+        personalized_status["artifact_id"] = hashlib.sha256(json.dumps({
+            key: active_personalized_artifact.get(key)
+            for key in ("model_version", "trained_at", "signature")
+        }, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+        predictions_ready = active_personalized_artifact.get("ready") and len(predictions) == len(scored) and all(
+            optional_float(prediction.get("rank_score")) is not None for prediction in predictions
+        )
         serving_ready = predictions_ready and active_personalized_artifact.get("accepted") and all(
             prediction.get("like_probability") is not None for prediction in predictions
         )
@@ -1732,6 +1750,7 @@ def recommend_page(
     require_prospective_threshold_validation: bool = False,
     count_only: bool = False,
     training_conn: sqlite3.Connection | None = None,
+    review_ranking_mode: str | None = None,
 ) -> dict:
     # Temporal replay can freeze learned preferences independently of candidate features.
     limit = max(1, min(10000, int(limit)))
@@ -1848,6 +1867,11 @@ def recommend_page(
         scored = [item for item in scored if not item["low_interest"]]
     elif interest_band == INTEREST_BAND_LOW:
         scored = [item for item in scored if item["low_interest"]]
+    review_ranking = None
+    if review_ranking_mode is not None and interest_band == INTEREST_BAND_PRIMARY and not include_rated:
+        # Trial ordering is downstream of triage, memberships and audit sampling.
+        # Never use this opt-in to authorize automatic exclusion or learned queries.
+        review_ranking = apply_review_ranking(scored, review_ranking_mode, model_mode, personalized_status)
     if not count_only:
         scored = diversify_ranked_galleries(scored)
     if interest_band == INTEREST_BAND_PRIMARY:
@@ -1860,6 +1884,9 @@ def recommend_page(
             bootstrap_queries=bootstrap_source_queries({row["tag"]: row["weight"] for row in get_bootstrap_tags(conn)}),
             seed=explore_seed,
         )
+    if review_ranking is not None:
+        for index, item in enumerate(scored):
+            item["served_rank"] = index + 1
     items = [] if count_only else scored[offset : offset + limit]
     next_offset = offset + len(items)
     return {
@@ -1882,10 +1909,58 @@ def recommend_page(
         "language_filter": sorted(language_filter_values),
         "model_mode": model_mode,
         "personalized_model": personalized_status,
+        "review_ranking": review_ranking,
         "continuing_classifier": classifier_status,
         "exclude_short_repeats": bool(exclude_short_repeats),
         "short_repeat_page_limit": SHORT_REPEAT_PAGE_LIMIT,
     }
+
+
+def normalize_review_ranking_mode(value: object) -> str:
+    return "personalized_trial" if value == "personalized_trial" else "legacy"
+
+
+def apply_review_ranking(items: list[dict], requested: str, model_mode: str, model_status: dict) -> dict:
+    requested = normalize_review_ranking_mode(requested)
+    status = {"requested": requested, "active": "legacy", "fallback_reason": None,
+              "artifact_id": model_status.get("artifact_id"), "trained_at": model_status.get("trained_at")}
+    if model_mode == MODEL_MODE_VISUAL:
+        status.update(active="visual", fallback_reason="visual-mode")
+        return status
+    trial = requested == "personalized_trial"
+    if trial:
+        if model_mode != MODEL_MODE_HYBRID or not model_status.get("ready"):
+            status["fallback_reason"] = "model-not-ready"
+        elif not items or any(optional_float(item.get("personalized_rank_score")) is None for item in items):
+            status["fallback_reason"] = "predictions-unavailable"
+        elif not model_status.get("model_version") or not model_status.get("artifact_id"):
+            status["fallback_reason"] = "model-identity-unavailable"
+        else:
+            status["active"] = "personalized_trial"
+    trial = status["active"] == "personalized_trial"
+    for item in items:
+        score = float(item["personalized_rank_score"] if trial else item["legacy_score"])
+        if not trial:
+            score = round(score, 3)
+        item.update(
+            score=score, rank_score=score, served_rank_score=score,
+            served_model="personalized-trial" if trial else "legacy",
+            model_version=model_status["model_version"] if trial else "legacy-linear-v1",
+            score_scale="trial-ranking" if trial else "additive",
+            like_probability=None, uncertainty=None, confidence=None,
+            ranking_trial=trial, ranking_policy=status["active"],
+            ranking_requested=requested, ranking_fallback=status["fallback_reason"],
+            ranking_artifact_id=model_status.get("artifact_id"),
+            ranking_trained_at=model_status.get("trained_at"),
+        )
+        if trial:
+            item["reasons"] = ["v5 trial ranking"]
+        elif "legacy_reasons" in item:
+            item["reasons"] = list(item["legacy_reasons"])
+    items.sort(key=lambda item: (item["rank_score"], -int(item.get("legacy_rank") or 0)), reverse=True)
+    for index, item in enumerate(items):
+        item["served_rank"] = index + 1
+    return status
 
 
 def apply_bootstrap_probability_prior(probability: float, gallery: dict, bootstrap: dict[str, float]) -> float:
@@ -2056,6 +2131,8 @@ def record_impressions(conn: sqlite3.Connection, request_id: str, surface: str, 
             key: item.get(key)
             for key in (
                 "served_model", "served_rank_score", "served_rank",
+                "ranking_trial", "ranking_policy", "ranking_requested", "ranking_fallback",
+                "ranking_artifact_id", "ranking_trained_at",
                 "legacy_score", "legacy_rank", "legacy_percentile", "legacy_bottom_20",
                 "personalized_model_version", "personalized_like_probability",
                 "personalized_rank_score", "personalized_rank", "personalized_percentile",
@@ -3513,7 +3590,7 @@ def marked_gallery_page(
 def diversify_ranked_galleries(scored: list[dict]) -> list[dict]:
     if len(scored) <= 2:
         return scored
-    if all(item.get("score_scale") in {"probability", "similarity"} for item in scored):
+    if all(item.get("score_scale") in {"probability", "similarity", "trial-ranking"} for item in scored):
         return diversify_probability_ranked_galleries(scored)
     remaining = list(scored)
     cached_keys = {id(item): diversity_keys(item) for item in scored}

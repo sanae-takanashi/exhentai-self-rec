@@ -86,6 +86,7 @@ from .recommender import (
     copy_continuing_feedback,
     discovery_page,
     record_impressions,
+    normalize_review_ranking_mode,
     score_gallery,
     set_classification_override,
     short_repeat_page,
@@ -501,6 +502,8 @@ class Handler(BaseHTTPRequestHandler):
                             reason_code=payload.get("reason_code"),
                             surface=payload.get("surface") or payload.get("view"),
                             retrain=False,
+                            impression_request_id=payload.get("impression_request_id"),
+                            impression_surface=payload.get("impression_surface"),
                         )
                     except ValueError as exc:
                         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
@@ -856,6 +859,7 @@ def get_settings() -> dict:
             "updates_min_new_pages": updates_min_new_pages(conn),
             "recommend_language_filter": configured_language_filter(conn),
             "recommend_model_mode": configured_model_mode(conn),
+            "review_ranking_mode": normalize_review_ranking_mode(db.get_setting(conn, "review_ranking_mode", "legacy")),
             "review_low_interest_percent": review_low_interest_percent(conn),
             "review_low_interest_auto_threshold": review_low_interest_auto_threshold(conn),
             "review_low_interest_max_percent": review_low_interest_max_percent(conn),
@@ -1054,6 +1058,10 @@ def save_settings(payload: dict[str, Any]) -> None:
             db.set_setting(conn, "recommend_language_filter", ",".join(sorted(languages)))
         if "recommend_model_mode" in payload:
             db.set_setting(conn, "recommend_model_mode", normalize_model_mode(payload["recommend_model_mode"]))
+        if "review_ranking_mode" in payload:
+            if payload["review_ranking_mode"] not in ("legacy", "personalized_trial"):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Review ranking mode")
+            db.set_setting(conn, "review_ranking_mode", payload["review_ranking_mode"])
         if "review_low_interest_percent" in payload:
             percent = bounded_int(payload["review_low_interest_percent"], default=20, lower=0, upper=50)
             db.set_setting(conn, "review_low_interest_percent", str(percent))
@@ -3491,6 +3499,10 @@ def recommendation_payload(
             else 0
         ),
         require_prospective_threshold_validation=True,
+        review_ranking_mode=(
+            normalize_review_ranking_mode(db.get_setting(conn, "review_ranking_mode", "legacy"))
+            if interest_band == "primary" and not include_rated else None
+        ),
     )
     page["items"] = gallery_item_payloads(conn, page["items"])
     page["request_id"] = hashlib.sha256(

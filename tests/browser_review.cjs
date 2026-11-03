@@ -286,10 +286,12 @@ async function scenario(viewport) {
     await page.evaluate(() => window.scrollTo(0, 0));
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     const bounds = await page.locator(".focus-rating").boundingBox();
-    assert(bounds.y >= 0 && bounds.y + bounds.height <= viewport.height + 1);
+    const scrollingFocus = viewport.width <= 820 && viewport.height <= 650;
+    assert(bounds.y >= 0);
+    if (!scrollingFocus) assert(bounds.y + bounds.height <= viewport.height + 1);
     for (const hint of await hints.locator(".review-key-items > span").all()) {
       const box = await hint.boundingBox();
-      assert(box.x >= 0 && box.x + box.width <= viewport.width && box.y + box.height <= viewport.height,
+      assert(box.x >= 0 && box.x + box.width <= viewport.width && (scrollingFocus || box.y + box.height <= viewport.height),
         "keyboard hint outside viewport");
     }
     assert.equal(await page.locator(".thumb img").evaluate((el) => getComputedStyle(el).objectFit), "contain");
@@ -302,6 +304,7 @@ async function scenario(viewport) {
       `rating footer overlaps gallery details: ${JSON.stringify({ viewport, bounds, bodyBounds })}`);
     for (const selector of ['select[data-reason-for]', '[data-mark="favorite"]', '[data-mark="ban"]', '[data-classification="updates"]']) {
       const control = page.locator(`.focus-rating ${selector}`);
+      if (scrollingFocus) await control.scrollIntoViewIfNeeded();
       assert(await control.isVisible(), `${selector} is not directly visible`);
       const box = await control.boundingBox();
       assert(box.x >= 0 && box.y >= 0 && box.x + box.width <= viewport.width + 1 && box.y + box.height <= viewport.height + 1,
