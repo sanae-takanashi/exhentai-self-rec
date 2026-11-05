@@ -1,21 +1,21 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>采集发现与收益 · ExHentai Self Rec</title>
+  <title>Fetch Discovery &amp; Outcomes · ExHentai Self Rec</title>
   <link rel="stylesheet" href="/static/fetch-insights.css">
   <script src="/static/fetch-insights.js" defer></script>
 </head>
 <body>
 <main>
-  <header><div><a href="/">← 返回推荐</a><h1>采集发现与收益</h1><p>按查询观察新增、重复发现与后续反馈。只读诊断，不自动调整采集预算。</p></div><button id="refresh" type="button">刷新</button></header>
-  <p id="status" role="status" aria-live="polite">正在读取统计…</p>
-  <section class="summary" aria-label="覆盖范围"><div><strong id="unique">—</strong><span>已记录独立画廊</span></div><div><strong id="pairs">—</strong><span>查询与画廊关联</span></div><div><strong id="started">—</strong><span>开始记录时间（UTC）</span></div></section>
-  <details open><summary>如何解读这些数字</summary><p>一次列表操作指一次单页采集调用，不包括内部 HTTP 重试、详情或图片请求。返回次数与入库次数可能不同；新增和重复以入库前是否存在为准。</p><p>好评率 = 好评 ÷（好评 + 差评）。中立、重复更新和未知均单列，未反馈不算差评。只统计首次记录该查询关联后产生的最新反馈；撤销会重新计算。“可见且好评”是查询关联后有实际可见回执、且最新反馈为好评的交集，不表示先看后评或因果关系。</p><p>同一画廊可由多个查询发现，因此各行不能直接相加，也不能证明某查询导致了反馈。历史推断来自旧 source_query 字段，仅提示覆盖，没有历史成本或收益。样本少的比率不宜直接比较。</p></details>
-  <div class="controls"><label>筛选查询 <input id="filter" type="search" placeholder="输入查询关键词"></label><label>排序 <select id="sort"><option value="new_positive">新增好评</option><option value="recorded_galleries">已记录画廊</option><option value="listing_operations">列表操作</option><option value="inferred_historical_galleries">历史推断覆盖</option></select></label></div>
-  <p id="empty" hidden>暂无采集记录。启用后执行采集，新的列表操作会开始积累数据。</p>
-  <div class="table-wrap"><table><caption>查询发现与反馈（— 表示无可用分母）</caption><thead><tr><th scope="col">查询 / 来源</th><th scope="col">列表操作</th><th scope="col">返回 / 入库次数</th><th scope="col">独立画廊</th><th scope="col">好 / 差 / 中立</th><th scope="col">未知 / 重复更新</th><th scope="col">明确好评率</th><th scope="col">新增好评 / 完成操作</th><th scope="col">可见且好评</th><th scope="col">历史推断</th></tr></thead><tbody id="rows"></tbody></table></div>
+  <header><div><a href="/">← Back to Recommendations</a><h1>Fetch Discovery &amp; Outcomes</h1><p>New galleries, repeat discoveries and subsequent feedback by query. Read-only diagnostics; fetch budgets are not adjusted automatically.</p></div><button id="refresh" type="button">Refresh</button></header>
+  <p id="status" role="status" aria-live="polite">Loading statistics…</p>
+  <section class="summary" aria-label="Coverage"><div><strong id="unique">—</strong><span>Recorded unique galleries</span></div><div><strong id="pairs">—</strong><span>Query–gallery associations</span></div><div><strong id="started">—</strong><span>Recording started (UTC)</span></div></section>
+  <details open><summary>How to read these numbers</summary><p>A listing operation is a single-page fetch call, excluding internal HTTP retries, detail requests and image requests. Returned and admitted occurrences may differ; new and existing status is determined before admission to the database.</p><p>Positive rate = positive ÷ (positive + negative). Neutral, duplicate updates and unknown outcomes are listed separately; no feedback does not mean negative. Only the latest feedback created after the query association was first recorded is counted; undo recalculates the results. “Visible and positive” is the intersection of galleries with an actual visibility receipt after the query association and galleries whose latest feedback is positive. It does not establish that viewing preceded feedback or imply causation.</p><p>Multiple queries can discover the same gallery, so rows cannot be added together or used to prove that a query caused feedback. Historical inference comes from the old source_query field and indicates coverage only; historical cost and outcomes are unknown. Rates based on small samples should not be compared directly.</p></details>
+  <div class="controls"><label>Filter queries <input id="filter" type="search" placeholder="Enter query keywords"></label><label>Sort <select id="sort"><option value="new_positive">New positives</option><option value="recorded_galleries">Recorded galleries</option><option value="listing_operations">Listing operations</option><option value="inferred_historical_galleries">Inferred historical coverage</option></select></label></div>
+  <p id="empty" hidden>No fetch records yet. After recording is enabled, new listing operations will accumulate data.</p>
+  <div class="table-wrap"><table><caption>Query discoveries and feedback (— means no available denominator)</caption><thead><tr><th scope="col">Query / Source</th><th scope="col">Listing operations</th><th scope="col">Returned / Admitted occurrences</th><th scope="col">Unique galleries</th><th scope="col">Positive / Negative / Neutral</th><th scope="col">Unknown / Duplicate updates</th><th scope="col">Explicit positive rate</th><th scope="col">New positives / Completed operation</th><th scope="col">Visible and positive</th><th scope="col">Historical inference</th></tr></thead><tbody id="rows"></tbody></table></div>
 </main>
 </body>
 </html>

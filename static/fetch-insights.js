@@ -2,7 +2,7 @@
 (() => {
   const el = (id) => document.getElementById(id);
   let items = [];
-  const number = (value) => Number(value || 0).toLocaleString('zh-CN');
+  const number = (value) => Number(value || 0).toLocaleString('en-US');
   const ratio = (value) => value == null ? '—' : `${(value * 100).toFixed(1)}%`;
   const cell = (row, text, detail) => {
     const td = document.createElement('td');
@@ -22,26 +22,26 @@
     const fragment = document.createDocumentFragment();
     for (const item of shown) {
       const row = document.createElement('tr');
-      cell(row, item.label, item.sources.join(' · ') || '仅历史推断');
-      cell(row, number(item.listing_operations), `完成 ${number(item.completed_operations)} / 失败 ${number(item.failed_operations)} / 未完成 ${number(item.unfinished_operations)}`);
-      cell(row, `${number(item.returned_occurrences)} / ${number(item.admitted_occurrences)}`, `重复入库占比 ${ratio(item.existing_occurrence_rate)}`);
-      cell(row, number(item.recorded_galleries), `新增 ${number(item.new_galleries)} / 已存在 ${number(item.existing_galleries)} / 共享 ${number(item.shared_galleries)}`);
+      cell(row, item.label, item.sources.join(' · ') || 'Historical inference only');
+      cell(row, number(item.listing_operations), `Completed ${number(item.completed_operations)} / Failed ${number(item.failed_operations)} / Unfinished ${number(item.unfinished_operations)}`);
+      cell(row, `${number(item.returned_occurrences)} / ${number(item.admitted_occurrences)}`, `Existing admission rate ${ratio(item.existing_occurrence_rate)}`);
+      cell(row, number(item.recorded_galleries), `New ${number(item.new_galleries)} / Existing ${number(item.existing_galleries)} / Shared ${number(item.shared_galleries)}`);
       cell(row, `${number(item.positive)} / ${number(item.negative)} / ${number(item.neutral)}`);
       cell(row, `${number(item.unknown)} / ${number(item.duplicate_update)}`);
-      cell(row, ratio(item.positive_rate_explicit), `明确样本 ${number(item.explicit_nonneutral)}`);
-      cell(row, item.new_positive_per_completed_operation == null ? '—' : item.new_positive_per_completed_operation.toFixed(2), `${number(item.new_positive)} 新增好评`);
+      cell(row, ratio(item.positive_rate_explicit), `Explicit sample ${number(item.explicit_nonneutral)}`);
+      cell(row, item.new_positive_per_completed_operation == null ? '—' : item.new_positive_per_completed_operation.toFixed(2), `${number(item.new_positive)} new positives`);
       cell(row, `${number(item.visible_positive)} / ${number(item.visible_galleries)}`, ratio(item.visible_positive_rate));
-      cell(row, number(item.inferred_historical_galleries), '成本与收益未知');
+      cell(row, number(item.inferred_historical_galleries), 'Cost and outcomes unknown');
       fragment.append(row);
     }
     el('rows').replaceChildren(fragment);
     el('empty').hidden = shown.length !== 0;
-    el('empty').textContent = items.length ? '没有匹配的查询。' : '暂无采集记录。启用后执行采集，新的列表操作会开始积累数据。';
+    el('empty').textContent = items.length ? 'No matching queries.' : 'No fetch records yet. After recording is enabled, new listing operations will accumulate data.';
   }
   async function refresh() {
     el('refresh').disabled = true;
     el('status').classList.remove('error');
-    el('status').textContent = '正在读取统计…';
+    el('status').textContent = 'Loading statistics…';
     try {
       const response = await fetch('/api/insights/fetch', {cache: 'no-store'});
       if (!response.ok) throw new Error('request failed');
@@ -50,12 +50,12 @@
       items = data.items;
       el('unique').textContent = number(data.recorded_unique_galleries);
       el('pairs').textContent = number(data.recorded_query_gallery_pairs);
-      el('started').textContent = data.measurement_started_at || '尚未开始记录';
+      el('started').textContent = data.measurement_started_at || 'Not started';
       render();
-      el('status').textContent = `已更新 · ${new Date().toLocaleTimeString('zh-CN')} · ${items.length} 个查询`;
+      el('status').textContent = `Updated · ${new Date().toLocaleTimeString('en-US')} · ${items.length} queries`;
     } catch (_) {
       el('status').classList.add('error');
-      el('status').textContent = '读取失败；已有数据可能过期。请重试，并确认服务已更新且支持采集洞察。';
+      el('status').textContent = 'Unable to load statistics; existing data may be stale. Retry and check that the service is updated and supports fetch insights.';
     } finally {
       el('refresh').disabled = false;
     }
