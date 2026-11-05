@@ -174,7 +174,7 @@ class RecentLog:
             stream.close()
 
 
-def read_recent_logs(config_path: Path) -> list[str]:
+def read_log_snapshot(config_path: Path) -> dict:
     try:
         with log_path(config_path).open("rb") as file:
             raw = file.read(MAX_LOG_BYTES + 1)
@@ -184,15 +184,24 @@ def read_recent_logs(config_path: Path) -> list[str]:
         if (payload.get("schema") != 1 or not re.fullmatch(r"[0-9a-f]{32}", payload.get("run_id", ""))
                 or not isinstance(payload.get("entries"), list) or len(payload["entries"]) > LOG_LIMIT):
             raise ValueError("Invalid log snapshot")
-        lines = []
+        entries = []
         for entry in payload["entries"]:
             timestamp = datetime.fromisoformat(entry["at"])
             if timestamp.tzinfo is None:
                 raise ValueError("Timestamp has no timezone")
             level, source, message = event_message(entry["code"], entry["fields"])
-            lines.append(f"{timestamp.astimezone():%m-%d %H:%M:%S}  {level:<5}  [{source}] {message}")
-        return lines
+            entries.append({"at": timestamp.isoformat(), "code": entry["code"], "level": level,
+                            "source": source, "message": message,
+                            "line": f"{timestamp.astimezone():%m-%d %H:%M:%S}  {level:<5}  [{source}] {message}"})
+        return {"availability": "available", "run_id": payload["run_id"], "entries": entries}
     except FileNotFoundError:
-        return []
+        return {"availability": "missing", "entries": []}
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return {"availability": "unavailable", "entries": []}
+
+
+def read_recent_logs(config_path: Path) -> list[str]:
+    snapshot = read_log_snapshot(config_path)
+    if snapshot["availability"] == "unavailable":
         return ["Recent logs unavailable."]
+    return [entry["line"] for entry in snapshot["entries"]]

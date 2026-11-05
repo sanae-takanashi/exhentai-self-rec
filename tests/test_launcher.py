@@ -407,6 +407,9 @@ class LauncherTests(unittest.TestCase):
         self.prepare_database()
         self.assertEqual(self.controller.start(self.config), "start-requested")
         eventually(lambda: self.controller.status(self.config)["state"] == "running", timeout=60)
+        self.assertEqual(self.controller.status(self.config)["health"], "ready")
+        self.assertTrue(self.controller.status(self.config)["profile_match"])
+        self.assertFalse(self.controller.status(replace(self.config, port=unused_port()))["profile_match"])
         run_id = core.read_runtime(self.path)["run_id"]
         self.assertEqual(self.controller.start(self.config), "already-running")
         self.assertEqual(core.read_runtime(self.path)["run_id"], run_id)
@@ -590,6 +593,107 @@ class LauncherUITests(unittest.TestCase):
                     for column in view.plan["columns"]:
                         self.assertLessEqual(font.nametofont("TkHeadingFont").measure(view.plan.heading(column, "text")) + 6,
                                              int(view.plan.column(column, "width")))
+
+    def test_operational_tabs_have_no_content_actions_and_work_offline(self):
+        self.assertEqual([self.app.notebook.tab(tab, "text") for tab in self.app.notebook.tabs()],
+                         ["Overview", "Connections", "Activity", "Environment", "Storage", "Logs"])
+        self.app.render_status({"state": "stopped", "managed": False, "health": "stopped"})
+        view = self.app.operations
+        self.assertEqual(view.overview_values["health"].get(), "Offline")
+        self.assertEqual(str(view.environment_button.cget("state")), "normal")
+        self.assertTrue(all(str(button.cget("state")) == "normal" for button in view.maintenance_buttons))
+
+    def test_profile_edits_and_running_configuration_are_not_conflated(self):
+        self.app.variables["port"].set("bad-number")
+        self.assertTrue(self.app.profile_dirty())
+        self.assertEqual(self.app.operations.overview_values["edits"].get(), "Unsaved changes")
+        self.app.render_status({"state": "running", "managed": True, "health": "ready", "profile_match": False})
+        self.assertIn("restart required", self.app.operations.overview_values["profile"].get())
+        self.app.render_status({"state": "running", "managed": True, "health": "ready"})
+        self.assertIn("Unknown", self.app.operations.overview_values["profile"].get())
+
+    def test_tunnel_start_log_does_not_claim_connected_and_old_run_is_not_live(self):
+        entry = {"code": "hath.starting", "level": "INFO", "at": "2026-11-05T01:00:00+00:00",
+                 "message": "Starting SSH tunnel."}
+        status = {"state": "running", "managed": True, "run_id": "a", "health": "ready",
+                  "log_snapshot": {"availability": "available", "run_id": "a", "entries": [entry]}}
+        self.app.render_status(status)
+        table = self.app.operations.connection_table
+        self.assertIn("unconfirmed", table.item("3", "values")[1])
+        status["run_id"] = "b"
+        self.app.render_status(status)
+        self.assertIn("Unknown", table.item("3", "values")[1])
+
+    def test_log_filters_and_copy_only_include_visible_sanitized_entries(self):
+        self.app.log_level.set("ERROR")
+        self.app.log_source.set("SSH")
+        self.app.render_logs(["11-05 10:00:00  INFO   [launcher] Starting service.",
+                              "11-05 10:00:01  ERROR  [SSH] SSH authentication failed.",
+                              "11-05 10:00:02  ERROR  [service] Required module missing."])
+        visible = self.app.log_text.get("1.0", "end-1c")
+        self.assertIn("authentication failed", visible)
+        self.assertNotIn("Starting", visible)
+        self.assertNotIn("module", visible)
+        with patch.object(self.root, "clipboard_clear"), patch.object(self.root, "clipboard_append") as copy:
+            self.app.copy_logs()
+        copy.assert_called_once_with(visible)
+
+    def test_cancelled_backup_does_not_write_or_start_service(self):
+        with patch("tkinter.messagebox.askyesno", return_value=False), patch("scripts.launcher.ops.backup_database") as backup:
+            self.app.create_backup()
+        backup.assert_not_called()
+        self.assertFalse(self.app.busy)
+
+    def test_environment_action_uses_saved_profile_without_saving_or_fetching(self):
+        self.app.variables["venv_path"].set("unsaved-different-environment")
+        result = {"python": "3.12.1", "accelerator": "cpu", "packages": {"numpy": "2.0"},
+                  "checked_at": "2026-11-05T01:00:00+00:00"}
+        with patch("scripts.launcher.ops.inspect_environment", return_value=result) as inspect:
+            self.app.check_environment()
+            self.pump()
+        inspect.assert_called_once_with(self.app.config)
+        self.assertIn("3.12.1", self.app.operations.environment_result.get())
+        self.assertFalse(self.path.exists())
+
+    def test_status_failure_clears_live_readiness_and_fetch_counts(self):
+        self.app.latest = {"state": "running", "managed": True, "health": "ready"}
+        self.app.results.put(("status", None, None, "Status unavailable", self.app.config_generation))
+        self.app.drain()
+        self.assertEqual(self.app.latest["state"], "checking")
+        self.assertNotIn("verified", self.app.operations.overview_values["health"].get())
+        self.assertEqual(self.app.latest["fetch_activity"]["availability"], "unavailable")
+
+    def test_all_operational_tabs_fit_supported_sizes(self):
+        from scripts.launcher_ops import timestamp
+        for timer in list(self.app.timers):
+            self.root.after_cancel(timer)
+        self.app.timers.clear()
+        self.root.attributes("-alpha", 0)
+        view = self.app.operations
+        view.render_environment({"python": "3.12.10", "accelerator": "rocm", "checked_at": timestamp(),
+                                 "packages": {name: "2.10.0+rocm7.13" for name in
+                                              ("numpy", "scipy", "scikit-learn", "joblib", "Pillow", "torch", "torchvision", "transformers", "PySocks")}})
+        view.maintenance_result.set("Verified backup: G:/" + "long-private-directory/" * 8 + "backup.sqlite3")
+        self.app.notice.set("Proxy check finished. This does not verify upstream access.")
+        self.app.render_status({"state": "running", "managed": True, "health": "ready", "profile_match": False})
+        for width, height in ((780, 760), (880, 760), (1100, 900)):
+            self.root.geometry(f"{width}x{height}+20000+20000")
+            self.root.deiconify()
+            for tab in self.app.notebook.tabs():
+                with self.subTest(width=width, tab=self.app.notebook.tab(tab, "text")):
+                    self.app.notebook.select(tab)
+                    self.root.update()
+                    frame = self.root.nametowidget(tab)
+                    for child in frame.winfo_children():
+                        if child.winfo_manager() == "grid":
+                            self.assertGreaterEqual(child.winfo_x(), 0)
+                            self.assertGreaterEqual(child.winfo_y(), 0)
+                            self.assertLessEqual(child.winfo_x() + child.winfo_width(), frame.winfo_width())
+                            self.assertLessEqual(child.winfo_y() + child.winfo_height(), frame.winfo_height())
+            from tkinter import font
+            headings = sum(font.nametofont("TkDefaultFont").measure(self.app.notebook.tab(tab, "text")) + 24
+                           for tab in self.app.notebook.tabs())
+            self.assertLessEqual(headings, self.app.notebook.winfo_width())
 
 
 if __name__ == "__main__":

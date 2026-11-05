@@ -66,6 +66,9 @@ detects existing instances, and opens the homepage in your default browser.
 Closing the launcher leaves its service running; Stop only controls services
 started by this launcher. Automatic startup is opt-in and runs in the background
 after the current user signs in, not before login. See [LAUNCHER.md](LAUNCHER.md).
+Its six operational tabs cover overview, connections, activity, environment,
+storage and logs. Offline checks, verified private SQLite backups and allowlisted
+diagnostic exports stay separate from the web UI's content workflows.
 
 ## H@H observer
 

@@ -203,6 +203,10 @@ def save_config(config: LaunchConfig, path: Path = DEFAULT_CONFIG):
         raise LauncherError("config-save-failed") from None
 
 
+def config_digest(config: LaunchConfig) -> str:
+    return hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode("utf-8")).hexdigest()
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -288,6 +292,8 @@ def read_runtime(config_path: Path) -> dict:
             return {}
         if not isinstance(payload.get("error"), str) or len(payload["error"]) > 100:
             return {}
+        if "config_digest" in payload and not re.fullmatch(r"[0-9a-f]{64}", str(payload["config_digest"])):
+            return {}
         if "host" in payload or "port" in payload:
             LaunchConfig.from_dict({"host": payload.get("host"), "port": payload.get("port")})
         return payload
@@ -327,12 +333,15 @@ class LauncherController:
                 state = "unresponsive"
             if runtime.get("state") == "stopping":
                 state = "stopping"
-            return {"state": state, "managed": bool(runtime), "home_url": active.home_url(), "error": runtime.get("error", "")}
+            return {"state": state, "managed": bool(runtime), "home_url": active.home_url(),
+                    "error": runtime.get("error", ""), "health": probe,
+                    "started_at": runtime.get("started_at", ""), "run_id": runtime.get("run_id", ""),
+                    "profile_match": config_digest(config) == runtime["config_digest"] if "config_digest" in runtime else None}
         probe = probe_service(config)
         if probe in {"ready", "legacy"}:
-            return {"state": "external", "managed": False, "home_url": config.home_url(), "error": ""}
+            return {"state": "external", "managed": False, "home_url": config.home_url(), "error": "", "health": probe}
         state = "occupied" if probe == "occupied" else "failed" if runtime.get("state") == "failed" else "stopped"
-        return {"state": state, "managed": False, "home_url": config.home_url(), "error": runtime.get("error", "")}
+        return {"state": state, "managed": False, "home_url": config.home_url(), "error": runtime.get("error", ""), "health": probe}
 
     def start(self, config: LaunchConfig) -> str:
         status = self.status(config)
@@ -406,7 +415,7 @@ def supervise_background(config_path: Path) -> int:
     try:
         config = load_config(config_path)
         config.validate(check_files=True)
-        runtime.update(host=config.host, port=config.port)
+        runtime.update(host=config.host, port=config.port, config_digest=config_digest(config))
         probe = probe_service(config)
         if probe in {"ready", "legacy"}:
             return 0

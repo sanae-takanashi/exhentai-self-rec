@@ -16,10 +16,25 @@ from a port scan or an old state file. Existing manually started servers are
 detected but cannot be stopped or adopted. Stop them using their original
 launcher before starting a managed replacement.
 
+The six tabs are **Overview**, **Connections**, **Activity**, **Environment**,
+**Storage**, and **Logs**. This is an operational console, not a second gallery
+browser: content review, feedback, recommendation policy and download-item
+operations remain in the web UI.
+
+Overview distinguishes verified health from process ownership and shows the
+supervisor uptime, last status check, launch-profile agreement, unsaved edits,
+fetch summary and latest retained sanitized error. Uptime is not inferred for
+external services. New supervisors record a digest of their launch profile;
+older already-running supervisors show profile agreement as unknown until the
+next owner-controlled restart. The digest does not prove database overrides
+or inherited environment values. Local revision means the checkout revision,
+not the revision of an already-running backend.
+
 Parameters cover `run.ps1`: virtual environment, bind address, port, data
 directory, proxy, visual encoder/device, H@H enablement, token-file path,
-SSH-config path and SSH host. Advanced settings include SSH executable,
-remote loopback port, reconnect delay and startup timeout. Blank optional
+SSH-config path and SSH host. Environment holds service parameters and automatic
+startup; Connections holds H@H parameters, SSH executable, remote loopback port
+and reconnect delay. Blank optional
 fields preserve the existing environment/default behavior. Secrets remain in
 their existing files and are read only by the established H@H supervisor.
 
@@ -29,13 +44,57 @@ Only paths and non-secret settings are saved. Proxy URLs containing credentials
 are rejected. Runtime status contains fixed codes, never child output,
 tokens, cookies or complete command lines.
 
-## Recent Logs
+## Connections And Environment
 
-The Recent Logs tab refreshes with service status, and Start Service selects it
+Connection checks use the **saved** profile, not unsaved edits. Local API health
+is polled; proxy TCP checks and observer timestamp reads are explicit actions.
+A reachable proxy socket does not prove upstream access. Blank proxy means
+inherited/default behavior, not verified direct access. Observer information is
+only a client count and latest receipt time from the saved profile's database,
+read in SQLite read-only mode; it is not live tunnel proof. SSH start/retry/error
+evidence is taken only from the current managed run's allowlisted logs. A start
+request is never presented as a connected tunnel.
+
+Check Environment runs a fixed local probe with the saved service Python and a
+20-second timeout. It reports interpreter/package versions and detected Torch
+accelerator availability without downloading models, installing packages, or
+changing the running service. This checks the selected environment, not the
+backend's current encoder or database-level overrides. Paths and configuration
+remain accessible offline; runtime-only information is explicitly unavailable.
+
+## Storage And Maintenance
+
+Storage always targets the saved profile data directory. Scan Usage reports
+disk free space, database/WAL sizes, thumbnail-cache size, backups and launcher
+files. Each directory scan is bounded to 20,000 entries and two seconds; partial
+results are lower bounds. Linked/reparse paths are not traversed. These totals
+cover the named categories, not every file in the data directory.
+
+Check Database runs read-only SQLite `quick_check`. Create Backup requires a
+privacy confirmation and uses SQLite's online backup API, including committed
+WAL data. A fresh read-only connection verifies the backup before a SHA-256
+receipt is written. Backups live in `data/backups/launcher-backup-*.sqlite3`
+(relative to the configured data directory). They include private settings and
+saved authentication; never publish them. Existing backups are not overwritten.
+Incomplete artifacts are retained without a verified receipt. Last-backup status
+means verified at creation, not continuously rehashed.
+
+Export Diagnostics creates a new allowlisted JSON file under `diagnostics/` in
+the saved data directory. It excludes gallery titles, query text, URLs, local
+paths, logs, credentials and full configuration. Both backup receipts and export
+files are read back before success is displayed. Maintenance works with the
+service offline and does not trigger fetches, training or downloads. There are
+no restore, reset, purge or deletion controls.
+
+## Logs
+
+The Logs tab refreshes with service status, and Start Service selects it
 automatically. It shows timestamps, severity, launcher lifecycle, H@H tunnel
 reconnects, HTTP request results and recognized service activity. Follow latest
 can be disabled to inspect older entries without scrolling to the end on update.
 The text is read-only and selectable; errors and warnings have distinct colors.
+Severity/component filters affect only the view. Copy Logs copies only the
+visible sanitized entries; Follow latest can be paused independently.
 
 Each managed run keeps up to 500 events in the ignored sibling
 `data/launcher/config.log.json`. Storage is bounded, flushed at most once per
@@ -51,13 +110,13 @@ URLs/query values, local paths, credentials and command lines are omitted;
 health polling is silent. Unknown output is noted only once per run. The UI
 validates the stored event codes and fields again before formatting them.
 
-## Fetch Activity
+## Activity
 
-Fetch Activity displays the current or most recent fetch in this server process,
+Activity retains the Fetch Activity monitor for the current or most recent fetch in this server process,
 including automatic refreshes, manual queries and detail-only enrichment. It
 refreshes with service status without starting work or calculating recommendations.
 
-- Run ID, trigger, start time in UTC, elapsed time and age of the latest activity.
+- Run ID, trigger, local start time with UTC offset, elapsed time and age of the latest activity.
 - Fetched, newly stored, enriched and error counts.
 - Separate query and detail progress bars. Query completion is not overall completion.
 - Phase overview for lists/covers, details/samples, optional model work and finalization.
@@ -66,8 +125,12 @@ refreshes with service status without starting work or calculating recommendatio
 - Up to 120 stage messages for listing, covers, details, samples, caching, parent
   metadata, model retraining and final recommendation refresh.
 
-Page caps are upper bounds: queries can end early after catching up. Reaching a
-cap without catching up is explicitly partial, not success. Detail progress
+Page caps are upper bounds: queries can end early after catching up. Reaching the
+configured page cap is completion, including when an old anchor has not been
+reached. The rolling three-calendar-month publication cutoff is also a normal
+completion boundary. Actual listing/metadata failures remain partial or failed.
+Per-query completion reasons, the frozen publication cutoff, metadata batches
+and explicit request-wait reasons remain visible. Detail progress
 counts processed attempts, including failures; Enriched counts successful stores.
 ETA remains unknown rather than estimating from variable remote and model work.
 Long requests retain their current stage and show the age of the latest update.

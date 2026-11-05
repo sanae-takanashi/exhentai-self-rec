@@ -17,8 +17,10 @@ from scripts.launcher_core import (
     load_config, save_config, startup_registration, supervise_background,
 )
 from scripts.launcher_windows import LauncherWindowsError
-from scripts.launcher_logs import read_recent_logs
+from scripts.launcher_logs import read_log_snapshot
 from scripts.launcher_fetch import FetchActivityView, read_fetch_activity
+from scripts.launcher_views import OperationsView
+from scripts import launcher_ops as ops
 
 
 ERRORS = {
@@ -55,6 +57,13 @@ ERRORS = {
     "startup-command-too-long": "The startup command exceeds Windows' Run-entry length limit.",
     "startup-save-failed": "Cannot update automatic startup.",
     "startup-readback-failed": "Cannot verify automatic startup.",
+    "maintenance-path-unavailable": "Maintenance requires a local directory without links or reparse points.",
+    "database-unavailable": "The saved profile database is not available.",
+    "database-check-failed": "Database verification failed. Existing data was not changed.",
+    "environment-check-failed": "The selected environment could not be verified.",
+    "maintenance-timeout": "Maintenance timed out. An incomplete artifact may have been retained.",
+    "backup-readback-failed": "Backup receipt could not be verified.",
+    "diagnostic-readback-failed": "Diagnostic export could not be verified.",
 }
 
 
@@ -77,6 +86,10 @@ class LauncherApp:
         self.polling = False
         self.config_generation = 0
         self.log_lines = None
+        self.all_log_lines = []
+        self.logs_external = False
+        self.proxy_result = {}
+        self.observer_result = {}
         self.latest = {"state": "checking", "managed": False}
         self.notice = tk.StringVar(value="")
         try:
@@ -95,7 +108,7 @@ class LauncherApp:
         style.configure("Muted.TLabel", foreground="#59636b")
         style.configure("Error.TLabel", foreground="#b42332")
         style.configure("TButton", padding=(12, 7))
-        style.configure("TNotebook.Tab", padding=(14, 7))
+        style.configure("TNotebook.Tab", padding=(10, 7))
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
 
@@ -122,22 +135,29 @@ class LauncherApp:
 
         self.notebook = notebook = ttk.Notebook(root)
         notebook.grid(row=2, column=0, sticky="nsew", padx=20)
-        basic = ttk.Frame(notebook, padding=18)
-        advanced = ttk.Frame(notebook, padding=18)
+        self.operations = OperationsView(self)
+        basic = self.operations.connection_form
+        advanced = self.operations.environment_form
         self.logs_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(basic, text="Service & H@H")
-        notebook.add(advanced, text="Advanced")
-        notebook.add(self.logs_tab, text="Recent Logs")
+        notebook.add(self.logs_tab, text="Logs")
         self.logs_tab.columnconfigure(0, weight=1)
         self.logs_tab.rowconfigure(1, weight=1)
         log_toolbar = ttk.Frame(self.logs_tab)
         log_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         log_toolbar.columnconfigure(0, weight=1)
         self.log_status = ttk.Label(log_toolbar, text="No recent logs.", style="Muted.TLabel")
-        self.log_status.grid(row=0, column=0, sticky="w")
+        self.log_status.grid(row=0, column=0, sticky="w", columnspan=4)
         self.follow_logs = tk.BooleanVar(value=True)
         ttk.Checkbutton(log_toolbar, text="Follow latest", variable=self.follow_logs,
-                        command=self.follow_latest_log).grid(row=0, column=1, sticky="e")
+                        command=self.follow_latest_log).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.log_level = tk.StringVar(value="All levels")
+        self.log_source = tk.StringVar(value="All components")
+        for column, variable, values in ((1, self.log_level, ("All levels", "INFO", "WARN", "ERROR")),
+                                          (2, self.log_source, ("All components", "launcher", "service", "H@H", "SSH", "HTTP"))):
+            selector = ttk.Combobox(log_toolbar, textvariable=variable, values=values, state="readonly", width=17)
+            selector.grid(row=1, column=column, padx=(8, 0), pady=(8, 0))
+            selector.bind("<<ComboboxSelected>>", lambda _: self.render_logs(self.all_log_lines, external=self.logs_external))
+        ttk.Button(log_toolbar, text="Copy Logs", command=self.copy_logs).grid(row=1, column=3, padx=(8, 0), pady=(8, 0))
         self.log_text = tk.Text(self.logs_tab, wrap="word", state="disabled", font=("Consolas", 10),
                                 width=1, height=1, background="#ffffff", foreground="#24292f",
                                 relief="flat", padx=10, pady=8)
@@ -148,6 +168,11 @@ class LauncherApp:
         self.log_text.tag_configure("error", foreground="#b42332")
         self.log_text.tag_configure("warning", foreground="#8a5715")
         self.fetch_activity = FetchActivityView(notebook, tk, ttk)
+        notebook.tab(self.fetch_activity.frame, text="Activity")
+        for frame in (self.operations.overview, self.operations.connections, self.fetch_activity.frame,
+                      self.operations.environment, self.operations.storage, self.logs_tab):
+            notebook.insert("end", frame)
+        notebook.select(self.operations.overview)
         self.variables = {}
         self.form_widgets = []
         values = asdict(self.config)
@@ -156,39 +181,46 @@ class LauncherApp:
         for frame in (basic, advanced):
             frame.columnconfigure(1, weight=1)
 
-        self.field(basic, 0, "Service environment", "venv_path", browse="directory")
-        self.field(basic, 1, "Bind address", "host", choices=("127.0.0.1", "0.0.0.0"), editable=True)
-        self.field(basic, 2, "Service port", "port")
-        ttk.Separator(basic).grid(row=3, column=0, columnspan=3, sticky="ew", pady=12)
         integration = ttk.Checkbutton(basic, text="Enable H@H integration", variable=self.variables["hath_enabled"], command=self.update_hath_fields)
-        integration.grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        integration.grid(row=0, column=0, columnspan=3, sticky="w", pady=(4, 3))
         self.form_widgets.append((integration, "normal"))
         self.hath_widgets = []
-        self.field(basic, 5, "H@H token file", "hath_token_file", browse="file", hath=True)
-        self.field(basic, 6, "SSH configuration", "hath_ssh_config", browse="file", hath=True)
-        self.field(basic, 7, "SSH host alias", "hath_ssh_host", hath=True)
-        self.field(advanced, 0, "Data directory", "data_dir", browse="directory")
-        self.field(advanced, 1, "Proxy", "proxy")
-        self.field(advanced, 2, "Visual encoder", "visual_encoder", choices=("", "simple", "dinov2"))
-        self.field(advanced, 3, "DINO device", "dino_device", choices=("", "auto", "cpu", "cuda", "rocm"))
-        self.field(advanced, 4, "SSH executable", "ssh_executable", browse="file", hath=True)
-        self.field(advanced, 5, "H@H remote port", "remote_port", hath=True)
-        self.field(advanced, 6, "Reconnect delay (s)", "reconnect_seconds", hath=True)
+        self.field(basic, 1, "H@H token file", "hath_token_file", browse="file", hath=True)
+        self.field(basic, 2, "SSH configuration", "hath_ssh_config", browse="file", hath=True)
+        self.field(basic, 3, "SSH host alias", "hath_ssh_host", hath=True)
+        self.field(basic, 4, "SSH executable", "ssh_executable", browse="file", hath=True)
+        tunnel_settings = ttk.Frame(basic)
+        tunnel_settings.grid(row=5, column=0, columnspan=3, sticky="ew")
+        for column, (label, name) in enumerate((("Remote port", "remote_port"), ("Reconnect (s)", "reconnect_seconds"))):
+            section = ttk.Frame(tunnel_settings)
+            section.grid(row=0, column=column, sticky="ew", padx=(0, 12) if column == 0 else 0)
+            tunnel_settings.columnconfigure(column, weight=1, uniform="tunnel")
+            section.columnconfigure(1, weight=1)
+            self.field(section, 0, label, name, hath=True)
+        self.field(advanced, 0, "Service environment", "venv_path", browse="directory")
+        self.field(advanced, 1, "Data directory", "data_dir", browse="directory")
+        self.field(advanced, 2, "Bind address", "host", choices=("127.0.0.1", "0.0.0.0"), editable=True)
+        self.field(advanced, 3, "Service port", "port")
+        self.field(advanced, 4, "Proxy", "proxy")
+        self.field(advanced, 5, "Visual encoder", "visual_encoder", choices=("", "simple", "dinov2"))
+        self.field(advanced, 6, "DINO device", "dino_device", choices=("", "auto", "cpu", "cuda", "rocm"))
         self.field(advanced, 7, "Startup timeout (s)", "startup_timeout")
 
         footer = ttk.Frame(root, padding=(20, 14, 20, 18))
         footer.grid(row=3, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         self.save_button = ttk.Button(footer, text="Save Parameters", command=self.save)
-        self.save_button.grid(row=0, column=1, sticky="e", pady=(0, 12))
-        ttk.Separator(footer).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.save_button.grid(row=0, column=1, sticky="e")
+        startup = self.operations.startup_frame
         self.auto_start = tk.BooleanVar(value=False)
-        self.startup_check = ttk.Checkbutton(footer, text="Start service in background when I sign in", variable=self.auto_start)
-        self.startup_check.grid(row=2, column=0, sticky="w")
-        self.startup_button = ttk.Button(footer, text="Apply Startup", command=self.apply_startup)
-        self.startup_button.grid(row=2, column=1, sticky="e")
-        ttk.Label(footer, textvariable=self.notice, wraplength=800, style="Error.TLabel").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.startup_check = ttk.Checkbutton(startup, text="Start service in background when I sign in", variable=self.auto_start)
+        self.startup_check.grid(row=0, column=0, sticky="w")
+        self.startup_button = ttk.Button(startup, text="Apply Startup", command=self.apply_startup)
+        self.startup_button.grid(row=0, column=1, sticky="e")
+        ttk.Label(footer, textvariable=self.notice, wraplength=560, style="Error.TLabel").grid(
+            row=0, column=0, sticky="ew", padx=(0, 10))
+        for variable in self.variables.values():
+            variable.trace_add("write", lambda *_: self.render_profile_edits())
         self.update_hath_fields()
         try:
             self.auto_start.set(startup_registration(self.path).enabled())
@@ -209,7 +241,7 @@ class LauncherApp:
 
     def field(self, frame, row, label, name, browse=None, choices=None, editable=False, hath=False):
         ttk = self.ttk
-        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=8)
+        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=5)
         if choices is not None:
             widget = ttk.Combobox(frame, textvariable=self.variables[name], values=choices,
                                   state="normal" if editable else "readonly")
@@ -217,13 +249,13 @@ class LauncherApp:
         else:
             widget = ttk.Entry(frame, textvariable=self.variables[name])
             mode = "normal"
-        widget.grid(row=row, column=1, columnspan=1 if browse else 2, sticky="ew", pady=8)
+        widget.grid(row=row, column=1, columnspan=1 if browse else 2, sticky="ew", pady=5)
         self.form_widgets.append((widget, mode))
         if hath:
             self.hath_widgets.append((widget, mode))
         if browse:
             button = ttk.Button(frame, text="Browse...", command=lambda: self.browse(name, browse))
-            button.grid(row=row, column=2, padx=(8, 0), pady=8)
+            button.grid(row=row, column=2, padx=(8, 0), pady=5)
             self.form_widgets.append((button, "normal"))
             if hath:
                 self.hath_widgets.append((button, "normal"))
@@ -243,12 +275,94 @@ class LauncherApp:
             raise LauncherError("invalid-number") from None
         return LaunchConfig.from_dict(payload)
 
+    def profile_dirty(self):
+        return any(self.variables[name].get() != (value if isinstance(value, bool) else str(value))
+                   for name, value in asdict(self.config).items())
+
+    def render_profile_edits(self):
+        self.operations.overview_values["edits"].set("Unsaved changes" if self.profile_dirty() else "No unsaved changes")
+
+    def clear_checks(self):
+        self.proxy_result = {}
+        self.observer_result = {}
+        self.operations.clear_checks()
+
+    def check_proxy(self):
+        config = self.config
+        self.notice.set("Checking saved proxy TCP endpoint...")
+        def done(result):
+            self.proxy_result = result
+            self.notice.set("Proxy check finished. This does not verify upstream access.")
+        self.submit(lambda: ops.check_proxy(config), done)
+
+    def check_observer(self):
+        config = self.config
+        self.notice.set("Reading observer timestamps from the saved profile database...")
+        def done(result):
+            self.observer_result = result
+            self.notice.set("Observer timestamps read. Tunnel connectivity is not assumed.")
+        self.submit(lambda: ops.observer_status(config), done)
+
+    def check_environment(self):
+        config = self.config
+        self.notice.set("Checking selected environment (up to 20 seconds)...")
+        def done(result):
+            self.operations.render_environment(result)
+            self.notice.set("Selected environment checked; running-service settings may differ.")
+        self.submit(lambda: ops.inspect_environment(config), done)
+
+    def scan_storage(self):
+        config = self.config
+        self.notice.set("Scanning saved profile storage...")
+        def done(result):
+            self.operations.render_storage(result)
+            self.notice.set("Storage scan finished. Partial sizes are lower bounds.")
+        self.submit(lambda: ops.inspect_storage(config), done)
+
+    def check_database(self):
+        config = self.config
+        self.notice.set("Checking saved profile database read-only...")
+        def done(result):
+            self.operations.database_result.set("Database quick_check passed: " + ops.local_time(result["checked_at"]))
+            self.notice.set("Read-only database check passed.")
+        self.submit(lambda: ops.check_database(config), done)
+
+    def create_backup(self):
+        from tkinter import messagebox
+        if self.busy:
+            return
+        config = self.config
+        if not messagebox.askyesno("Create Private Backup", "Create a verified SQLite backup of the saved profile database?\n\n"
+                                  "It includes private settings and saved authentication. Keep it private.\n\n"
+                                  + str(ops.data_directory(config) / "backups"), parent=self.root):
+            return
+        self.notice.set("Creating and independently checking a private database backup...")
+        def done(result):
+            self.operations.backup_summary.set("Last backup verified at creation: " + ops.local_time(result["at"]))
+            self.operations.maintenance_result.set("Verified backup: " + result["path"])
+            self.notice.set("Private backup verified. Existing data was not replaced.")
+        self.submit(lambda: ops.backup_database(config), done)
+
+    def export_diagnostics(self):
+        config, status = self.config, dict(self.latest)
+        self.notice.set("Exporting allowlisted operational diagnostics...")
+        def done(result):
+            self.operations.maintenance_result.set("Diagnostics: " + result["path"])
+            self.notice.set("Diagnostic export verified. No gallery text, credentials, addresses or local paths inside.")
+        self.submit(lambda: ops.export_diagnostics(config, status), done)
+
+    def copy_logs(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get("1.0", "end-1c"))
+        self.notice.set("Visible sanitized logs copied.")
+
     def save(self):
         try:
             config = self.collect()
             save_config(config, self.path)
             self.config = config
             self.config_generation += 1
+            self.clear_checks()
             self.notice.set("Parameters saved.")
             self.refresh()
             return config
@@ -303,6 +417,7 @@ class LauncherApp:
                 save_config(config, self.path)
                 self.config = config
                 self.config_generation += 1
+                self.clear_checks()
             registration = startup_registration(self.path)
             registration.set_enabled(enabled)
             self.auto_start.set(registration.enabled())
@@ -324,9 +439,13 @@ class LauncherApp:
         def work():
             try:
                 status = self.controller.status(config)
-                status["logs"] = read_recent_logs(self.path)
+                status["log_snapshot"] = read_log_snapshot(self.path)
+                snapshot = status["log_snapshot"]
+                status["logs"] = ([entry["line"] for entry in snapshot["entries"]] if snapshot["availability"] != "unavailable"
+                                  else ["Recent logs unavailable."])
                 status["fetch_activity"] = (read_fetch_activity(status["home_url"])
                                             if status["state"] in {"running", "external"} else {"availability": "offline"})
+                status["checked_at"] = ops.timestamp()
                 self.results.put(("status", status, None, None, generation))
             except Exception as error:
                 self.results.put(("status", None, None, error_message(error), generation))
@@ -352,6 +471,8 @@ class LauncherApp:
                     self.latest = result
                 if error:
                     self.notice.set(error)
+                    self.latest = {**self.latest, "state": "checking", "health": "unknown",
+                                   "fetch_activity": {"availability": "unavailable"}}
             else:
                 self.busy = False
                 if error:
@@ -381,6 +502,7 @@ class LauncherApp:
         for widget, mode in self.form_widgets:
             widget.configure(state="disabled" if managed or self.busy else mode)
         self.update_hath_fields()
+        self.operations.render(status, self.config, dirty=self.profile_dirty())
         if "logs" in status:
             self.render_logs(status["logs"], external=state == "external")
         if "fetch_activity" in status:
@@ -389,19 +511,24 @@ class LauncherApp:
             self.notice.set(error_message(status["error"]))
 
     def render_logs(self, lines, external=False):
+        self.logs_external = external
+        self.all_log_lines = list(lines)
+        level, source = self.log_level.get(), self.log_source.get()
+        visible = [line for line in lines if (level == "All levels" or f"  {level:<5}  " in line)
+                   and (source == "All components" or f"[{source}]" in line)]
         self.log_status.configure(text="External service: previous managed logs only." if external and lines else
                                   "External service: logs unavailable." if external else
-                                  f"{len(lines)} recent entries" if lines else "No recent logs.")
-        if lines == self.log_lines:
+                                  f"{len(visible)} / {len(lines)} recent entries" if lines else "No recent logs.")
+        if visible == self.log_lines:
             return
         previous_view = self.log_text.yview()
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
-        for line in lines:
+        for line in visible:
             tag = "error" if "  ERROR  " in line else "warning" if "  WARN   " in line else ""
             self.log_text.insert("end", line + "\n", tag)
         self.log_text.configure(state="disabled")
-        self.log_lines = list(lines)
+        self.log_lines = list(visible)
         if self.follow_logs.get():
             self.follow_latest_log()
         else:
