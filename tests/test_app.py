@@ -2419,7 +2419,7 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(fetch.call_count, 2)
                 self.assertEqual(second["stored"], 0)
 
-    def test_fetch_and_store_preserves_cursor_when_catch_up_limit_is_reached(self):
+    def test_fetch_and_store_completes_window_when_catch_up_limit_is_reached(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_dir = Path(tmpdir)
             with patch.object(db, "DATA_DIR", data_dir), patch.object(db, "DB_PATH", data_dir / "test.sqlite3"):
@@ -2454,12 +2454,12 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(result["stored"], 3)
                 with db.connect() as conn:
                     state = get_fetch_query_state(conn, {"query": None, "source": "recent"})
-                self.assertEqual(state["anchors"], [old_gallery.url])
-                self.assertFalse(state["caught_up"])
+                self.assertEqual(state["anchors"], ["https://exhentai.org/g/200/a/"])
+                self.assertTrue(state["caught_up"])
                 self.assertEqual(state["last_page_count"], 3)
-                self.assertEqual(state["resume_url"], "https://exhentai.org/?next=197")
-                self.assertEqual(result["status"], "partial")
-                self.assertFalse(result["ok"])
+                self.assertIsNone(state["resume_url"])
+                self.assertEqual(result["status"], "success")
+                self.assertTrue(result["ok"])
 
     def test_fetch_and_store_logs_detailed_progress(self):
         with tempfile.TemporaryDirectory() as tmpdir:

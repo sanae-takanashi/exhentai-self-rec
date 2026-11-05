@@ -161,7 +161,7 @@ class CatchUpTest(unittest.TestCase):
         with db.connect() as conn:
             conn.execute("UPDATE fetch_query_state SET last_success_at='2000-01-01 00:00:00'")
         pages = [GalleryBatch([gallery(30)], next_url="https://exhentai.org/?next=29"),
-                 GalleryBatch([gallery(29)], next_url="https://exhentai.org/?next=28")]
+                 http.client.IncompleteRead(b"")]
         with patch.object(app, "fetch_galleries", side_effect=pages):
             first = app.fetch_and_store()
         self.assertEqual(first["status"], "partial")
@@ -170,18 +170,18 @@ class CatchUpTest(unittest.TestCase):
         self.assertFalse(activity["running"])
         self.assertEqual(activity["status"], "partial")
         self.assertEqual(activity["queries"][0]["state"], "partial")
-        self.assertEqual(activity["pages_done"], 2)
+        self.assertEqual(activity["pages_done"], 1)
         self.assertEqual(activity["page_budget"], 2)
         self.assertEqual(activity["incomplete_count"], 1)
         self.assertEqual(self.state()["anchors"], [gallery(10).url])
         self.assertEqual(self.state()["pending_anchors"], [gallery(30).url])
-        self.assertEqual(self.state()["resume_url"], "https://exhentai.org/?next=28")
+        self.assertEqual(self.state()["resume_url"], "https://exhentai.org/?next=29")
         with db.connect() as conn:
             self.assertEqual(app.fetch_runs(conn, 1)[0]["cursor_incomplete_queries"], ["recent"])
         self.assertEqual(self.state()["last_success_at"], "2000-01-01 00:00:00")
         with patch.object(app, "fetch_galleries", return_value=GalleryBatch([gallery(10)], next_url="https://exhentai.org/?next=9")) as fetch:
             second = app.fetch_and_store()
-        self.assertEqual(fetch.call_args.kwargs["next_url"], "https://exhentai.org/?next=28")
+        self.assertEqual(fetch.call_args.kwargs["next_url"], "https://exhentai.org/?next=29")
         self.assertEqual(second["status"], "success")
         activity = app.FETCH_ACTIVITY.snapshot()["activity"]
         self.assertEqual(activity["status"], "success")
@@ -242,10 +242,12 @@ class CatchUpTest(unittest.TestCase):
         self.assertEqual(self.state()["anchors"], [gallery(10).url])
 
     def test_duplicate_page_is_detected_across_run_boundary(self):
-        with db.connect() as conn:
-            db.set_setting(conn, "stale_fetch_extra_pages", "0")
-        with patch.object(app, "fetch_galleries", return_value=GalleryBatch([gallery(30)], next_url="https://exhentai.org/?next=29")):
+        with patch.object(app, "fetch_galleries", side_effect=[
+            GalleryBatch([gallery(30)], next_url="https://exhentai.org/?next=29"),
+            http.client.IncompleteRead(b""),
+        ]):
             app.fetch_and_store()
+        with patch.object(app, "fetch_galleries", return_value=GalleryBatch([gallery(30)], next_url="https://exhentai.org/?next=28")):
             second = app.fetch_and_store()
         self.assertEqual(second["status"], "failed")
         self.assertIn("repeated", second["errors"][0])
@@ -254,14 +256,48 @@ class CatchUpTest(unittest.TestCase):
 
     def test_anchor_matches_accumulate_across_batches(self):
         with db.connect() as conn:
-            db.set_setting(conn, "stale_fetch_extra_pages", "0")
             app.save_fetch_query_state(conn, {"query": None, "source": "recent"},
                                        [gallery(gid).url for gid in (12, 11, 10)], True, 1)
         for gid in (12, 11, 10):
-            with patch.object(app, "fetch_galleries", return_value=GalleryBatch([gallery(gid)], next_url=f"https://exhentai.org/?next={gid-1}")):
+            with patch.object(app, "fetch_galleries", side_effect=[
+                GalleryBatch([gallery(gid)], next_url=f"https://exhentai.org/?next={gid-1}"),
+                http.client.IncompleteRead(b""),
+            ]):
                 result = app.fetch_and_store()
             self.assertEqual(result["status"], "success" if gid == 10 else "partial")
         self.assertEqual(self.state()["anchors"], [gallery(12).url])
+
+    def test_25_page_limit_completes_without_anchors_and_next_run_starts_at_head(self):
+        with db.connect() as conn:
+            db.set_setting(conn, "stale_fetch_extra_pages", "24")
+        pages = [GalleryBatch([gallery(gid)], next_url=f"https://exhentai.org/?next={gid-1}")
+                 for gid in range(1000, 975, -1)]
+        with patch.object(app, "fetch_galleries", side_effect=pages) as fetch:
+            result = app.fetch_and_store()
+        self.assertEqual(fetch.call_count, 25)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(self.state()["caught_up"])
+        self.assertEqual(self.state()["anchors"], [gallery(1000).url])
+        self.assertIsNone(self.state()["resume_url"])
+        self.assertEqual(self.state()["pending_anchors"], [])
+        self.assertEqual(self.state()["matched_anchors"], [])
+        activity = app.FETCH_ACTIVITY.snapshot()["activity"]
+        self.assertEqual(activity["incomplete_count"], 0)
+        self.assertEqual(activity["queries"][0]["state"], "done")
+        self.assertTrue(activity["queries"][0]["page_limit_reached"])
+        self.assertFalse(activity["queries"][0]["age_limit_reached"])
+        self.assertEqual(activity["queries"][0]["anchor_matches"], 0)
+        with db.connect() as conn:
+            self.assertEqual(app.fetch_runs(conn, 1)[0]["cursor_incomplete_queries"], [])
+        with patch.object(app, "fetch_galleries", side_effect=[
+            GalleryBatch([gallery(1001)], next_url="https://exhentai.org/?next=1000"),
+            GalleryBatch([gallery(1000)], next_url="https://exhentai.org/?next=999"),
+        ]) as fetch:
+            following = app.fetch_and_store()
+        self.assertIsNone(fetch.call_args_list[0].kwargs["next_url"])
+        self.assertEqual(following["status"], "success")
+        self.assertEqual(fetch.call_count, 2)
 
     def test_legacy_database_migration_preserves_existing_anchors(self):
         path = self.directory / "legacy.sqlite3"

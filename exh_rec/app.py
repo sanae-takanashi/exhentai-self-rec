@@ -1545,6 +1545,7 @@ def plan_fetch_from_conn(conn, force_query: str | None = None) -> dict:
         "recommend_candidate_limit": recommend_candidate_limit(conn),
         "has_cookie": bool(db.get_setting(conn, "cookie_header", "")),
         "min_posted_date": recent_gallery_cutoff(),
+        "page_limit_policy": "complete",
     }
 
 
@@ -1902,6 +1903,7 @@ def fetch_and_store(
                 seen_page_digests = {cursor_state["last_page_digest"]} if next_url else set()
                 batch_stored = 0
                 age_limit_reached = False
+                page_limit_reached = False
                 anchor_match_target = min(FETCH_CURSOR_MATCH_COUNT, len(old_anchors))
                 update_fetch_progress(
                     "query started",
@@ -1914,6 +1916,7 @@ def fetch_and_store(
                     cursor_resuming=bool(next_url),
                     cursor_caught_up=cursor_caught_up,
                     age_limit_reached=False,
+                    page_limit_reached=False,
                     cursor_matches=len(matched_anchors),
                     cursor_match_target=anchor_match_target,
                     page_start=0,
@@ -1982,8 +1985,9 @@ def fetch_and_store(
                         age_limit_reached
                         or not next_url
                         or (cursor_active and len(matched_anchors) >= anchor_match_target)
-                        or (not cursor_active and page_number + 1 == page_limit)
                     )
+                    page_limit_reached = page_number + 1 == page_limit and not cursor_caught_up
+                    cursor_caught_up = cursor_caught_up or page_limit_reached
                     # Commit the listing and its continuation atomically before requesting another page.
                     with db.connect() as conn:
                         page_stored = store_galleries(conn, page_galleries)
@@ -2010,6 +2014,8 @@ def fetch_and_store(
                     )
                     if age_limit_reached:
                         update_fetch_progress("query age limit reached", age_limit_reached=True)
+                    if page_limit_reached:
+                        update_fetch_progress("query page limit reached", page_limit_reached=True)
                     if cursor_caught_up:
                         break
 
@@ -2055,6 +2061,7 @@ def fetch_and_store(
                     cursor_match_target=anchor_match_target,
                     pages_fetched=pages_fetched,
                     age_limit_reached=age_limit_reached,
+                    page_limit_reached=page_limit_reached,
                 )
                 if cursor_enabled_for(entry) and not cursor_caught_up:
                     cursor_incomplete_queries.append(display_query(query))

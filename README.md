@@ -314,24 +314,21 @@ Over-age listings are not stored or selected for detail enrichment. Existing his
 downloads, and parent metadata are retained. The limit is applied before the
 recommendation candidate cap and cannot be weakened by a preview date filter.
 
-A cursor advances after its old anchors are reached, the publication limit is
-crossed, or the search reaches the end. Reaching the age boundary clears the
-continuation even with fewer than three anchor matches; the next run starts at
-the head. If the catch-up page limit is reached first, the run is `partial`, its old
-anchors are preserved, and the plan reports `resume pending`. The next normal
-`Fetch` continues from the saved next page, rather than rescanning the head. The
-head captured when that catch-up started remains frozen until completion; newer
-uploads are collected by the following normal fetch. Queries keep independent
-continuations, including after restarting the app.
+A query window completes when its old anchors are reached, the publication limit
+is crossed, the search ends, or its configured page budget is exhausted. Reaching
+the page budget (currently 25 pages for anchored automatic queries) is successful
+completion, not `partial`: its continuation is cleared and its frozen head becomes
+the new anchor set. The next normal `Fetch` starts at the head instead of chasing
+deeper history. The three-month limit is a hard outer boundary, not a requirement
+to collect every gallery within that period.
 
-To recover missed history after a pagination repair, restart the app, leave the
-one-off query blank, and use normal `Fetch` repeatedly until all planned queries
-have no pending catch-up and the run is successful. Existing anchors from the old
-database are preserved automatically. The first repaired run starts at the head;
-subsequent partial runs resume within the three-month window. Keep the existing request
-delay and ban pause; increasing `Catch-up` changes only the bounded batch size.
-Run one additional normal fetch after completing the backlog to collect uploads
-that arrived during catch-up. Do not reset data or clear cursors for this recovery.
+Actual request or metadata failures still report `partial`/`failed`. Successfully
+stored pages remain committed; page failures keep their continuation and original
+anchors for retry, including after restarting the app. Leave the one-off query
+blank to use normal `Fetch`; a retry resumes the saved page and then completes at
+an anchor, age boundary, end of results, or the next page budget. Keep the existing
+request delay and ban pause; increasing `Catch-up` changes only the bounded batch
+size. No library reset or deletion of historical galleries is needed.
 
 Detail enrichment and parent metadata updates also follow missing parent links and store ancestor metadata locally, up to 12 levels. Ancestors fetched only for this purpose are excluded from Review and short-repeat candidates; if a later normal query discovers one, it becomes reviewable like any other fetched gallery.
 

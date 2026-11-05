@@ -12,6 +12,7 @@ MESSAGES = {
     "fetching query page": "Requesting list page",
     "query page fetched": "List page stored",
     "query age limit reached": "Three-month publication limit reached",
+    "query page limit reached": "Page limit reached; query window complete",
     "query page failed": "List page failed",
     "cover metadata checked": "Cover metadata checked",
     "cover metadata failed": "Cover metadata failed",
@@ -108,6 +109,7 @@ class FetchActivity:
                 row["anchor_matches"] = number(state.get("cursor_matches"))
                 row["anchor_target"] = number(state.get("cursor_match_target"))
                 row["age_limit_reached"] = state.get("age_limit_reached") is True
+                row["page_limit_reached"] = state.get("page_limit_reached") is True
             data["queries_done"] = sum(row["state"] in {"done", "partial", "failed"} for row in data["queries"])
             data["pages_done"] = sum(row["pages_done"] for row in data["queries"])
             data["page_budget"] = sum(row["page_budget"] for row in data["queries"])
