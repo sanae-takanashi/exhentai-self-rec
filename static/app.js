@@ -3561,11 +3561,33 @@ function parentProgressLogLine(entry) {
 
 function renderStatus(payload) {
   const fetchState = payload.fetch || {};
+  const activity = payload.fetch_activity || {};
   const parentUpdate = payload.parent_update || {};
   const last = payload.last_fetch;
   const rows = [
-    ["State", fetchState.running ? fetchState.message || fetchState.stage || "Running" : "Idle"],
+    ["State", fetchState.running ? activity.message || fetchState.message || fetchState.stage || "Running" : "Idle"],
   ];
+  if (activity.run_id) {
+    if (activity.min_posted_date) rows.push(["Run Window", `Published >= ${activity.min_posted_date}; page cap completes query`]);
+    if (activity.running) {
+      rows.push(["Timing", `${activity.elapsed_seconds || 0}s elapsed; ${activity.phase_elapsed_seconds || 0}s in stage; updated ${activity.quiet_seconds || 0}s ago`]);
+      const waits = { request: "Waiting for response", rate_limit: "Request rate limit", retry: "Retry backoff",
+        temporary_ban: "Temporary ban pause", metadata_pause: "Metadata batch pause" };
+      if (waits[activity.wait_reason]) {
+        const remaining = activity.wait_remaining_seconds ? `; ${activity.wait_remaining_seconds}s remaining` : "";
+        const attempt = activity.request_attempt > 1 ? `; attempt ${activity.request_attempt}` : "";
+        rows.push(["Waiting", waits[activity.wait_reason] + remaining + attempt]);
+      }
+      if (activity.stage === "cover_metadata") {
+        rows.push(["Metadata Batches", `${activity.metadata_batches_done || 0}/${activity.metadata_total_batches || 0} processed; current ${activity.metadata_batch || 0}; failed ${activity.metadata_failed_batches || 0}`]);
+      }
+    }
+    const reasons = { page_limit: "Page cap", age_limit: "Age boundary", anchors: "Old anchors", results_end: "Results end",
+      request_failed: "Request failed", metadata_failed: "Metadata gaps", incomplete: "Incomplete", skipped: "Not started" };
+    for (const query of activity.queries || []) {
+      if (query.completion_reason) rows.push([query.label, `${query.state}: ${reasons[query.completion_reason] || "Unknown"}; ${query.pages_done}/${query.page_budget} pages`]);
+    }
+  }
   if (parentUpdate.running || parentUpdate.updated_at) {
     rows.push(["Parents", parentUpdate.running ? parentUpdate.message || "Running" : parentUpdate.message || "Idle"]);
     if (parentUpdate.total || parentUpdate.checked) {
@@ -3655,6 +3677,7 @@ function renderStatus(payload) {
         .join(", "),
     ]);
     rows.push(["Scope", `${plan.pages} initial page(s), +${plan.stale_fetch_extra_pages || 0} cursor catch-up, ${plan.detail_fetch_limit} details`]);
+    if (plan.min_posted_date) rows.push(["Plan Window", `Published >= ${plan.min_posted_date}${plan.page_limit_policy === "complete" ? "; page cap completes query" : ""}`]);
     rows.push(["Pool", `${plan.recommend_candidate_limit} local candidates`]);
   }
   if (payload.refresh) {

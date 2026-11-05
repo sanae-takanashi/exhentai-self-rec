@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -42,6 +43,7 @@ from .net import (
     configure_request_rate_limit,
     default_proxy_url,
     normalize_proxy_url,
+    observe_requests,
     open_url_with_retry,
     pause_after_temporary_ban,
     proxy_preview,
@@ -895,6 +897,7 @@ def get_status() -> dict:
                 "snapshot_schema": 2,
             },
             "fetch": dict(FETCH_STATE),
+            "fetch_activity": FETCH_ACTIVITY.snapshot()["activity"],
             "parent_update": parent_update_status(),
             "last_fetch": last_fetch_run(conn),
             "fetch_history": fetch_runs(conn, limit=5),
@@ -1805,6 +1808,13 @@ def recent_fetch_anchors(conn, anchors: list[str], cutoff: str) -> list[str]:
     return recent
 
 
+def report_fetch_request(reason: str, seconds: float, attempt: int) -> None:
+    if FETCH_STATE.get("running"):
+        fields = {"request_attempt": attempt} if attempt else {}
+        update_fetch_progress("request activity", wait_reason=reason, wait_seconds=math.ceil(seconds), **fields)
+
+
+@observe_requests(report_fetch_request)
 def fetch_and_store(
     force_query: str | None = None,
     trigger: str = "manual",
@@ -1917,6 +1927,9 @@ def fetch_and_store(
                     cursor_caught_up=cursor_caught_up,
                     age_limit_reached=False,
                     page_limit_reached=False,
+                    query_completion_reason="",
+                    metadata_batch=0, metadata_total_batches=0,
+                    metadata_batches_done=0, metadata_failed_batches=0,
                     cursor_matches=len(matched_anchors),
                     cursor_match_target=anchor_match_target,
                     page_start=0,
@@ -1959,12 +1972,13 @@ def fetch_and_store(
                                         gallery.posted_at = row[0]
                         undated = [gallery for gallery in page_galleries if gallery_posted_date(gallery.posted_at) is None]
                         if undated:
-                            enrich_covers_via_api(cookie, undated, proxy_url=proxy_url)
+                            enrich_covers_via_api(cookie, undated, proxy_url=proxy_url, track_progress=True)
                         if any(gallery_posted_date(gallery.posted_at) is None for gallery in page_galleries):
                             raise RuntimeError("Gallery publication date unavailable; pagination boundary not advanced")
                     except Exception as exc:
                         errors.append(f"query {display_query(query)}: {exc}")
-                        update_fetch_progress("query page failed", stage="error", error=str(exc), errors=list(errors))
+                        update_fetch_progress("query page failed", stage="error", error=str(exc), errors=list(errors),
+                                              query_completion_reason="request_failed")
                         break
                     seen_page_digests.add(page_digest)
                     pages_fetched += 1
@@ -1988,6 +2002,9 @@ def fetch_and_store(
                     )
                     page_limit_reached = page_number + 1 == page_limit and not cursor_caught_up
                     cursor_caught_up = cursor_caught_up or page_limit_reached
+                    completion_reason = ("age_limit" if age_limit_reached else "results_end" if not next_url
+                                         else "anchors" if cursor_caught_up and not page_limit_reached
+                                         else "page_limit" if page_limit_reached else "")
                     # Commit the listing and its continuation atomically before requesting another page.
                     with db.connect() as conn:
                         page_stored = store_galleries(conn, page_galleries)
@@ -2011,6 +2028,7 @@ def fetch_and_store(
                         stored_page=page_stored,
                         cursor_matches=len(matched_anchors),
                         cursor_match_target=anchor_match_target,
+                        query_completion_reason=completion_reason,
                     )
                     if age_limit_reached:
                         update_fetch_progress("query age limit reached", age_limit_reached=True)
@@ -2020,13 +2038,18 @@ def fetch_and_store(
                         break
 
                 try:
-                    cover_updated = enrich_covers_via_api(cookie, query_galleries, proxy_url=proxy_url)
+                    cover_updated = enrich_covers_via_api(cookie, query_galleries, proxy_url=proxy_url, track_progress=True)
                     update_fetch_progress(
                         "cover metadata checked",
                         stage="cover_metadata",
                         current_query=display_query(query),
                         cover_updated=cover_updated,
+                        wait_reason="", wait_seconds=0,
                     )
+                    if FETCH_STATE.get("metadata_failed_batches"):
+                        errors.append(f"covers {query or 'recent'}: metadata batches failed")
+                        update_fetch_progress("cover metadata failed", errors=list(errors),
+                                              query_completion_reason="metadata_failed")
                 except Exception as exc:
                     errors.append(f"covers {query or 'recent'}: {exc}")
                     update_fetch_progress(
@@ -2035,6 +2058,7 @@ def fetch_and_store(
                         current_query=display_query(query),
                         error=str(exc),
                         errors=list(errors),
+                        query_completion_reason="metadata_failed", wait_reason="", wait_seconds=0,
                     )
                 with db.connect() as conn:
                     store_galleries(conn, query_galleries)
@@ -2219,6 +2243,7 @@ def fetch_and_store(
         FETCH_LOCK.release()
 
 
+@observe_requests(report_fetch_request)
 def enrich_recommendations(include_rated: bool = False, filter_text: str | None = None, limit: Any = None) -> dict:
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
@@ -2401,16 +2426,27 @@ REFRESH_THUMBS_MAX = 60
 PARENT_METADATA_BACKFILL_MAX = 200
 
 
-def enrich_covers_via_api(cookie: str, galleries: list[Gallery], proxy_url: str = "") -> int:
+def enrich_covers_via_api(cookie: str, galleries: list[Gallery], proxy_url: str = "", *, track_progress=False) -> int:
     """Fill cover thumbnails/metadata on ``galleries`` from the gdata API.
 
     Returns the number of covers set/changed. Prefers the stable ehgt.org cover;
     galleries the API does not return keep their existing HTML-scraped cover.
     """
+    if track_progress:
+        update_fetch_progress("cover metadata started", stage="cover_metadata", wait_reason="", wait_seconds=0,
+                              metadata_batch=0, metadata_total_batches=0,
+                              metadata_batches_done=0, metadata_failed_batches=0)
     pairs = [(gallery.gid, gallery.token) for gallery in galleries if gallery.gid and gallery.token]
     if not pairs:
         return 0
-    metadata = fetch_gallery_metadata(cookie, pairs, proxy_url=proxy_url)
+
+    def progress(batch, total, done, failed):
+        update_fetch_progress("cover metadata batch", stage="cover_metadata", metadata_batch=batch,
+                              metadata_total_batches=total, metadata_batches_done=done, metadata_failed_batches=failed,
+                              wait_reason="", wait_seconds=0)
+
+    kwargs = {"progress": progress} if track_progress else {}
+    metadata = fetch_gallery_metadata(cookie, pairs, proxy_url=proxy_url, **kwargs)
     return apply_gallery_metadata(galleries, metadata)
 
 

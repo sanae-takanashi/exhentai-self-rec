@@ -528,6 +528,15 @@ class GdataTest(unittest.TestCase):
         # First batch raised; only the second batch's non-error entry survives.
         self.assertEqual(list(metadata), ["https://exhentai.org/g/8/y/"])
 
+    def test_metadata_progress_counts_batches_and_reports_failures_without_private_errors(self):
+        progress = []
+        pairs = [(gid, "tok") for gid in range(30)] + [(1, "tok")]
+        with patch.object(exhentai, "post_api_json", side_effect=[RuntimeError("private"), {"gmetadata": []}]):
+            metadata = fetch_gallery_metadata("cookie", pairs, sleep=lambda _: None,
+                                              progress=lambda *values: progress.append(values))
+        self.assertEqual(metadata, {})
+        self.assertEqual(progress, [(1, 2, 0, 0), (1, 2, 1, 1), (2, 2, 1, 1), (2, 2, 2, 1)])
+
     def test_apply_gallery_metadata_prefers_ehgt_and_backfills(self):
         gallery = Gallery(
             url="https://exhentai.org/g/123/abc/",

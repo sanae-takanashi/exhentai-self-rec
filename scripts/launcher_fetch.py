@@ -1,12 +1,12 @@
 """Read-only fetch telemetry client and native activity view."""
-from datetime import datetime
+from datetime import date, datetime, timezone
 import ipaddress
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from exh_rec.fetch_activity import COUNTERS, MESSAGES, STAGES
+from exh_rec.fetch_activity import COMPLETION_REASONS, COUNTERS, METADATA_COUNTERS, MESSAGES, STAGES, WAIT_REASONS
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -29,6 +29,13 @@ def validate_activity(payload):
     for key in numeric:
         if type(data[key]) is not int or not 0 <= data[key] <= 10**12:
             raise ValueError()
+    for key in (*METADATA_COUNTERS, "phase_elapsed_seconds", "wait_remaining_seconds", "request_attempt"):
+        if type(data.get(key, 0)) is not int or not 0 <= data.get(key, 0) <= 10**12:
+            raise ValueError()
+    if data.get("wait_reason", "") not in WAIT_REASONS:
+        raise ValueError()
+    if data.get("min_posted_date"):
+        date.fromisoformat(data["min_posted_date"])
     if (data["trigger"] not in {"manual", "background", "enrich", "other"}
             or data["status"] not in {"", "success", "partial", "failed"}
             or data["message"] not in MESSAGES.values()):
@@ -45,6 +52,8 @@ def validate_activity(payload):
     if not isinstance(data["queries"], list) or len(data["queries"]) > 100:
         raise ValueError()
     for row in data["queries"]:
+        if row.get("completion_reason", "") not in COMPLETION_REASONS:
+            raise ValueError()
         if (not isinstance(row["label"], str) or len(row["label"]) > 256
                 or any(not char.isprintable() for char in row["label"])
                 or row["source"] not in {"recent", "bootstrap", "learned", "manual", "other"}
@@ -102,17 +111,17 @@ def duration(seconds):
 
 class FetchActivityView:
     def __init__(self, notebook, tk, ttk):
-        self.frame = ttk.Frame(notebook, padding=12)
+        self.frame = ttk.Frame(notebook, padding=8)
         notebook.add(self.frame, text="Fetch Activity")
         self.frame.columnconfigure(0, weight=1)
-        self.frame.rowconfigure(8, weight=2)
-        self.frame.rowconfigure(10, weight=1)
+        self.frame.rowconfigure(8, weight=2, minsize=100)
+        self.frame.rowconfigure(10, weight=1, minsize=65)
         self.heading = ttk.Label(self.frame, text="Waiting for service", style="Status.TLabel", wraplength=680)
         self.heading.grid(row=0, column=0, sticky="ew")
         self.summary = ttk.Label(self.frame, text="", style="Muted.TLabel", wraplength=680)
-        self.summary.grid(row=1, column=0, sticky="ew", pady=(5, 8))
+        self.summary.grid(row=1, column=0, sticky="ew", pady=(3, 6))
         metrics = ttk.Frame(self.frame)
-        metrics.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        metrics.grid(row=2, column=0, sticky="ew", pady=(0, 4))
         self.metrics = {}
         self.phases = []
         for index, name in enumerate(("Fetched", "New", "Enriched", "Errors")):
@@ -132,7 +141,7 @@ class FetchActivityView:
         self.query_bar = ttk.Progressbar(query_row, mode="determinate", maximum=1, length=150)
         self.query_bar.grid(row=0, column=1, sticky="e", padx=(10, 0))
         detail_row = ttk.Frame(self.frame)
-        detail_row.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        detail_row.grid(row=5, column=0, sticky="ew", pady=(0, 6))
         detail_row.columnconfigure(0, weight=1)
         self.detail_label = ttk.Label(detail_row, text="Details: --", wraplength=520)
         self.detail_label.grid(row=0, column=0, sticky="ew")
@@ -140,10 +149,9 @@ class FetchActivityView:
         self.detail_bar.grid(row=0, column=1, sticky="e", padx=(10, 0))
         self.plan_label = ttk.Label(self.frame, text="Query Plan", style="Muted.TLabel", wraplength=680)
         self.plan_label.grid(row=7, column=0, sticky="ew", pady=(0, 4))
-        self.plan = self.table(ttk, 8, ("query", "source", "state", "pages", "anchors", "fetched", "new"),
-                               ("Query", "Source", "State", "Pages / Cap", "Anchors", "Fetched", "New"),
-                               (210, 76, 78, 88, 64, 64, 54), height=5)
-        ttk.Label(self.frame, text="Stage Messages", style="Muted.TLabel").grid(row=9, column=0, sticky="w", pady=(10, 4))
+        self.plan = self.table(ttk, 8, ("query", "source", "state", "pages", "anchors", "fetched", "new", "reason"),
+                               ("Query", "Source", "State", "Pages / Cap", "Anchors", "Fetched", "New", "Ended By"),
+                               (140, 62, 58, 80, 56, 54, 42, 112), height=5)
         self.events = self.table(ttk, 10, ("time", "message", "context"),
                                  ("Time", "Activity", "Query / Detail"), (86, 380, 104), height=4)
         self.events.tag_configure("warning", foreground="#b42332")
@@ -199,9 +207,22 @@ class FetchActivityView:
         running = data["running"]
         state = "Running" if running else {"success": "Completed", "partial": "Partially completed", "failed": "Failed"}.get(data["status"], "Stopped")
         self.heading.configure(text=f"{state} | {data['message']}")
-        started = datetime.fromisoformat(data["started_at"]).strftime("%m-%d %H:%M UTC")
+        started = datetime.fromisoformat(data["started_at"])
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        started = started.astimezone().strftime("%m-%d %H:%M UTC%z")
+        wait = {"request": "Waiting for response", "rate_limit": "Request rate limit",
+                "retry": "Retry backoff", "temporary_ban": "Temporary ban pause",
+                "metadata_pause": "Metadata batch pause"}.get(data.get("wait_reason"), "") if running else ""
+        if wait and data.get("wait_remaining_seconds"):
+            wait += f" ({data['wait_remaining_seconds']}s remaining)"
+        if wait and data.get("request_attempt", 0) > 1:
+            wait += f" | Attempt {data['request_attempt']}"
         self.summary.configure(text=f"#{data['run_id']} {data['trigger']} | {started} | "
-                               f"Elapsed {duration(data['elapsed_seconds'])} | Update {data['quiet_seconds']}s ago | ETA --"
+                               f"Elapsed {duration(data['elapsed_seconds'])}"
+                               + (f" | Stage {duration(data.get('phase_elapsed_seconds', 0))}" if running else "")
+                               + f" | Update {data['quiet_seconds']}s ago"
+                               + (f"\n{wait}" if wait else "")
                                + (f"\nCurrent: {data['current_item'][:77]}{'...' if len(data['current_item']) > 77 else ''}" if data["current_item"] else ""))
         for name, key in (("Fetched", "fetched"), ("New", "stored"), ("Enriched", "enriched")):
             self.metrics[name].set(f"{name}: {data[key]}")
@@ -218,9 +239,17 @@ class FetchActivityView:
         details = f"{data['detail_done']}/{data['detail_total']} processed" if "detail_total" in data and data["stage"] not in {"starting", "running", "fetching_pages", "cover_metadata", "storing", "error", "selecting_details"} else "selection pending"
         self.detail_label.configure(text=f"Details: {details} | Limit {data['detail_limit']} | "
                                     f"Samples +{data['sample_extra_pages']} | Parents {data['parent_enriched']}")
-        self.detail_bar.configure(maximum=max(1, data["detail_total"]), value=data["detail_done"])
-        self.plan_label.configure(text=f"Plan: {data['initial_pages']} initial + {data['extra_pages']} catch-up pages/query | "
-                                  f"Incomplete: {data['incomplete_count']}")
+        if data["stage"] == "cover_metadata":
+            self.detail_label.configure(text=f"Metadata batches: {data.get('metadata_batches_done', 0)}/{data.get('metadata_total_batches', 0)} processed | "
+                                        f"Current {data.get('metadata_batch', 0)} | Failed {data.get('metadata_failed_batches', 0)}")
+        if data["stage"] == "cover_metadata":
+            self.detail_bar.configure(maximum=max(1, data.get("metadata_total_batches", 0)), value=data.get("metadata_batches_done", 0))
+        else:
+            self.detail_bar.configure(maximum=max(1, data["detail_total"]), value=data["detail_done"])
+        self.plan_label.configure(text=(f"Published >= {data['min_posted_date']} | " if data.get("min_posted_date") else "Plan: ")
+                                  + f"{data['initial_pages']} initial + {data['extra_pages']} extra/query | "
+                                  + ("Page cap completes | " if data.get("min_posted_date") else "")
+                                  + f"Incomplete {data['incomplete_count']}")
         wanted = {str(row["index"]) for row in data["queries"]}
         for item in self.plan.get_children():
             if item not in wanted:
@@ -230,7 +259,7 @@ class FetchActivityView:
             values = (row["label"] + (" [resume]" if row["resuming"] else ""), row["source"], row["state"],
                       f"{row['pages_done']}/{row['page_budget']}",
                       f"{row.get('anchor_matches', 0)}/{row['anchor_target']}" if row.get("anchor_target") else "--",
-                      row["fetched"], row["stored"])
+                      row["fetched"], row["stored"], COMPLETION_REASONS[row.get("completion_reason", "")])
             if self.plan.exists(key):
                 self.plan.item(key, values=values, tags=(row["state"],))
             else:

@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-from .net import open_url, open_url_with_retry, pause_after_temporary_ban, temporary_ban_detected
+from .net import open_url, open_url_with_retry, pause_after_temporary_ban, temporary_ban_detected, report_request_state
 from .recency import gallery_posted_date
 
 
@@ -350,6 +350,7 @@ def fetch_page(cookie_header: str, url: str, timeout: int = 30, proxy_url: str =
         except (http.client.IncompleteRead, ConnectionResetError):
             if attempt == 2:
                 raise
+            report_request_state("retry", 0.5 * (attempt + 1), attempt + 2)
             time.sleep(0.5 * (attempt + 1))
     raise RuntimeError("Page response retries exhausted")
 
@@ -461,6 +462,7 @@ def fetch_gallery_metadata(
     delay: float = GDATA_BATCH_PAUSE,
     proxy_url: str = "",
     sleep=time.sleep,
+    progress=None,
 ) -> dict[str, dict]:
     """Return ``{canonical_gallery_url: metadata}`` via the E-Hentai gdata API.
 
@@ -482,7 +484,12 @@ def fetch_gallery_metadata(
             pairs.append(key)
 
     metadata: dict[str, dict] = {}
+    total = (len(pairs) + GDATA_BATCH_SIZE - 1) // GDATA_BATCH_SIZE
+    failed = 0
     for index in range(0, len(pairs), GDATA_BATCH_SIZE):
+        batch = index // GDATA_BATCH_SIZE + 1
+        if progress:
+            progress(batch, total, batch - 1, failed)
         chunk = pairs[index : index + GDATA_BATCH_SIZE]
         try:
             response = post_api_json(
@@ -491,6 +498,9 @@ def fetch_gallery_metadata(
                 proxy_url=proxy_url,
             )
         except Exception:
+            failed += 1
+            if progress:
+                progress(batch, total, batch, failed)
             continue
         for entry in response.get("gmetadata") or []:
             if not isinstance(entry, dict) or entry.get("error"):
@@ -500,8 +510,12 @@ def fetch_gallery_metadata(
             if gid is None or not token:
                 continue
             metadata[canonical_gallery_url(str(gid), str(token))] = parse_gdata_entry(entry)
+        if progress:
+            progress(batch, total, batch, failed)
         if index + GDATA_BATCH_SIZE < len(pairs):
+            report_request_state("metadata_pause", delay)
             sleep(delay)
+            report_request_state()
     return metadata
 
 

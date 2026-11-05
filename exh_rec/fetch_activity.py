@@ -15,6 +15,8 @@ MESSAGES = {
     "query page limit reached": "Page limit reached; query window complete",
     "query page failed": "List page failed",
     "cover metadata checked": "Cover metadata checked",
+    "cover metadata started": "Checking cover metadata",
+    "cover metadata batch": "Processing cover metadata batch",
     "cover metadata failed": "Cover metadata failed",
     "query stored": "Query processed",
     "query failed": "Query failed",
@@ -41,6 +43,13 @@ STAGES = frozenset({"starting", "running", "fetching_pages", "error", "cover_met
                     "storing", "selecting_details", "enriching_details", "retraining", "finalizing", "finished", "failed"})
 COUNTERS = ("run_id", "fetched", "stored", "enriched", "parent_enriched", "detail_limit",
             "detail_total", "detail_done", "detail_index", "sample_extra_pages", "query_index", "query_total")
+COMPLETION_REASONS = {
+    "": "--", "page_limit": "Page cap", "age_limit": "Age boundary", "anchors": "Old anchors",
+    "results_end": "Results end", "request_failed": "Request failed", "metadata_failed": "Metadata gaps",
+    "incomplete": "Incomplete", "skipped": "Not started",
+}
+WAIT_REASONS = {"", "request", "rate_limit", "retry", "temporary_ban", "metadata_pause"}
+METADATA_COUNTERS = ("metadata_batch", "metadata_total_batches", "metadata_batches_done", "metadata_failed_batches")
 
 
 def number(value):
@@ -59,12 +68,15 @@ class FetchActivity:
         self.started = None
         self.updated = None
         self.finished = None
+        self.phase_started = None
+        self.wait_until = None
 
     def update(self, message, state, plan=None):
         with self.lock:
             now = time.monotonic()
             if message in {"fetch started", "enrichment started"}:
                 self.started, self.updated, self.finished = now, now, None
+                self.phase_started, self.wait_until = now, None
                 self.data = {"queries": [], "events": [], "initial_pages": number(state.get("page_count")),
                              "extra_pages": number(state.get("stale_extra_pages")), "queries_done": 0}
                 for index, entry in enumerate(plan or [], 1):
@@ -73,14 +85,26 @@ class FetchActivity:
                         "source": entry.get("source") if entry.get("source") in {"recent", "bootstrap", "learned", "manual"} else "other",
                         "state": "pending", "pages_done": 0, "page_budget": number(entry.get("page_budget")),
                         "fetched": 0, "stored": 0, "resuming": bool(entry.get("resuming")),
+                        "completion_reason": "",
                     })
             if self.started is None:
                 return
             data = self.data
+            old_stage = data.get("stage")
             for key in COUNTERS:
                 data[key] = number(state.get(key))
             data["running"] = state.get("running") is True
             data["stage"] = state.get("stage") if state.get("stage") in STAGES else "running"
+            if old_stage != data["stage"]:
+                self.phase_started = now
+            for key in METADATA_COUNTERS:
+                data[key] = number(state.get(key))
+            if message == "request activity":
+                self.wait_until = now + number(state.get("wait_seconds"))
+            else:
+                self.wait_until = None
+            data["wait_reason"] = state.get("wait_reason") if message == "request activity" and state.get("wait_reason") in WAIT_REASONS else ""
+            data["request_attempt"] = number(state.get("request_attempt"))
             data["trigger"] = state.get("trigger") if state.get("trigger") in {"manual", "background", "enrich"} else "other"
             data["status"] = state.get("status") if state.get("status") in {"success", "partial", "failed"} else ""
             data["error_count"] = len(state.get("errors") or [])
@@ -103,9 +127,15 @@ class FetchActivity:
                     row["stored"] += number(state.get("stored_page"))
                 if message in {"query page failed", "cover metadata failed", "query failed"}:
                     row["error"] = True
+                    if row["completion_reason"] != "request_failed":
+                        row["completion_reason"] = "metadata_failed" if message == "cover metadata failed" else "request_failed"
                 if message in {"query stored", "query failed"}:
                     row["state"] = "failed" if message == "query failed" else "partial" if row.get("error") or not state.get("cursor_caught_up") else "done"
                     row["incomplete"] = not state.get("cursor_caught_up") and row["source"] in {"recent", "bootstrap", "learned"}
+                    if not row.get("error"):
+                        reason = state.get("query_completion_reason")
+                        row["completion_reason"] = reason if reason in COMPLETION_REASONS else "incomplete"
+                    row["metadata_failed_batches"] = number(state.get("metadata_failed_batches"))
                 row["anchor_matches"] = number(state.get("cursor_matches"))
                 row["anchor_target"] = number(state.get("cursor_match_target"))
                 row["age_limit_reached"] = state.get("age_limit_reached") is True
@@ -130,6 +160,7 @@ class FetchActivity:
                     for row in data["queries"]:
                         if row["state"] in {"pending", "running"}:
                             row["state"] = "failed" if row["state"] == "running" else "skipped"
+                            row["completion_reason"] = "request_failed" if row["state"] == "failed" else "skipped"
                     data["queries_done"] = sum(row["state"] in {"done", "partial", "failed"} for row in data["queries"])
 
     def snapshot(self):
@@ -138,4 +169,9 @@ class FetchActivity:
             now = time.monotonic()
             result["elapsed_seconds"] = int((self.finished or now) - self.started) if self.started is not None else 0
             result["quiet_seconds"] = int(now - self.updated) if self.updated is not None else 0
-            return {"service": "exh-rec", "schema": 1, "activity": result}
+            end = self.finished if self.finished is not None else now
+            result["phase_elapsed_seconds"] = max(0, int(end - self.phase_started)) if self.phase_started is not None else 0
+            result["wait_remaining_seconds"] = max(0, int(self.wait_until - now + .999)) if self.wait_until is not None and result["running"] else 0
+            return {"service": "exh-rec", "schema": 1,
+                    "capabilities": ["query_completion_reason", "publication_window", "metadata_batches", "request_wait"],
+                    "activity": result}

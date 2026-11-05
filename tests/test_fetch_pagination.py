@@ -12,6 +12,8 @@ from exh_rec import app, db, exhentai
 from exh_rec.exhentai import Gallery, GalleryBatch
 from exh_rec.recency import recent_gallery_cutoff
 
+REAL_ENRICH_COVERS = app.enrich_covers_via_api
+
 
 def gallery(gid):
     return Gallery(url=f"https://exhentai.org/g/{gid}/abcdef/", gid=str(gid), token="abcdef", title=f"Gallery {gid}",
@@ -90,6 +92,30 @@ class PaginationTest(unittest.TestCase):
 
 
 class CatchUpTest(unittest.TestCase):
+    def test_metadata_progress_starts_before_network_and_reports_batch_gaps(self):
+        observed = []
+        batch = GalleryBatch([gallery(gid) for gid in range(100, 130)], next_url=None)
+
+        def post(*args, **kwargs):
+            observed.append(app.FETCH_ACTIVITY.snapshot()["activity"])
+            if len(observed) == 1:
+                raise TimeoutError("fixture-private")
+            return {"gmetadata": []}
+
+        with patch.object(app, "fetch_galleries", return_value=batch), patch.object(
+            app, "enrich_covers_via_api", REAL_ENRICH_COVERS
+        ), patch.object(app, "fetch_gallery_metadata", wraps=exhentai.fetch_gallery_metadata), patch.object(
+            exhentai, "post_api_json", side_effect=post
+        ):
+            result = app.fetch_and_store()
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual([entry["stage"] for entry in observed], ["cover_metadata", "cover_metadata"])
+        self.assertEqual([entry["metadata_batch"] for entry in observed], [1, 2])
+        data = app.FETCH_ACTIVITY.snapshot()["activity"]
+        self.assertEqual(data["queries"][0]["completion_reason"], "metadata_failed")
+        self.assertEqual(data["queries"][0]["metadata_failed_batches"], 1)
+        self.assertNotIn("fixture-private", json.dumps(data))
+
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp(prefix="exh-fetch-test-"))
         self.patches = [
@@ -266,6 +292,7 @@ class CatchUpTest(unittest.TestCase):
                 result = app.fetch_and_store()
             self.assertEqual(result["status"], "success" if gid == 10 else "partial")
         self.assertEqual(self.state()["anchors"], [gallery(12).url])
+        self.assertEqual(app.FETCH_ACTIVITY.snapshot()["activity"]["queries"][0]["completion_reason"], "anchors")
 
     def test_25_page_limit_completes_without_anchors_and_next_run_starts_at_head(self):
         with db.connect() as conn:
@@ -286,6 +313,7 @@ class CatchUpTest(unittest.TestCase):
         self.assertEqual(activity["incomplete_count"], 0)
         self.assertEqual(activity["queries"][0]["state"], "done")
         self.assertTrue(activity["queries"][0]["page_limit_reached"])
+        self.assertEqual(activity["queries"][0]["completion_reason"], "page_limit")
         self.assertFalse(activity["queries"][0]["age_limit_reached"])
         self.assertEqual(activity["queries"][0]["anchor_matches"], 0)
         with db.connect() as conn:
@@ -336,6 +364,7 @@ class CatchUpTest(unittest.TestCase):
         activity = app.FETCH_ACTIVITY.snapshot()["activity"]
         self.assertEqual(activity["min_posted_date"], "2026-08-03")
         self.assertTrue(activity["queries"][0]["age_limit_reached"])
+        self.assertEqual(activity["queries"][0]["completion_reason"], "age_limit")
 
     def test_all_old_resume_finishes_and_next_run_starts_at_head(self):
         old = gallery(20)

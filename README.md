@@ -330,6 +330,16 @@ an anchor, age boundary, end of results, or the next page budget. Keep the exist
 request delay and ban pause; increasing `Catch-up` changes only the bounded batch
 size. No library reset or deletion of historical galleries is needed.
 
+The launcher's Fetch Activity query table includes an `Ended By` reason (page cap,
+age boundary, old anchors, results end, or failure). The frozen run publication
+cutoff and page-cap completion policy appear below the progress bars. Metadata
+progress switches stage before the API call and counts processed/failed batches;
+request-rate limits, batch pauses, retry backoff and temporary-ban waits show their
+remaining delay separately from elapsed stage time. Remaining delay is not a run
+ETA. The web status panel exposes the same telemetry. `/api/fetch-progress` remains
+bounded, in-memory and free of request URLs, credentials and raw exceptions; request
+observation is scoped to the current fetch/enrichment worker, not other operations.
+
 Detail enrichment and parent metadata updates also follow missing parent links and store ancestor metadata locally, up to 12 levels. Ancestors fetched only for this purpose are excluded from Review and short-repeat candidates; if a later normal query discovers one, it becomes reviewable like any other fetched gallery.
 
 Blank or whitespace-only one-off search input uses the normal recent/bootstrap/learned fetch plan.

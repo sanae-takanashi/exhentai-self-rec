@@ -14,6 +14,8 @@ from exh_rec.net import (
     normalize_proxy_url,
     open_url,
     open_url_with_retry,
+    observe_requests,
+    report_request_state,
     rate_limited_url,
     proxy_preview,
     request_rate_limit_settings,
@@ -27,6 +29,38 @@ from exh_rec.net import (
 class NetTest(unittest.TestCase):
     def tearDown(self):
         configure_request_rate_limit(0, 0)
+
+    def test_request_observer_is_scoped_nested_and_thread_local(self):
+        import threading
+        outer, inner = [], []
+        with observe_requests(lambda *args: outer.append(args)):
+            report_request_state("request")
+            with self.assertRaises(RuntimeError), observe_requests(lambda *args: inner.append(args)):
+                report_request_state("retry", 2, 3)
+                raise RuntimeError("fixture")
+            thread = threading.Thread(target=report_request_state, args=("temporary_ban", 90))
+            thread.start()
+            thread.join()
+            report_request_state("rate_limit", 1)
+        report_request_state("retry", 5)
+        self.assertEqual(outer, [("request", 0, 0), ("rate_limit", 1, 0)])
+        self.assertEqual(inner, [("retry", 2, 3)])
+
+    def test_retry_and_deferred_ban_wait_are_observable_without_request_data(self):
+        events = []
+        request = urllib.request.Request("https://exhentai.org/", headers={"Cookie": "fixture-private"})
+        with observe_requests(lambda *args: events.append(args)), patch(
+            "exh_rec.net.open_url", side_effect=[TimeoutError("private"), object()]
+        ):
+            open_url_with_retry(request, timeout=1, sleep=lambda _: None)
+        self.assertIn(("retry", .5, 2), events)
+        self.assertNotIn("private", repr(events))
+        events.clear()
+        configure_request_rate_limit(0, 90)
+        with observe_requests(lambda *args: events.append(args)), patch("exh_rec.net.time.monotonic", return_value=10):
+            pause_after_temporary_ban(sleep_now=False)
+            wait_for_request_slot("https://exhentai.org/", sleep=lambda _: None)
+        self.assertIn(("temporary_ban", 90, 0), events)
 
     def test_environment_proxy_url_upgrades_socks5_to_socks5h(self):
         # Plain socks5:// makes requests/huggingface_hub resolve DNS locally; socks5h

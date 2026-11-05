@@ -15,9 +15,11 @@ from typing import Any
 PROXY_ENV_KEYS = ("EXH_REC_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 _SOCKS_LOCK = threading.Lock()
+_REQUEST_OBSERVER = threading.local()
 _RATE_LOCK = threading.Lock()
 _RATE_LIMIT_SECONDS = 0.0
 _TEMPORARY_BAN_PAUSE_SECONDS = 0.0
+_TEMPORARY_BAN_UNTIL = 0.0
 _NEXT_REQUEST_AT = 0.0
 _TEMPORARY_BAN_BUFFER_SECONDS = 5.0
 RATE_LIMIT_HOST_SUFFIXES = (
@@ -35,11 +37,29 @@ TEMPORARY_BAN_DURATION_RE = re.compile(
 )
 
 
+@contextmanager
+def observe_requests(callback):
+    """Observe only this worker's public request/wait state, never request data."""
+    previous = getattr(_REQUEST_OBSERVER, "callback", None)
+    _REQUEST_OBSERVER.callback = callback
+    try:
+        yield
+    finally:
+        _REQUEST_OBSERVER.callback = previous
+
+
+def report_request_state(reason: str = "", seconds: float = 0, attempt: int = 0) -> None:
+    callback = getattr(_REQUEST_OBSERVER, "callback", None)
+    if callback:
+        callback(reason, max(0, seconds), max(0, attempt))
+
+
 def configure_request_rate_limit(interval_seconds: float = 0.0, temporary_ban_pause_seconds: float = 0.0) -> None:
-    global _RATE_LIMIT_SECONDS, _TEMPORARY_BAN_PAUSE_SECONDS, _NEXT_REQUEST_AT
+    global _RATE_LIMIT_SECONDS, _TEMPORARY_BAN_PAUSE_SECONDS, _NEXT_REQUEST_AT, _TEMPORARY_BAN_UNTIL
     _RATE_LIMIT_SECONDS = max(0.0, float(interval_seconds or 0.0))
     _TEMPORARY_BAN_PAUSE_SECONDS = max(0.0, float(temporary_ban_pause_seconds or 0.0))
     _NEXT_REQUEST_AT = 0.0
+    _TEMPORARY_BAN_UNTIL = 0.0
 
 
 def request_rate_limit_settings() -> dict[str, float]:
@@ -138,6 +158,7 @@ def open_url_with_retry(
     last_exc: Exception | None = None
     for index in range(max(1, attempts)):
         try:
+            report_request_state("request", attempt=index + 1)
             return open_url(request, timeout=timeout, proxy_url=proxy_url)
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 509) and index < attempts - 1:
@@ -151,7 +172,9 @@ def open_url_with_retry(
             if index == attempts - 1:
                 raise
             last_exc = exc
-        sleep(backoff * (2 ** index))
+        delay = backoff * (2 ** index)
+        report_request_state("retry", delay, index + 2)
+        sleep(delay)
     # Unreachable: the loop either returns or raises on the final attempt.
     raise last_exc if last_exc else RuntimeError("open_url_with_retry exhausted")
 
@@ -182,10 +205,13 @@ def wait_for_request_slot(url: str, sleep=time.sleep) -> None:
     with _RATE_LOCK:
         now = time.monotonic()
         if _NEXT_REQUEST_AT > now:
+            reason = "temporary_ban" if _TEMPORARY_BAN_UNTIL > now else "rate_limit"
+            report_request_state(reason, _NEXT_REQUEST_AT - now)
             sleep(_NEXT_REQUEST_AT - now)
             now = time.monotonic()
         if _RATE_LIMIT_SECONDS > 0:
             _NEXT_REQUEST_AT = now + _RATE_LIMIT_SECONDS
+    report_request_state("request")
 
 
 def rate_limited_url(url: str) -> bool:
@@ -200,11 +226,14 @@ def pause_after_temporary_ban(text: str = "", sleep=time.sleep, sleep_now: bool 
     if seconds <= 0:
         return 0.0
 
-    global _NEXT_REQUEST_AT
+    global _NEXT_REQUEST_AT, _TEMPORARY_BAN_UNTIL
     with _RATE_LOCK:
-        _NEXT_REQUEST_AT = max(_NEXT_REQUEST_AT, time.monotonic() + seconds)
+        _TEMPORARY_BAN_UNTIL = max(_TEMPORARY_BAN_UNTIL, time.monotonic() + seconds)
+        _NEXT_REQUEST_AT = max(_NEXT_REQUEST_AT, _TEMPORARY_BAN_UNTIL)
     if sleep_now:
+        report_request_state("temporary_ban", seconds)
         sleep(seconds)
+        report_request_state("request")
     return seconds
 
 

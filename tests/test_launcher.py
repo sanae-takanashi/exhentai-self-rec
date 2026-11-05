@@ -557,6 +557,40 @@ class LauncherUITests(unittest.TestCase):
         read.assert_called_with(status["home_url"])
         self.assertIn("Running", self.app.fetch_activity.heading.cget("text"))
 
+    def test_fetch_layout_preserves_query_and_event_rows_at_supported_sizes(self):
+        from tkinter import font
+        from tests.test_fetch_activity import running_activity
+        for timer in list(self.app.timers):
+            self.root.after_cancel(timer)
+        self.app.timers.clear()
+        self.root.attributes("-alpha", 0)
+        view = self.app.fetch_activity
+        self.app.notebook.select(view.frame)
+        activity, state = running_activity()
+        state.update(min_posted_date="2026-08-05", query_index=1, query_page_limit=25,
+                     cursor_caught_up=True, query_completion_reason="page_limit")
+        activity.update("query started", state)
+        activity.update("query stored", state)
+        for stage in ("cover_metadata", "enriching_details", "finished"):
+            state.update(stage=stage, metadata_batch=20, metadata_total_batches=25, metadata_batches_done=19,
+                         current_gallery_title="Synthetic gallery " * 12, detail_total=50, detail_done=20,
+                         wait_reason="retry", wait_seconds=5, request_attempt=3,
+                         running=stage != "finished", status="success" if stage == "finished" else "")
+            activity.update("request activity" if stage != "finished" else "fetch finished", state)
+            view.render({"availability": "available", "activity": activity.snapshot()["activity"]})
+            for width, height in ((780, 760), (880, 760), (1100, 900)):
+                with self.subTest(stage=stage, width=width):
+                    self.root.geometry(f"{width}x{height}+20000+20000")
+                    self.root.deiconify()
+                    self.root.update()
+                    self.assertGreaterEqual(view.plan.winfo_height(), 100)
+                    self.assertGreaterEqual(view.events.winfo_height(), 65)
+                    self.assertLessEqual(view.events.master.winfo_y() + view.events.master.winfo_height(), view.frame.winfo_height() - 8)
+                    self.assertLessEqual(sum(int(view.plan.column(column, "width")) for column in view.plan["columns"]), view.plan.winfo_width())
+                    for column in view.plan["columns"]:
+                        self.assertLessEqual(font.nametofont("TkHeadingFont").measure(view.plan.heading(column, "text")) + 6,
+                                             int(view.plan.column(column, "width")))
+
 
 if __name__ == "__main__":
     unittest.main()

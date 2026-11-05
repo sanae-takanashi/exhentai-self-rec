@@ -66,6 +66,55 @@ def telemetry_server(payload, mode="normal"):
 
 
 class FetchActivityTests(unittest.TestCase):
+    def test_completion_reasons_and_scope_are_retained_per_query(self):
+        activity, state = running_activity()
+        state.update(query_index=1, min_posted_date="2026-08-05", query_page_limit=25,
+                     cursor_caught_up=True, page_limit_reached=True, query_completion_reason="page_limit")
+        activity.update("query started", state)
+        activity.update("query stored", state)
+        state.update(query_index=2, query_completion_reason="age_limit", page_limit_reached=False, age_limit_reached=True)
+        activity.update("query started", state)
+        activity.update("query stored", state)
+        data = validate_activity(activity.snapshot())
+        self.assertEqual([row["completion_reason"] for row in data["queries"]], ["page_limit", "age_limit"])
+        self.assertEqual(data["min_posted_date"], "2026-08-05")
+
+    def test_metadata_errors_do_not_look_like_successful_page_cap(self):
+        activity, state = running_activity()
+        state.update(query_index=1, query_page_limit=25, cursor_caught_up=True, query_completion_reason="page_limit")
+        activity.update("query started", state)
+        activity.update("cover metadata failed", state)
+        activity.update("query stored", state)
+        row = validate_activity(activity.snapshot())["queries"][0]
+        self.assertEqual(row["completion_reason"], "metadata_failed")
+        self.assertEqual(row["state"], "partial")
+
+    def test_phase_time_and_wait_countdown_are_independent_of_polling(self):
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=100):
+            activity, state = running_activity()
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=105):
+            state.update(stage="cover_metadata", metadata_batch=2, metadata_total_batches=10, metadata_batches_done=1)
+            activity.update("cover metadata batch", state)
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=110):
+            state.update(wait_reason="metadata_pause", wait_seconds=5)
+            activity.update("request activity", state)
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=112):
+            data = validate_activity(activity.snapshot())
+        self.assertEqual(data["phase_elapsed_seconds"], 7)
+        self.assertEqual(data["wait_remaining_seconds"], 3)
+        self.assertEqual(data["quiet_seconds"], 2)
+        self.assertEqual(data["metadata_batches_done"], 1)
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=113):
+            activity.update("cover metadata batch", state)
+            self.assertEqual(activity.snapshot()["activity"]["wait_remaining_seconds"], 0)
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=116):
+            state.update(stage="finished", running=False, status="success")
+            activity.update("fetch finished", state)
+        with patch("exh_rec.fetch_activity.time.monotonic", return_value=150):
+            data = activity.snapshot()["activity"]
+        self.assertEqual(data["wait_remaining_seconds"], 0)
+        self.assertEqual(data["wait_reason"], "")
+
     def test_query_budget_counts_and_incomplete_do_not_claim_success(self):
         activity, state = running_activity()
         state.update(stage="fetching_pages", query_index=1, query_page_limit=3, cursor_active=True, cursor_resuming=True)
@@ -183,7 +232,8 @@ class FetchActivityTests(unittest.TestCase):
         activity, _ = running_activity()
         payload = activity.snapshot()
         for field, value in (("stage", "private"), ("run_id", "private"), ("queries", None),
-                             ("events", [{"message": "private"}]), ("current_item", "x\nprivate")):
+                             ("events", [{"message": "private"}]), ("current_item", "x\nprivate"),
+                             ("wait_reason", "private"), ("metadata_batch", -1), ("min_posted_date", "private")):
             invalid = deepcopy(payload)
             invalid["activity"][field] = value
             with self.subTest(field=field), telemetry_server(invalid) as (url, _):
@@ -203,6 +253,25 @@ class FetchActivityViewTests(unittest.TestCase):
 
     def tearDown(self):
         self.root.destroy()
+
+    def test_renders_scope_completion_reason_and_metadata_wait(self):
+        activity, state = running_activity()
+        state.update(query_index=1, query_page_limit=25, cursor_caught_up=True,
+                     query_completion_reason="page_limit", min_posted_date="2026-08-05")
+        activity.update("query started", state)
+        activity.update("query stored", state)
+        state.update(stage="cover_metadata", metadata_batch=2, metadata_total_batches=10, metadata_batches_done=1,
+                     wait_reason="metadata_pause", wait_seconds=5)
+        activity.update("request activity", state)
+        self.view.render({"availability": "available", "activity": validate_activity(activity.snapshot())})
+        self.assertEqual(self.view.plan.item("1", "values")[-1], "Page cap")
+        self.assertIn("Published >= 2026-08-05", self.view.plan_label.cget("text"))
+        self.assertIn("cap completes", self.view.plan_label.cget("text"))
+        self.assertIn("1/10 processed", self.view.detail_label.cget("text"))
+        self.assertIn("Metadata batch pause", self.view.summary.cget("text"))
+        self.assertEqual(float(self.view.detail_bar.cget("value")), 1)
+        self.assertEqual(float(self.view.detail_bar.cget("maximum")), 10)
+        self.assertNotIn("ETA", self.view.summary.cget("text"))
 
     def test_renders_plan_budget_and_completed_queries_while_details_still_running(self):
         activity, state = running_activity()
