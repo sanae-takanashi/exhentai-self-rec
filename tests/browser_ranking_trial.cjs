@@ -170,7 +170,9 @@ async function scenario(viewport) {
     await idle();
     assert(await page.locator("#recommendations button[data-score]").first().isEnabled());
     await page.locator("#lowInterestTab").click();
-    await page.locator("#reviewModeControls").waitFor({ state: "hidden" });
+    await page.locator(".review-ranking-controls").waitFor({ state: "hidden" });
+    assert(await page.locator("#reviewModeControls").isVisible());
+    assert(await page.locator("#reviewGridMode").isEnabled());
     assert.deepEqual(errors, []);
     return { viewport, passed: true, switches: writes.length, deliveries: deliveries.length, lists };
   } finally {

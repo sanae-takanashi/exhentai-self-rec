@@ -131,6 +131,7 @@ let hathPackStatusPayload = null;
 let hathCleanupOnly = false;
 let hathPackPreviewVersion = 0;
 let lastRenderedFetchId = null;
+let lastObservedTrainingCompletion;
 let initialPageLoading = true;
 let currentView = "review";
 let reviewExploreSeed = "";
@@ -212,6 +213,9 @@ function updateReviewControls() {
   refresh.disabled = reviewBusy();
   refresh.classList.toggle("updates-available", reviewUpdatesAvailable);
   refresh.title = reviewUpdatesAvailable ? "New updates available; refresh review queue" : "Refresh review queue";
+  document.querySelector("#reviewUpdatesNotice")?.classList.toggle("hidden", !isReviewView() || !reviewUpdatesAvailable);
+  const applyUpdates = document.querySelector("#reviewApplyUpdatesBtn");
+  if (applyUpdates) applyUpdates.disabled = reviewBusy();
   recommendationsEl.setAttribute("aria-busy", String(isReviewView() && reviewLoading));
   if (isReviewView()) {
     const empty = !renderedGalleryItems.length && recommendationsEl.querySelector(".hint");
@@ -297,7 +301,7 @@ async function navigateReview(delta) {
 }
 
 function deferFocusRefresh() {
-  if (!isFocusReview()) return false;
+  if (!isReviewView() || (!isFocusReview() && !renderedGalleryItems.length)) return false;
   reviewUpdatesAvailable = true;
   updateReviewControls();
   return true;
@@ -777,8 +781,23 @@ async function loadStatus() {
   applyVisualSettings(payload.visual);
   renderStatus(payload);
   renderParentUpdateProgress(payload.parent_update || {});
+  observeTrainingCompletion(payload.model_retrain);
   await reloadRecommendationsAfterFetch(payload);
   return payload;
+}
+
+function observeTrainingCompletion(training) {
+  if (!training) return;
+  const completed = training.last_completed_at || null;
+  // A second job may already be running when a completed revision is first
+  // observed. Keep the last acknowledged revision until a later idle poll.
+  if (lastObservedTrainingCompletion !== undefined && training.running) return;
+  if (lastObservedTrainingCompletion !== undefined && completed &&
+      completed !== lastObservedTrainingCompletion && !training.running) {
+    deferFocusRefresh();
+    refreshQueueCounts();
+  }
+  lastObservedTrainingCompletion = completed;
 }
 
 async function previewPlan() {
@@ -2731,11 +2750,15 @@ async function showFeedbackHistory(galleryUrl) {
 }
 
 async function retrain() {
-  setStatus("Retraining model");
+  setStatus("Queuing model training");
   const payload = await api("/api/retrain", {
     method: "POST",
     body: JSON.stringify({ include_rated: false, filter_text: localFilterEl.value.trim() }),
   });
+  if (payload.queued) {
+    setStatus("Training queued in the background. Your current Review and undo are preserved.");
+    return;
+  }
   await loadCurrentPage();
   refreshQueueCounts();
   modelBody.textContent = JSON.stringify(payload.model, null, 2);
@@ -4001,6 +4024,9 @@ document.querySelector("#reviewPrevBtn").addEventListener("click", () => navigat
 document.querySelector("#reviewNextBtn").addEventListener("click", () => navigateReview(1).catch((error) => setStatus(error.message, true)));
 document.querySelector("#reviewUndoBtn").addEventListener("click", () => undoReviewRating().catch((error) => setStatus(error.message, true)));
 document.querySelector("#reviewRefreshBtn").addEventListener("click", () => {
+  if (!reviewBusy()) loadCurrentPage().catch((error) => setStatus(error.message, true));
+});
+document.querySelector("#reviewApplyUpdatesBtn").addEventListener("click", () => {
   if (!reviewBusy()) loadCurrentPage().catch((error) => setStatus(error.message, true));
 });
 document.addEventListener("keydown", reviewKeydown);

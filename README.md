@@ -6,6 +6,22 @@ It stores your login cookies locally, fetches recent/search result pages, ranks 
 
 ## Features
 
+The **Insights & Preferences** menu opens four local tools while preserving the
+current Review tab: [fetch yield](FETCH-INSIGHTS.md),
+[ranking results](RANKING-INSIGHTS.md), [similar local pages](PAGE-SEARCH.md),
+and [preference evidence and previewed edits](PREFERENCES.md).
+Manual Retrain now queues background work and reports its status; see
+[Review training jobs](REVIEW-JOBS.md). Fetch/model completion offers a queue
+refresh without replacing loaded Review cards. This preserves the loaded
+session, not a frozen snapshot of every future recommendation page.
+
+Restart the backend to initialize the additive provenance tables and new API
+routes. Query yield measurements begin with subsequent fetches; historical
+single-query hints are shown separately. Existing local image indexes remain
+previewable, but single-page search needs a newly built index containing
+per-page vectors. These tools do not enable a new ranking model, change the
+Low Interest gate, or automatically redistribute fetch budgets.
+
 Audit safety update: delivered pages and confirmed-visible cards are now tracked
 separately. Pending audits resume within a frozen opening-day budget. The
 learned absolute threshold currently fails closed until candidate-region

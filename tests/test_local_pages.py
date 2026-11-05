@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from unittest.mock import patch
 
-from exh_rec.local_pages import LocalPageLibrary, SCHEMA, mean_vector, normalized, read_regular
+from exh_rec.local_pages import LocalPageLibrary, PAGE_SEARCH_SCHEMA, SCHEMA, mean_vector, normalized, read_regular
 
 
 class LocalPagesTest(unittest.TestCase):
@@ -190,10 +190,107 @@ class LocalPagesTest(unittest.TestCase):
         self.library.image(self.digest)
         self.assertEqual(self.conn.total_changes, before)
 
+    def searchable_fixture(self):
+        self.document.update(page_embedding_schema=PAGE_SEARCH_SCHEMA, page_embedding_dimension=2, encoder="fixture-v1")
+        for row in self.document["galleries"]:
+            for page in row["pages"]:
+                blob = f"synthetic-{row['key']}-{page['position']}".encode()
+                digest = hashlib.sha256(blob).hexdigest()
+                (self.root / "images" / f"{digest}.png").write_bytes(blob)
+                page.update(sha256=digest, bytes=len(blob), embedding=[1, 0] if row["gid"] in {"1", "2"} else [0, 1],
+                            embedding_version="fixture-v1")
+        self.publish()
+
+    def test_page_search_ranks_actual_pages_and_has_no_writes_or_network(self):
+        self.searchable_fixture()
+        self.document["galleries"][1]["pages"][1]["embedding"] = [-1, 0]
+        self.publish()
+        before = (self.root / "index.json").read_bytes()
+        changes = self.conn.total_changes
+        with patch("urllib.request.urlopen", side_effect=AssertionError("no network")):
+            result = self.library.search("1-1280", 11, self.conn, limit=2)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["query"]["page"]["position"], 11)
+        self.assertEqual(result["candidate_count"], 9)
+        self.assertEqual(result["indexed_pages"], 12)
+        self.assertEqual(result["items"][0]["item"]["gid"], "2")
+        self.assertEqual([hit["page"]["position"] for hit in result["items"]], [1, 20])
+        self.assertEqual(result["items"][0]["cosine"], 1.0)
+        self.assertEqual(result["scope"], "indexed-local-samples")
+        self.assertEqual(result["score_kind"], "cosine-similarity")
+        self.assertNotIn("embedding", json.dumps(result))
+        self.assertEqual(self.conn.total_changes, changes)
+        self.assertEqual((self.root / "index.json").read_bytes(), before)
+
+    def test_page_search_old_index_is_previewable_and_requires_rebuild(self):
+        catalog = self.library.catalog(self.conn)
+        self.assertTrue(catalog["available"])
+        self.assertEqual(catalog["page_search"]["reason"], "rebuild_required")
+        self.assertFalse(catalog["items"][0]["pages"][0]["searchable"])
+        self.assertEqual(self.library.search("1-1280", 1, self.conn)["reason"], "rebuild_required")
+
+    def test_page_search_excludes_query_gid_and_deduplicates_assets(self):
+        self.searchable_fixture()
+        duplicate = copy.deepcopy(self.document["galleries"][0])
+        duplicate.update(key="1-org", resolution="org")
+        self.document["galleries"].append(duplicate)
+        self.document["galleries"][2]["pages"][0] = copy.deepcopy(self.document["galleries"][1]["pages"][0])
+        self.document["galleries"][3]["pages"][0] = copy.deepcopy(self.document["galleries"][0]["pages"][0])
+        self.publish()
+        result = self.library.search("1-1280", 1, self.conn)
+        self.assertEqual(result["candidate_count"], 7)
+        self.assertNotIn("1", {hit["item"]["gid"] for hit in result["items"]})
+        self.assertEqual(len({hit["page"]["src"] for hit in result["items"]}), 7)
+
+    def test_page_search_partial_index_and_unknown_page(self):
+        self.searchable_fixture()
+        self.document["galleries"][0]["pages"][0].pop("embedding")
+        self.publish()
+        self.assertEqual(self.library.search("1-1280", 1, self.conn)["reason"], "page_not_indexed")
+        for key, position in [("99-1280", 1), ("1-1280", 2), ("../private", 1)]:
+            with self.assertRaises(KeyError):
+                self.library.search(key, position, self.conn)
+        for position, limit in [(0, 12), (True, 12), (1, 0), (1, 31), (1, True)]:
+            with self.assertRaises(ValueError):
+                self.library.search("1-1280", position, self.conn, limit)
+
+    def test_page_search_rejects_invalid_provenance_vectors_and_dimensions(self):
+        self.searchable_fixture()
+        original = copy.deepcopy(self.document)
+        for mutation in [lambda doc: doc.update(page_embedding_schema="unknown"),
+                         lambda doc: doc.update(page_embedding_dimension=3),
+                         lambda doc: doc.update(page_embedding_dimension=True),
+                         lambda doc: doc.update(encoder="other"),
+                         lambda doc: doc["galleries"][0]["pages"][0].update(embedding_version="other"),
+                         lambda doc: doc["galleries"][0]["pages"][0].update(embedding=[1, 0, 0]),
+                         lambda doc: doc["galleries"][0]["pages"][0].update(embedding=[float("nan"), 0]),
+                         lambda doc: doc["galleries"][0]["pages"][0].update(embedding=[0, 0])]:
+            self.document = copy.deepcopy(original)
+            mutation(self.document)
+            self.publish()
+            self.assertEqual(LocalPageLibrary(self.root).catalog(self.conn)["reason"], "invalid_library")
+
+    def test_page_search_verifies_query_and_returned_assets(self):
+        self.searchable_fixture()
+        original_image = self.library.image
+        for row_index in [0, 1]:
+            digest = self.document["galleries"][row_index]["pages"][0]["sha256"]
+            def fail_missing(selected):
+                if selected == digest:
+                    raise FileNotFoundError("synthetic missing image")
+                return original_image(selected)
+            with patch.object(self.library, "image", side_effect=fail_missing), self.assertRaises(FileNotFoundError):
+                self.library.search("1-1280", 1, self.conn)
+        digest = self.document["galleries"][1]["pages"][0]["sha256"]
+        (self.root / "images" / f"{digest}.png").write_bytes(b"corrupt")
+        with self.assertRaises(ValueError):
+            self.library.search("1-1280", 1, self.conn)
+
     def test_http_routes_serve_only_allowlisted_verified_images(self):
         from contextlib import contextmanager
         from http.server import ThreadingHTTPServer
         from exh_rec import app
+        self.searchable_fixture()
 
         class QuietHandler(app.Handler):
             def log_message(self, *args):
@@ -220,6 +317,21 @@ class LocalPagesTest(unittest.TestCase):
                     self.assertTrue(json.load(response)["available"])
                 with opener.open(base + "/api/local-pages/compare?key=1-1280", timeout=5) as response:
                     self.assertEqual(json.load(response)["body"][0]["gid"], "3")
+                with opener.open(base + "/api/local-pages/search?key=1-1280&position=11&limit=2", timeout=5) as response:
+                    result = json.load(response)
+                    self.assertTrue(result["available"])
+                    self.assertEqual(result["query"]["page"]["position"], 11)
+                    self.assertEqual(len(result["items"]), 2)
+                for path, expected in [
+                    ("/api/local-pages/search?key=1-1280&position=bad", 400),
+                    ("/api/local-pages/search?key=1-1280&position=0", 400),
+                    ("/api/local-pages/search?key=1-1280&position=1&limit=31", 400),
+                    ("/api/local-pages/search?key=1-1280&position=2", 404),
+                    ("/api/local-pages/search?key=99-1280&position=1", 404),
+                ]:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        opener.open(base + path, timeout=5)
+                    self.assertEqual(raised.exception.code, expected)
                 with opener.open(base + "/api/local-pages/image?id=" + self.digest, timeout=5) as response:
                     self.assertEqual(response.headers["Content-Type"], "image/png")
                     self.assertEqual(response.headers["Cache-Control"], "private, no-store")
@@ -297,6 +409,10 @@ class LibraryBuildTest(unittest.TestCase):
         library = LocalPageLibrary(root / "library")
         library.load()
         self.assertEqual(library.rows["1-1280"]["body_vector"], [1., 0.])
+        self.assertEqual(library.indexed_pages, 2)
+        self.assertEqual(library.rows["1-1280"]["pages"][0]["embedding"], [1., 0.])
+        self.assertEqual(library.rows["1-1280"]["pages"][0]["embedding_version"], "fixture")
+        self.assertEqual(json.loads((root / "library" / "index.json").read_text())["page_embedding_dimension"], 2)
         self.assertEqual(len(library.assets), 1)
         self.assertEqual(library.image(sample["sha256"])[0], blob)
         with self.assertRaises(ValueError):

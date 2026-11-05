@@ -23,6 +23,9 @@ from typing import Any
 
 from . import db
 from .fetch_activity import FetchActivity
+from .fetch_insights import start_listing, finish_listing, known_gallery_urls, fetch_insights
+from .ranking_insights import ranking_insights
+from .preference_tools import preferences_report, preview_preference, apply_preference, PreferenceConflict
 from .recency import gallery_posted_date, recent_gallery_cutoff
 from .audit import low_interest_audit_report, record_visible_impressions
 from .exhentai import (
@@ -204,6 +207,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_status())
             elif path == "/api/health":
                 self.send_json({"service": "exh-rec", "status": "ok"})
+            elif path == "/api/insights/fetch":
+                with db.connect() as conn:
+                    self.send_json(fetch_insights(conn))
+            elif path == "/api/insights/ranking":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    with db.connect() as conn:
+                        result = ranking_insights(conn,
+                            days=query_int(query, "days", default=30, lower=1, upper=365),
+                            surface=str(query.get("surface", ["all"])[0]))
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from None
+                self.send_json(result)
+            elif path == "/api/preferences":
+                with db.connect() as conn:
+                    self.send_json(preferences_report(conn))
+            elif path == "/api/local-pages/search":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    with db.connect() as conn:
+                        result = LOCAL_PAGES.search(str(query.get("key", [""])[0]),
+                            int(query.get("position", [""])[0]), conn,
+                            limit=int(query.get("limit", ["12"])[0]))
+                except KeyError:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "Local page unavailable") from None
+                except ValueError:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid local page search") from None
+                except (OSError, TypeError):
+                    raise ApiError(HTTPStatus.NOT_FOUND, "Local page search unavailable") from None
+                self.send_json(result)
             elif path == "/api/local-pages":
                 with db.connect() as conn:
                     self.send_json(LOCAL_PAGES.catalog(conn))
@@ -368,6 +401,19 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json()
                 save_settings(payload)
                 self.send_json(get_settings())
+            elif path in {"/api/preferences/preview", "/api/preferences/apply"}:
+                payload = self.read_json(max_bytes=8192)
+                try:
+                    with db.connect() as conn:
+                        result = (apply_preference(conn, payload) if path.endswith("/apply")
+                                  else preview_preference(conn, payload))
+                except PreferenceConflict as exc:
+                    raise ApiError(HTTPStatus.CONFLICT, str(exc)) from None
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from None
+                if path.endswith("/apply"):
+                    wake_background_refresh()
+                self.send_json(result)
             elif path == "/api/integrations/hath/events":
                 require_hath_authorization(self.headers.get("Authorization"))
                 payload = self.read_json(max_bytes=1024 * 1024)
@@ -734,22 +780,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json(result)
             elif path == "/api/retrain":
-                payload = self.read_json()
-                retrain_status = run_model_retrain("manual", force=True)
-                with db.connect() as conn:
-                    self.send_json(
-                        {
-                            "ok": True,
-                            "model": model_snapshot(conn),
-                            "model_retrain": retrain_status,
-                            **recommendation_payload(
-                                conn,
-                                limit=40,
-                                include_rated=parse_bool(payload.get("include_rated")),
-                                filter_text=payload.get("filter_text"),
-                            ),
-                        }
-                    )
+                self.read_json()
+                retrain_status = request_model_retrain()
+                self.send_json({"ok": True, "queued": True, "model_retrain": retrain_status},
+                               status=HTTPStatus.ACCEPTED)
             elif path == "/api/check":
                 result = check_saved_access()
                 self.send_json(result)
@@ -1951,6 +1985,8 @@ def fetch_and_store(
                         cursor_match_target=anchor_match_target,
                         remaining_extra_pages=max(0, page_limit - page_number - 1),
                     )
+                    with db.connect() as conn:
+                        listing_id = start_listing(conn, run_id, entry, page_number)
                     try:
                         page_galleries = fetch_galleries(
                             cookie,
@@ -1976,6 +2012,8 @@ def fetch_and_store(
                         if any(gallery_posted_date(gallery.posted_at) is None for gallery in page_galleries):
                             raise RuntimeError("Gallery publication date unavailable; pagination boundary not advanced")
                     except Exception as exc:
+                        with db.connect() as conn:
+                            finish_listing(conn, listing_id, failed=True)
                         errors.append(f"query {display_query(query)}: {exc}")
                         update_fetch_progress("query page failed", stage="error", error=str(exc), errors=list(errors),
                                               query_completion_reason="request_failed")
@@ -2007,7 +2045,11 @@ def fetch_and_store(
                                          else "page_limit" if page_limit_reached else "")
                     # Commit the listing and its continuation atomically before requesting another page.
                     with db.connect() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        existing_urls = known_gallery_urls(conn, page_galleries)
                         page_stored = store_galleries(conn, page_galleries)
+                        finish_listing(conn, listing_id, page_galleries,
+                                       existing_urls=existing_urls, returned_count=fetched_batch)
                         if cursor_enabled_for(entry):
                             save_fetch_query_state(
                                 conn, entry,
@@ -4423,6 +4465,9 @@ def model_retrain_status(conn) -> dict[str, Any]:
         "feedback_threshold": threshold,
         "interval_minutes": interval,
         "pending_count": pending,
+        "manual_requested": db.get_setting(conn, "model_retrain_manual_requested", "0") == "1",
+        "claimed_count": bounded_int(db.get_setting(conn, "model_retrain_claimed_count", "0"),
+                                     default=0, lower=0, upper=1000000000),
         "pending_since": pending_since,
         "running": running,
         "trigger": MODEL_RETRAIN_STATE.get("trigger"),
@@ -4433,7 +4478,8 @@ def model_retrain_status(conn) -> dict[str, Any]:
             or db.get_setting(conn, "model_retrain_last_completed_at", "")
             or None
         ),
-        "last_error": MODEL_RETRAIN_STATE.get("last_error"),
+        "last_error": (MODEL_RETRAIN_STATE.get("last_error")
+                       or db.get_setting(conn, "model_retrain_last_error", "") or None),
     }
 
 
@@ -4446,7 +4492,43 @@ def mark_model_retrain_pending(conn, increment: bool = True) -> dict[str, Any]:
     return model_retrain_status(conn)
 
 
+def request_model_retrain() -> dict[str, Any]:
+    """Durably coalesce manual requests; the HTTP handler never trains."""
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        mark_model_retrain_pending(conn, increment=False)
+        db.set_setting(conn, "model_retrain_manual_requested", "1")
+        status = model_retrain_status(conn)
+    MODEL_RETRAIN_WAKE.set()
+    return status
+
+
+def recover_model_retrain_claim(conn) -> None:
+    """Restore an interrupted worker's claim, preserving newer pending reviews."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    claimed = bounded_int(db.get_setting(conn, "model_retrain_claimed_count", "0"),
+                          default=0, lower=0, upper=1000000000)
+    claimed_since = db.get_setting(conn, "model_retrain_claimed_since", "")
+    if claimed:
+        db.set_setting(conn, "model_retrain_pending_count", str(model_retrain_pending_count(conn) + claimed))
+        pending_since = db.get_setting(conn, "model_retrain_pending_since", "")
+        db.set_setting(conn, "model_retrain_pending_since",
+                       min(value for value in (pending_since, claimed_since, current_timestamp()) if value))
+    if db.get_setting(conn, "model_retrain_claimed_manual", "0") == "1":
+        db.set_setting(conn, "model_retrain_manual_requested", "1")
+    clear_model_retrain_claim(conn)
+
+
+def clear_model_retrain_claim(conn) -> None:
+    db.set_setting(conn, "model_retrain_claimed_count", "0")
+    db.set_setting(conn, "model_retrain_claimed_since", "")
+    db.set_setting(conn, "model_retrain_claimed_manual", "0")
+
+
 def model_retrain_due(conn) -> tuple[bool, str | None, float]:
+    if db.get_setting(conn, "model_retrain_manual_requested", "0") == "1":
+        return True, "manual", 0.0
     pending = model_retrain_pending_count(conn)
     if not pending:
         return False, None, 3600.0
@@ -4470,10 +4552,16 @@ def run_model_retrain(trigger: str, force: bool = False) -> dict[str, Any]:
     claimed_since = ""
     try:
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             claimed_count = model_retrain_pending_count(conn)
             claimed_since = db.get_setting(conn, "model_retrain_pending_since", "")
-            if not force and claimed_count <= 0:
+            manual = db.get_setting(conn, "model_retrain_manual_requested", "0") == "1"
+            if not force and not manual and claimed_count <= 0:
                 return model_retrain_status(conn)
+            db.set_setting(conn, "model_retrain_claimed_count", str(claimed_count))
+            db.set_setting(conn, "model_retrain_claimed_since", claimed_since)
+            db.set_setting(conn, "model_retrain_claimed_manual", "1" if manual or force else "0")
+            db.set_setting(conn, "model_retrain_manual_requested", "0")
             db.set_setting(conn, "model_retrain_pending_count", "0")
             db.set_setting(conn, "model_retrain_pending_since", "")
         started_at = current_timestamp()
@@ -4489,6 +4577,8 @@ def run_model_retrain(trigger: str, force: bool = False) -> dict[str, Any]:
             retrain_model(conn, release_write_lock=True)
             completed_at = current_timestamp()
             db.set_setting(conn, "model_retrain_last_completed_at", completed_at)
+            db.set_setting(conn, "model_retrain_last_error", "")
+            clear_model_retrain_claim(conn)
         MODEL_RETRAIN_STATE.update(
             {
                 "running": False,
@@ -4499,14 +4589,12 @@ def run_model_retrain(trigger: str, force: bool = False) -> dict[str, Any]:
         )
         with db.connect() as conn:
             return model_retrain_status(conn)
-    except Exception as exc:
-        if claimed_count:
-            with db.connect() as conn:
-                pending = model_retrain_pending_count(conn)
-                db.set_setting(conn, "model_retrain_pending_count", str(pending + claimed_count))
-                if not db.get_setting(conn, "model_retrain_pending_since", ""):
-                    db.set_setting(conn, "model_retrain_pending_since", claimed_since or current_timestamp())
-        MODEL_RETRAIN_STATE.update({"running": False, "trigger": None, "last_error": str(exc)})
+    except Exception:
+        with db.connect() as conn:
+            recover_model_retrain_claim(conn)
+            db.set_setting(conn, "model_retrain_last_error", "Training failed; pending work retained. Retry available.")
+        MODEL_RETRAIN_STATE.update({"running": False, "trigger": None,
+                                   "last_error": "Training failed; pending work retained. Retry available."})
         raise
     finally:
         MODEL_RETRAIN_RUN_LOCK.release()
@@ -4604,10 +4692,14 @@ def main() -> None:
         configure_request_rate_limit_from_conn(conn)
         finish_interrupted_fetch_runs(conn)
         clear_shared_thumbnail_metadata(conn)
+        recover_model_retrain_claim(conn)
         retrain_model(conn, release_write_lock=True)
         completed_at = current_timestamp()
         db.set_setting(conn, "model_retrain_pending_count", "0")
         db.set_setting(conn, "model_retrain_pending_since", "")
+        db.set_setting(conn, "model_retrain_manual_requested", "0")
+        db.set_setting(conn, "model_retrain_last_error", "")
+        clear_model_retrain_claim(conn)
         db.set_setting(conn, "model_retrain_last_completed_at", completed_at)
         MODEL_RETRAIN_STATE.update({"last_completed_at": completed_at, "last_error": None})
     server = ThreadingHTTPServer((HOST, PORT), Handler)

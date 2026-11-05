@@ -2120,3 +2120,9 @@ dd {
     margin-bottom: 8px;
   }
 }
+/* Secondary tools open separately so an active Review and its undo stay intact. */
+.insights-menu { position: relative; align-self: center; }
+.insights-menu summary { cursor: pointer; padding: 0.6rem; }
+.insights-menu nav { position: absolute; right: 0; z-index: 20; min-width: 13rem;
+  padding: 0.5rem; background: #17212b; border: 1px solid #536474; border-radius: 0.5rem; }
+.insights-menu nav a { display: block; color: #e3eef7; padding: 0.65rem; }

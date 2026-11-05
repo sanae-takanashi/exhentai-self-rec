@@ -1,0 +1,17 @@
+# Fetch discovery and yield
+
+Open `/static/fetch-insights.html`. The standalone page reads `GET /api/insights/fetch` and offers filtering, sorting, refresh, and measurement definitions. It does not submit feedback, change budgets, retrain models, or create exposure records.
+
+`fetch_listing_observations` starts with each single-page listing call. Completed observations record the raw returned count, unique admitted galleries, and pre-store new/existing membership. Failed and interrupted observations remain separate. Counts describe listing operations, **not HTTP requests**: retries, metadata, and image requests are excluded. A repeated finish is a no-op; repeated starts with the same run/query/page identity return the same observation. Page numbers must uniquely identify actual operations within a query/run.
+
+`gallery_query_provenance` retains the first observation for every query/gallery pair, including whether the gallery was new. Later queries do not overwrite earlier provenance. Query identity preserves case and syntax, with outer whitespace stripped; unfiltered recent listings have a distinct identity. Different source categories using the same query share its statistics.
+
+Outcomes use the latest remaining feedback only when its ID is newer than the feedback watermark at first query observation. Undo therefore restores the prior outcome or unknown. Positive and negative votes form the explicit-rating denominator. Neutral, duplicate-update, and unknown are distinct. An unknown outcome means no qualifying subsequent feedback, not dislike. Actual visible receipts newer than the observation watermark provide a separate visibility denominator; serving a result alone is not visibility. Existing feedback and older impressions are not credited as new outcomes.
+
+New-positive yield divides first-discovered galleries with a current subsequent positive outcome by completed listing operations. Existing occurrence rate uses admitted occurrences. Visible-positive counts are the intersection of post-observation visible galleries and current subsequent positive feedback; the visibility receipt need not precede the rating. Shared galleries can contribute to more than one query, so query totals are not additive and attribution is observational, not causal. Small samples and selection effects prevent treating these ratios as causal quality scores.
+
+The old `galleries.source_query` column is a possibly overwritten single-query hint. Galleries without recorded provenance contribute only to a separate inferred historical coverage count. No past operation cost, exposure, or feedback yield is fabricated. No migration reads network data or backfills provenance.
+
+The caller starts and commits an observation before network I/O. On success, it obtains `known_gallery_urls` before storing the page, then stores galleries and calls `finish_listing` within the same transaction. On request/validation exceptions it marks the observation failed; process interruption or failed storage may leave it started. The dashboard uses one consistent read transaction and performs no data writes.
+
+Synthetic verification: `.venv-rocm/Scripts/python.exe -B -m unittest discover -s tests -p test_fetch_insights.py`. Fixtures cover shared/repeated discovery, current labels and undo, neutral/duplicate/unknown separation, genuine visibility, empty/failure/interrupted pages, idempotence, historic inference, large pages, invalid inputs, and SQLite query-only reads.

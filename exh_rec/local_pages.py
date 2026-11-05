@@ -18,6 +18,8 @@ ASSET = re.compile(r"[0-9a-f]{64}\Z")
 MIMES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif", "avif": "image/avif"}
 MAX_IMAGE = 8 * 1024 * 1024
 MAX_INDEX = 8 * 1024 * 1024
+PAGE_SEARCH_SCHEMA = "local-page-embeddings-v1"
+MAX_SEARCH_RESULTS = 30
 
 
 def read_regular(path: Path, limit: int) -> bytes:
@@ -66,6 +68,8 @@ class LocalPageLibrary:
         self.signature = None
         self.lock = threading.RLock()
         self.collected_at = None
+        self.encoder = None
+        self.indexed_pages = 0
 
     def load(self):
         with self.lock:
@@ -78,6 +82,14 @@ class LocalPageLibrary:
             if not isinstance(document, dict) or document.get("schema") != SCHEMA or not isinstance(document.get("galleries"), list):
                 raise ValueError("invalid_local_index")
             rows, assets, dimensions = {}, {}, set()
+            encoder = document.get("encoder")
+            page_schema = document.get("page_embedding_schema")
+            if page_schema is not None and page_schema != PAGE_SEARCH_SCHEMA:
+                raise ValueError("invalid_local_page_embedding_schema")
+            page_dimension = document.get("page_embedding_dimension")
+            if page_schema is not None and (type(page_dimension) is not int or not 1 <= page_dimension <= 4096):
+                raise ValueError("invalid_local_page_embedding_dimension")
+            indexed_pages = 0
             if not 0 < len(document["galleries"]) <= 100:
                 raise ValueError("invalid_local_gallery_count")
             for row in document["galleries"]:
@@ -104,6 +116,17 @@ class LocalPageLibrary:
                     raise ValueError("invalid_local_position")
                 if len({image["position"] for image in row["pages"]}) != len(row["pages"]):
                     raise ValueError("duplicate_local_position")
+                for image in row["pages"]:
+                    if image.get("embedding") is not None:
+                        if (page_schema != PAGE_SEARCH_SCHEMA or not isinstance(encoder, str)
+                                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}", encoder)
+                                or image.get("embedding_version") != encoder):
+                            raise ValueError("incompatible_local_page_encoder")
+                        image["embedding"] = normalized(image["embedding"])
+                        if len(image["embedding"]) != page_dimension:
+                            raise ValueError("incompatible_local_page_dimension")
+                        dimensions.add(len(image["embedding"]))
+                        indexed_pages += 1
                 for field in ("cover_vector", "body_vector"):
                     if row.get(field) is not None:
                         row[field] = normalized(row[field])
@@ -115,6 +138,7 @@ class LocalPageLibrary:
                 raise ValueError("incompatible_local_vectors")
             self.rows, self.assets = rows, assets
             self.collected_at = str(document.get("collected_at") or "")
+            self.encoder, self.indexed_pages = encoder, indexed_pages
             self.signature = signature
 
     def image(self, digest):
@@ -133,13 +157,18 @@ class LocalPageLibrary:
             try:
                 self.load()
             except FileNotFoundError:
-                return {"available": False, "reason": "not_configured", "items": []}
+                return {"available": False, "reason": "not_configured", "items": [],
+                        "page_search": {"available": False, "reason": "not_configured", "indexed_pages": 0}}
             except (OSError, ValueError, KeyError, TypeError):
-                return {"available": False, "reason": "invalid_library", "items": []}
+                return {"available": False, "reason": "invalid_library", "items": [],
+                        "page_search": {"available": False, "reason": "invalid_library", "indexed_pages": 0}}
             metadata = self.metadata(conn)
             return {"available": True, "collected_at": self.collected_at,
                     "items": [self.public(row, metadata) for row in self.rows.values()],
-                    "comparable_count": len(self.paired())}
+                    "comparable_count": len(self.paired()),
+                    "page_search": {"available": bool(self.indexed_pages),
+                                    "reason": None if self.indexed_pages else "rebuild_required",
+                                    "indexed_pages": self.indexed_pages}}
 
     def metadata(self, conn):
         gids = sorted({row["gid"] for row in self.rows.values()})
@@ -159,7 +188,8 @@ class LocalPageLibrary:
                 "url": known["url"] if known and re.fullmatch(r"https://(?:exhentai|e-hentai)\.org/g/[0-9]+/[0-9a-f]+/", known["url"]) else None,
                 "metadata_status": "matched" if known else "ambiguous" if matches else "missing",
                 "ordering": row["ordering"], "image_count": row["image_count"],
-                "pages": [{**image(item), "position": item["position"]} for item in row["pages"]],
+                "pages": [{**image(item), "position": item["position"],
+                           "searchable": item.get("embedding") is not None} for item in row["pages"]],
                 "cover": image(row["cover"]) if row.get("cover") else None,
                 "comparable": row.get("cover_vector") is not None and row.get("body_vector") is not None}
 
@@ -188,4 +218,57 @@ class LocalPageLibrary:
                 score = lambda candidate: sum(a * b for a, b in zip(row[field], candidate[field]))
                 ranked = sorted(candidates, key=lambda candidate: (-score(candidate), candidate["key"]))[:3]
                 result[source] = [{**self.public(candidate, metadata), "cosine": round(max(-1., min(1., score(candidate))), 6)} for candidate in ranked]
+            return result
+
+    def search(self, key, position, conn, limit=12):
+        """Find individual sampled pages; never fetch, encode or alter preference state."""
+        if (type(position) is not int or position < 1 or type(limit) is not int
+                or not 1 <= limit <= MAX_SEARCH_RESULTS):
+            raise ValueError("invalid_local_page_search_parameter")
+        if not isinstance(key, str) or not KEY.fullmatch(key):
+            raise KeyError("unknown_local_gallery")
+        with self.lock:
+            self.load()
+            row = self.rows[key]
+            page = next((item for item in row["pages"] if item["position"] == position), None)
+            if page is None:
+                raise KeyError("unknown_local_page")
+            metadata = self.metadata(conn)
+            public = self.public(row, metadata)
+            selected = next(item for item in public["pages"] if item["position"] == position)
+            result = {"available": False, "reason": "rebuild_required" if not self.indexed_pages else "page_not_indexed",
+                      "query": {"item": public, "page": selected}, "items": [], "candidate_count": 0,
+                      "indexed_pages": self.indexed_pages, "scope": "indexed-local-samples",
+                      "score_kind": "cosine-similarity", "collected_at": self.collected_at}
+            if page.get("embedding") is None:
+                return result
+            # Verify source content before presenting scores derived from its stored embedding.
+            self.image(page["sha256"])
+            candidates = []
+            for candidate in self.rows.values():
+                if candidate["gid"] == row["gid"]:
+                    continue
+                for matched in candidate["pages"]:
+                    if matched.get("embedding") is None or matched["sha256"] == page["sha256"]:
+                        continue
+                    # Load rejects mixed dimensions/encoders; do not silently zip unequal vectors.
+                    if (matched.get("embedding_version") != page["embedding_version"]
+                            or len(matched["embedding"]) != len(page["embedding"])):
+                        raise ValueError("incompatible_local_page_vectors")
+                    cosine = sum(left * right for left, right in zip(page["embedding"], matched["embedding"]))
+                    candidates.append((cosine, candidate, matched))
+            candidates.sort(key=lambda item: (-item[0], item[1]["key"], item[2]["position"]))
+            unique, seen = [], set()
+            for cosine, candidate, matched in candidates:
+                if matched["sha256"] in seen:
+                    continue
+                seen.add(matched["sha256"])
+                unique.append((cosine, candidate, matched))
+            for cosine, candidate, matched in unique[:limit]:
+                self.image(matched["sha256"])
+                public_candidate = self.public(candidate, metadata)
+                public_page = next(item for item in public_candidate["pages"] if item["position"] == matched["position"])
+                result["items"].append({"item": public_candidate, "page": public_page,
+                                        "cosine": round(max(-1., min(1., cosine)), 6)})
+            result.update(available=True, reason=None, candidate_count=len(unique))
             return result

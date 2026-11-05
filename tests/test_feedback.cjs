@@ -108,6 +108,47 @@ const loaders = [
   ["favorite", 'loadMarkedGalleries("favorite")'],
   ["classifier", "loadClassificationSamples()"],
 ];
+
+for (const view of ["review", "low-interest"]) {
+  test(`${view}: a completed job remains discoverable while a following job runs or fails`, () => {
+    const f = fixture(view);
+    f.run('observeTrainingCompletion({last_completed_at: "2026-11-01 00:00:00"});');
+    f.run('observeTrainingCompletion({last_completed_at: "2026-11-05 00:00:00", running: true});');
+    assert.equal(f.run('reviewUpdatesAvailable'), false);
+    f.run('observeTrainingCompletion({last_completed_at: "2026-11-05 00:00:00", running: false, last_error: "fixture"});');
+    assert.equal(f.run('reviewUpdatesAvailable'), true);
+  });
+  test(`${view}: queued manual training preserves loaded cards, selection and undo`, async () => {
+    const f = fixture(view);
+    f.run('reviewUndo = {feedbackId: 42}; reviewCurrentUrl = fixtureItems[1].url;');
+    const before = f.urls();
+    const training = f.run('retrain()');
+    assert.equal(f.requests[0].url, "/api/retrain");
+    f.respond(0, {ok: true, queued: true, model_retrain: {pending_count: 1}});
+    await training;
+    assert.equal(f.requests.length, 1);
+    assert.deepEqual(f.urls(), before);
+    assert.equal(f.run('reviewUndo.feedbackId'), 42);
+    assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+  });
+  test(`${view}: training completion and background fetch preserve Grid until explicit refresh`, async () => {
+    const f = fixture(view);
+    f.run('reviewLayout = "grid"; reviewUndo = {feedbackId: 42};');
+    f.run('observeTrainingCompletion({last_completed_at: "2026-11-01 00:00:00"});');
+    assert.equal(f.run('reviewUpdatesAvailable'), false);
+    f.run('observeTrainingCompletion({last_completed_at: "2026-11-05 00:00:00"});');
+    assert.equal(f.run('reviewUpdatesAvailable'), true);
+    await f.run('reloadRecommendationsAfterFetch({fetch: {running: false}, last_fetch: {id: 55}})');
+    assert.equal(f.requests.length, 0);
+    assert.equal(f.run('reviewUndo.feedbackId'), 42);
+    assert.deepEqual(f.urls(), items.map(item => item.url));
+    const refresh = f.run('loadRecommendations()');
+    f.respond(0, {items: [], total: 0, has_more: false, next_offset: 0});
+    await refresh;
+    assert.equal(f.run('reviewUpdatesAvailable'), false);
+    assert.equal(f.run('reviewUndo'), null);
+  });
+}
 function page(pageItems = items) {
   return { items: pageItems, total: pageItems.length, next_offset: pageItems.length, has_more: false };
 }

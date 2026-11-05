@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地单页相似搜索</title>
+  <link rel="stylesheet" href="/static/page-search.css">
+  <script src="/static/page-search.js" defer></script>
+</head>
+<body>
+<main>
+  <a href="/">← 返回图库</a>
+  <h1>本地单页相似搜索</h1>
+  <p>选择一张已收录的本地样本页，查找其他画廊中相似的实际页面。</p>
+  <p class="notice">搜索范围仅限已有向量的本地抽样页，通常每本只有少量页面。余弦相似度不是喜欢概率，也不能推算整本相关页占比。同一本的其他分辨率及重复图片会排除。</p>
+  <p id="catalog-status" role="status">正在读取本地目录…</p>
+  <form id="search-form">
+    <label for="gallery">画廊</label>
+    <select id="gallery" disabled></select>
+    <label for="page">查询页</label>
+    <select id="page" disabled></select>
+    <button id="search" disabled>搜索相似页</button>
+    <button id="reload" type="button">重新读取目录</button>
+  </form>
+  <section aria-labelledby="query-heading"><h2 id="query-heading">查询页</h2><div id="query"></div></section>
+  <p id="search-status" role="status" aria-live="polite"></p>
+  <section aria-labelledby="results-heading"><h2 id="results-heading">相似页</h2><div id="results" class="grid"></div></section>
+</main>
+</body>
+</html>

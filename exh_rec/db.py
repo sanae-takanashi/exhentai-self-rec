@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from .fetch_insights import SCHEMA as FETCH_INSIGHTS_SCHEMA
+
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("EXH_REC_DATA_DIR", APP_DIR / "data"))
@@ -358,6 +360,8 @@ BEGIN
 END;
 """
 
+
+SCHEMA += FETCH_INSIGHTS_SCHEMA
 
 CACHE_TABLES = (
     "galleries", "feedback", "gallery_marks", "bootstrap_tags", "feature_weights",

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from exh_rec.local_pages import LocalPageLibrary, SCHEMA, mean_vector, normalized
+from exh_rec.local_pages import LocalPageLibrary, PAGE_SEARCH_SCHEMA, SCHEMA, mean_vector, normalized
 from scripts.compare_hath_pages import verified_blob, verify_experiment
 from scripts.probe_hath_pages import write_json_new
 
@@ -24,7 +24,7 @@ def build(experiment, output):
         raise ValueError("output_already_exists")
     dataset = experiment / "dataset-batched"
     report_path = experiment / "comparison.json"
-    verify_experiment(dataset, report_path)
+    verification = verify_experiment(dataset, report_path)
     report_bytes = report_path.read_bytes()
     report = json.loads(report_bytes)
     manifest_bytes = (dataset / "manifest.json").read_bytes()
@@ -49,12 +49,16 @@ def build(experiment, output):
         body = [normalized(item["embedding"]) for item in row["pages"] if item["position"] != 1]
         rows.append({"key": f"{row['gid']}-{row['resolution']}", "gid": row["gid"], "resolution": row["resolution"],
                      "ordering": source["ordering"], "image_count": source["image_count"],
-                     "pages": [{**image(item), "position": item["position"]} for item in row["pages"]],
+                     "pages": [{**image(item), "position": item["position"],
+                                "embedding": normalized(item["embedding"]),
+                                "embedding_version": report["encoder"]} for item in row["pages"]],
                      "cover": image(covers[0]) if len(covers) == 1 else None,
                      "cover_vector": normalized(covers[0]["embedding"]) if len(covers) == 1 else None,
                      "body_vector": mean_vector(body)})
     # Keep filenames and metadata independent of remote paths and site credentials.
-    document = {"schema": SCHEMA, "encoder": report["encoder"], "collected_at": manifest["collected_at"],
+    document = {"schema": SCHEMA, "page_embedding_schema": PAGE_SEARCH_SCHEMA,
+                "page_embedding_dimension": verification["embedding_dimensions"],
+                "encoder": report["encoder"], "collected_at": manifest["collected_at"],
                 "source_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                 "source_comparison_sha256": hashlib.sha256(report_bytes).hexdigest(), "galleries": rows}
     output.mkdir(parents=True, exist_ok=False)
@@ -72,7 +76,8 @@ def build(experiment, output):
     for digest in library.assets:
         library.image(digest)
     return {"ok": True, "galleries": len(rows), "comparable_galleries": len(library.paired()),
-            "assets": len(assets), "metadata_status": dict(Counter(row["metadata_status"] for row in report["galleries"]))}
+            "assets": len(assets), "indexed_pages": library.indexed_pages,
+            "metadata_status": dict(Counter(row["metadata_status"] for row in report["galleries"]))}
 
 
 def main():

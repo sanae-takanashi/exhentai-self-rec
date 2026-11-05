@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preferences | ExHentai Recommender</title>
+  <link rel="stylesheet" href="/static/preferences.css?v=20261105">
+  <script src="/static/preferences.js?v=20261105" defer></script>
+</head>
+<body>
+  <header>
+    <div><a href="/">ExHentai Recommender</a><h1>Preferences</h1></div>
+    <nav aria-label="Local pages"><a href="/">Review</a><a href="/static/ranking-insights.html">Ranking insights</a><a href="/static/fetch-insights.html">Fetch insights</a><a href="/static/preferences.html" aria-current="page">Preferences</a></nav>
+  </header>
+  <main>
+    <p id="preferencesStatus" role="status" aria-live="polite">Loading preferences...</p>
+    <section aria-labelledby="explicitHeading">
+      <h2 id="explicitHeading">Explicit preferences</h2>
+      <div class="table-scroll"><table><thead><tr><th>Preference</th><th>Weight</th><th>State</th></tr></thead><tbody id="explicitPreferences"></tbody></table></div>
+    </section>
+    <section aria-labelledby="editHeading">
+      <h2 id="editHeading">Edit one preference</h2>
+      <form id="preferenceForm">
+        <label>Preference<select id="preferenceSelect"><option value="">Add preference</option></select></label>
+        <label>Name<input id="preferenceTag" type="text" maxlength="300" required autocomplete="off" spellcheck="false"></label>
+        <label>Action<select id="preferenceAction"><option value="set">Set weight</option><option value="remove">Remove preference</option></select></label>
+        <label>Weight<input id="preferenceWeight" type="number" min="-10" max="10" step="any" value="1" required></label>
+        <div class="actions"><button id="previewPreferenceBtn" type="submit">Preview change</button><button id="applyPreferenceBtn" type="button" disabled>Apply previewed change</button><button id="restorePreferenceBtn" type="button" disabled>Restore previous weight</button></div>
+      </form>
+      <div id="preferencePreview" aria-live="polite"></div>
+      <p class="note">Weight 0 pauses only this explicit preference. Learned features remain active. Positive preferences can affect future fetch queries and the positive-match Review filter. Final ranking and Review membership can change for other reasons.</p>
+    </section>
+    <section aria-labelledby="learnedHeading">
+      <h2 id="learnedHeading">Learned evidence</h2>
+      <p class="note">Up to 40 features with the largest absolute weights. Counts describe training evidence, not causal explanations or match probabilities. These features are read only here.</p>
+      <div class="table-scroll" tabindex="0" aria-label="Learned evidence; scroll horizontally on small screens"><table class="learned-table"><thead><tr><th>Feature</th><th>Weight</th><th>Positive count</th><th>Negative count</th></tr></thead><tbody id="learnedFeatures"></tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>

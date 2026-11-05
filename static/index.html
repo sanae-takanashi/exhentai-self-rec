@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ExHentai Recommender</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20261031-local-pages">
+    <link rel="stylesheet" href="/static/styles.css?v=20261105-insights">
   </head>
   <body>
     <header class="topbar">
@@ -18,6 +18,15 @@
         <button id="refreshThumbsBtn" type="button">Refresh Thumbs</button>
         <button id="retrainBtn" type="button">Retrain</button>
         <button id="modelBtn" type="button">Model</button>
+        <details class="insights-menu">
+          <summary>Insights &amp; Preferences</summary>
+          <nav aria-label="Insights and preferences">
+            <a href="/static/fetch-insights.html" target="_blank" rel="noopener">Fetch yield</a>
+            <a href="/static/ranking-insights.html" target="_blank" rel="noopener">Ranking results</a>
+            <a href="/static/page-search.html" target="_blank" rel="noopener">Find similar pages</a>
+            <a href="/static/preferences.html" target="_blank" rel="noopener">Preference evidence</a>
+          </nav>
+        </details>
       </div>
     </header>
 
@@ -263,6 +272,10 @@
             <strong id="lowInterestPolicyTitle">Low Interest</strong>
             <span id="lowInterestPolicyDetail"></span>
           </section>
+          <div id="reviewUpdatesNotice" class="hint hidden" role="status">
+            New results are ready. Your loaded queue is preserved.
+            <button id="reviewApplyUpdatesBtn" type="button">Refresh queue</button>
+          </div>
           <div class="toolbar">
             <button id="localPagesBtn" class="icon-button" type="button" aria-label="Local Pages" title="Local Pages"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m22 13-1.296-1.296a2.4 2.4 0 0 0-3.408 0L12 17"/><path d="M4 8H3a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-1"/><rect width="14" height="14" x="8" y="2" rx="1"/><circle cx="14" cy="8" r="2"/></svg></button>
             <input id="query" type="search" placeholder="Optional one-off search query">
@@ -471,6 +484,6 @@
     </dialog>
 
     <script src="/static/visibility.js?v=20260909-1"></script>
-    <script src="/static/app.js?v=20261105-fetch-telemetry"></script>
+    <script src="/static/app.js?v=20261105-insights"></script>
   </body>
 </html>
