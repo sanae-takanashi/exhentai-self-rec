@@ -199,7 +199,7 @@ async function pageSearchScenario(viewport) {
     assert.equal(await page.locator("#page option").count(), 3);
     await page.locator("#page").selectOption("30");
     assert(await page.locator("#search").isDisabled());
-    assert((await page.locator("#search-status").innerText()).includes("没有向量"));
+    assert((await page.locator("#search-status").innerText()).includes("no indexed vector"));
     await page.locator("#gallery").selectOption("gallery-b");
     assert.equal(await page.locator("#page option").count(), 2);
     assert.equal(await page.locator("#query img").getAttribute("src"), image("gallery-b", 4));
@@ -212,8 +212,8 @@ async function pageSearchScenario(viewport) {
     await page.locator("#results .card").waitFor();
     assert.equal(await page.locator("#query img").getAttribute("src"), image("gallery-a", 8));
     assert.equal(await page.locator("#results img").getAttribute("src"), image("gallery-b", 22));
-    assert((await page.locator("#results").innerText()).includes("第 22 / 90 页"));
-    assert((await page.locator("#results").innerText()).includes("0.8321（不是概率）"));
+    assert((await page.locator("#results").innerText()).includes("Page 22 / 90"));
+    assert((await page.locator("#results").innerText()).includes("0.8321 (not a probability)"));
     assert.equal(await page.locator("#query h3").innerText(), hostile);
     assert.equal(await page.locator("#query img").count(), 1);
     await page.waitForFunction(() => [...document.querySelectorAll(".card img")].every((n) => n.naturalWidth > 0));
@@ -221,7 +221,7 @@ async function pageSearchScenario(viewport) {
     await page.locator("#page").selectOption("1");
     assert.equal(await page.locator("#results .card").count(), 0, "edited query invalidates results");
     available = false; await page.locator("#reload").click();
-    await page.waitForFunction(() => document.querySelector("#catalog-status").textContent.includes("没有单页向量"));
+    await page.waitForFunction(() => document.querySelector("#catalog-status").textContent.includes("no page vectors"));
     assert(await page.locator("#search").isDisabled());
     assert.equal(await page.locator("#query .card").count(), 1, "legacy catalog stays previewable");
     await test.check();

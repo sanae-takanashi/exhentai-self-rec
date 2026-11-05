@@ -1,30 +1,30 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>本地单页相似搜索</title>
+  <title>Local page similarity search</title>
   <link rel="stylesheet" href="/static/page-search.css">
   <script src="/static/page-search.js" defer></script>
 </head>
 <body>
 <main>
-  <a href="/">← 返回图库</a>
-  <h1>本地单页相似搜索</h1>
-  <p>选择一张已收录的本地样本页，查找其他画廊中相似的实际页面。</p>
-  <p class="notice">搜索范围仅限已有向量的本地抽样页，通常每本只有少量页面。余弦相似度不是喜欢概率，也不能推算整本相关页占比。同一本的其他分辨率及重复图片会排除。</p>
-  <p id="catalog-status" role="status">正在读取本地目录…</p>
+  <a href="/">← Recommender</a>
+  <h1>Local page similarity search</h1>
+  <p>Select a local sample page to find similar pages in other galleries.</p>
+  <p class="notice">Search covers only local sample pages with indexed vectors, usually a small number per gallery. Cosine similarity is not a probability that you will like a page, and cannot estimate the share of relevant pages in a full gallery. Other resolutions of the same gallery and duplicate images are excluded.</p>
+  <p id="catalog-status" role="status">Loading local catalog…</p>
   <form id="search-form">
-    <label for="gallery">画廊</label>
+    <label for="gallery">Gallery</label>
     <select id="gallery" disabled></select>
-    <label for="page">查询页</label>
+    <label for="page">Query page</label>
     <select id="page" disabled></select>
-    <button id="search" disabled>搜索相似页</button>
-    <button id="reload" type="button">重新读取目录</button>
+    <button id="search" disabled>Find similar pages</button>
+    <button id="reload" type="button">Reload catalog</button>
   </form>
-  <section aria-labelledby="query-heading"><h2 id="query-heading">查询页</h2><div id="query"></div></section>
+  <section aria-labelledby="query-heading"><h2 id="query-heading">Query page</h2><div id="query"></div></section>
   <p id="search-status" role="status" aria-live="polite"></p>
-  <section aria-labelledby="results-heading"><h2 id="results-heading">相似页</h2><div id="results" class="grid"></div></section>
+  <section aria-labelledby="results-heading"><h2 id="results-heading">Similar pages</h2><div id="results" class="grid"></div></section>
 </main>
 </body>
 </html>
