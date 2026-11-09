@@ -1,9 +1,11 @@
 """Native operational views. No gallery controls or application business settings."""
 from datetime import datetime, timezone
 
-from scripts.launcher_core import ROOT
+from scripts.launcher_core import config_digest
+from scripts.launcher_checkup import CHECKS, service_key
 from scripts.launcher_fetch import duration
 from scripts.launcher_ops import local_time
+from scripts.launcher_runtime import compare_source
 
 
 def size_text(value):
@@ -18,7 +20,7 @@ class OperationsView:
     def __init__(self, app):
         self.app = app
         tk, ttk, notebook = app.tk, app.ttk, app.notebook
-        self.overview = ttk.Frame(notebook, padding=16)
+        self.overview = ttk.Frame(notebook, padding=12)
         self.connections = ttk.Frame(notebook, padding=12)
         self.environment = ttk.Frame(notebook, padding=12)
         self.storage = ttk.Frame(notebook, padding=16)
@@ -27,19 +29,53 @@ class OperationsView:
             notebook.add(frame, text=name)
             frame.columnconfigure(0, weight=1)
 
-        ttk.Label(self.overview, text="Service overview", style="Status.TLabel").grid(row=0, sticky="w", pady=(0, 12))
+        overview_bar = ttk.Frame(self.overview)
+        overview_bar.grid(row=0, sticky="ew", pady=(0, 5))
+        overview_bar.columnconfigure(0, weight=1)
+        ttk.Label(overview_bar, text="Service overview", style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        self.checkup_button = ttk.Button(overview_bar, text="Run Checkup", command=app.checkup)
+        self.checkup_button.grid(row=0, column=1, sticky="e")
         self.overview_values = {}
         for row, (key, label) in enumerate((("health", "Readiness"), ("owner", "Ownership"), ("uptime", "Supervisor uptime"),
                                            ("checked", "Last status check"), ("profile", "Saved / running profile"),
+                                           ("version", "Local / service source"),
                                            ("edits", "Form changes"), ("activity", "Background activity"),
                                            ("failure", "Latest retained error")), start=1):
             section = ttk.Frame(self.overview)
-            section.grid(row=row, sticky="ew", pady=7)
+            section.grid(row=row, sticky="ew", pady=2)
             section.columnconfigure(1, weight=1)
             ttk.Label(section, text=label, width=24, style="Muted.TLabel").grid(row=0, column=0, sticky="nw")
             value = tk.StringVar(value="Unknown")
             ttk.Label(section, textvariable=value, wraplength=460).grid(row=0, column=1, sticky="ew")
             self.overview_values[key] = value
+
+        self.checkup_report = None
+        self.checkup_running = False
+        self.checkup_rows = {}
+        self.checkup_summary = tk.StringVar(value="Checkup: not run")
+        ttk.Label(self.overview, textvariable=self.checkup_summary, wraplength=680, style="Muted.TLabel").grid(
+            row=10, sticky="ew", pady=(8, 5))
+        table_frame = ttk.Frame(self.overview)
+        table_frame.grid(row=11, sticky="nsew")
+        self.overview.rowconfigure(11, weight=1, minsize=80)
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.checkup_table = ttk.Treeview(table_frame, columns=("component", "outcome", "summary"), show="headings", height=3)
+        for key, title, width, stretch in (("component", "Check", 145, False), ("outcome", "Result", 75, False),
+                                           ("summary", "Observation", 405, True)):
+            self.checkup_table.heading(key, text=title)
+            self.checkup_table.column(key, width=width, minwidth=70, stretch=stretch)
+        self.checkup_table.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.checkup_table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.checkup_table.configure(yscrollcommand=scroll.set)
+        self.checkup_table.tag_configure("fail", foreground="#b42332")
+        self.checkup_table.tag_configure("warn", foreground="#8a5715")
+        self.checkup_table.tag_configure("unknown", foreground="#59636b")
+        self.checkup_detail = tk.StringVar(value="")
+        ttk.Label(self.overview, textvariable=self.checkup_detail, wraplength=660, justify="left").grid(
+            row=12, sticky="ew", pady=(7, 0))
+        self.checkup_table.bind("<<TreeviewSelect>>", lambda _: self.select_checkup())
 
         ttk.Label(self.connections, text="Connection diagnostics", style="Status.TLabel").grid(row=0, sticky="w")
         self.connection_scope = tk.StringVar(value="Saved profile; live tunnel state is not assumed.")
@@ -72,7 +108,7 @@ class OperationsView:
         env_bar.columnconfigure(1, weight=1)
         self.environment_button = ttk.Button(env_bar, text="Check Environment", command=app.check_environment)
         self.environment_button.grid(row=0, column=0, sticky="w")
-        self.revision = tk.StringVar(value="Local revision: " + self.local_revision())
+        self.revision = tk.StringVar(value="Local revision: checking")
         ttk.Label(env_bar, textvariable=self.revision, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
         self.environment_result = tk.StringVar(value="Selected Python: not checked. Runtime accelerator: unknown.")
         ttk.Label(self.environment, textvariable=self.environment_result, wraplength=680, justify="left").grid(
@@ -107,20 +143,6 @@ class OperationsView:
         self.maintenance_result = tk.StringVar(value="")
         ttk.Label(self.storage, textvariable=self.maintenance_result, wraplength=680).grid(row=7, sticky="ew")
 
-    @staticmethod
-    def local_revision():
-        try:
-            head = (ROOT / ".git/HEAD").read_text(encoding="ascii").strip()
-            if head.startswith("ref: refs/heads/"):
-                ref = head[5:]
-                candidate = (ROOT / ".git" / ref).read_text(encoding="ascii").strip()
-            else:
-                candidate = head
-            import re
-            return candidate[:12] if re.fullmatch(r"[0-9a-f]{40,64}", candidate) else "unknown"
-        except (OSError, UnicodeError):
-            return "unknown"
-
     def render(self, status, config, *, dirty=False):
         state = status.get("state", "checking")
         managed = status.get("managed", False)
@@ -144,6 +166,24 @@ class OperationsView:
         profile = ("Matching launch profile" if match is True else "Changed since launch; restart required" if match is False
                    else "Unknown (older supervisor)" if managed else "Unknown (external service)" if state == "external" else "Saved profile; service is offline")
         values["profile"].set(profile)
+        local, runtime = status.get("local_source", {}), status.get("runtime_identity", {})
+        local_revision = (local.get("revision") or "unknown")[:12]
+        self.revision.set("Local revision: " + local_revision)
+        availability = runtime.get("availability")
+        service_revision = (runtime.get("revision") or "unknown")[:12]
+        comparison = compare_source(local, runtime)
+        source_text = {"matching": "Backend source matches startup snapshot",
+                       "changed": "Backend source changed; restart pending",
+                       "unknown": "Backend source comparison unknown"}[comparison]
+        if availability == "available":
+            version = (f"Local {local_revision} | Service {service_revision} | Python {runtime['python']}\n"
+                       + "Startup " + local_time(runtime.get("started_at")) + "\n" + source_text)
+        else:
+            reason = {"unsupported": "older server; owner restart needed", "offline": "service offline",
+                      "unavailable": "startup identity unavailable"}.get(availability, "not checked")
+            version = f"Local {local_revision} | Service startup unknown\n{reason}"
+        values["version"].set(version)
+        self.render_checkup_summary(status, config)
         values["edits"].set("Unsaved changes" if dirty else "No unsaved changes")
         fetch = status.get("fetch_activity", {})
         activity = fetch.get("activity", {})
@@ -192,8 +232,63 @@ class OperationsView:
                 self.connection_table.insert("", "end", iid=key, values=row)
         self.storage_path.set(str(config.resolve(config.data_dir or "data")))
         enabled = "disabled" if self.app.busy else "normal"
-        for button in (*self.maintenance_buttons, self.proxy_button, self.observer_button, self.environment_button):
+        for button in (*self.maintenance_buttons, self.proxy_button, self.observer_button, self.environment_button, self.checkup_button):
             button.configure(state=enabled)
+
+    def begin_checkup(self):
+        self.checkup_report = None
+        self.checkup_running = True
+        self.checkup_rows = {}
+        self.checkup_table.delete(*self.checkup_table.get_children())
+        for key, component in CHECKS:
+            self.checkup_table.insert("", "end", iid=key, values=(component, "Pending", ""))
+        self.checkup_summary.set("Checkup running | 0 / " + str(len(CHECKS)))
+        self.checkup_detail.set("")
+
+    def render_checkup_row(self, row):
+        self.checkup_rows[row["key"]] = row
+        outcome = {"pass": "Passed", "fail": "Failed", "warn": "Warning", "unknown": "Unknown", "skip": "Skipped"}[row["outcome"]]
+        self.checkup_table.item(row["key"], values=(row["component"], outcome, row["summary"]), tags=(row["outcome"],))
+        self.checkup_summary.set(f"Checkup running | {len(self.checkup_rows)} / {len(CHECKS)}")
+        if not self.checkup_table.selection():
+            self.checkup_table.selection_set(row["key"])
+        self.select_checkup()
+
+    def select_checkup(self):
+        selected = self.checkup_table.selection()
+        row = self.checkup_rows.get(selected[0]) if selected else None
+        self.checkup_detail.set((local_time(row["checked_at"]) + " | " + row["action"]) if row else "")
+
+    def finish_checkup(self, report):
+        self.checkup_running = False
+        self.checkup_report = report
+        important = next((row["key"] for outcome in ("fail", "warn", "unknown")
+                          for row in report["rows"] if row["outcome"] == outcome), None)
+        if important:
+            self.checkup_table.selection_set(important)
+            self.checkup_table.see(important)
+        self.select_checkup()
+
+    def fail_checkup(self):
+        if self.checkup_running:
+            self.checkup_running = False
+            self.checkup_summary.set("Checkup incomplete; pending checks remain unverified")
+
+    def render_checkup_summary(self, status, config):
+        report = self.checkup_report
+        if not report or self.checkup_running:
+            return
+        source_changed = (status.get("local_source", {}).get("source_digest")
+                          != report.get("local_source", {}).get("source_digest"))
+        stale = report["profile_digest"] != config_digest(config) or report["service_key"] != service_key(status) or source_changed
+        counts = {outcome: sum(row["outcome"] == outcome for row in report["rows"])
+                  for outcome in ("pass", "fail", "warn", "unknown", "skip")}
+        if stale:
+            text = "Checkup snapshot outdated: service, source or saved profile changed"
+        else:
+            text = (f"Snapshot: {counts['pass']} passed, {counts['fail']} failed, {counts['warn']} warnings, "
+                    f"{counts['unknown']} unknown, {counts['skip']} skipped")
+        self.checkup_summary.set(text + " | " + local_time(report["finished_at"]))
 
     def render_storage(self, result):
         self.storage_summary.set(f"Free: {size_text(result['free_bytes'])} / {size_text(result['total_bytes'])} | " + local_time(result["checked_at"]))
@@ -213,6 +308,11 @@ class OperationsView:
                                     "\n" + " | ".join(f"{name}: {version}" for name, version in packages.items()))
 
     def clear_checks(self):
+        self.checkup_report = None
+        self.checkup_rows = {}
+        self.checkup_table.delete(*self.checkup_table.get_children())
+        self.checkup_summary.set("Saved profile changed; checkup not run")
+        self.checkup_detail.set("")
         self.environment_result.set("Selected Python: not checked. Runtime accelerator: unknown.")
         self.storage_summary.set("Disk usage: not scanned")
         self.storage_table.delete(*self.storage_table.get_children())

@@ -408,6 +408,11 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.controller.start(self.config), "start-requested")
         eventually(lambda: self.controller.status(self.config)["state"] == "running", timeout=60)
         self.assertEqual(self.controller.status(self.config)["health"], "ready")
+        from scripts.launcher_runtime import read_runtime_identity, compare_source
+        from exh_rec.runtime_identity import capture_source
+        startup = read_runtime_identity(self.config.home_url())
+        self.assertEqual(startup["availability"], "available")
+        self.assertEqual(compare_source(capture_source(), startup), "matching")
         self.assertTrue(self.controller.status(self.config)["profile_match"])
         self.assertFalse(self.controller.status(replace(self.config, port=unused_port()))["profile_match"])
         run_id = core.read_runtime(self.path)["run_id"]
@@ -554,7 +559,8 @@ class LauncherUITests(unittest.TestCase):
         activity, _ = running_activity()
         status = {"state": "running", "managed": True, "home_url": "http://127.0.0.1:12345/"}
         with patch.object(self.app.controller, "status", return_value=status), patch(
-                "scripts.launcher.read_fetch_activity", return_value={"availability": "available", "activity": activity.snapshot()["activity"]}) as read:
+                "scripts.launcher.read_fetch_activity", return_value={"availability": "available", "activity": activity.snapshot()["activity"]}) as read, patch(
+                "scripts.launcher.read_runtime_identity", return_value={"availability": "unsupported"}):
             self.app.refresh()
             self.pump()
         read.assert_called_with(status["home_url"])
@@ -662,9 +668,168 @@ class LauncherUITests(unittest.TestCase):
         self.assertEqual(self.app.latest["state"], "checking")
         self.assertNotIn("verified", self.app.operations.overview_values["health"].get())
         self.assertEqual(self.app.latest["fetch_activity"]["availability"], "unavailable")
+        self.assertEqual(self.app.latest["runtime_identity"]["availability"], "unavailable")
+
+    def test_slow_maintenance_does_not_block_status_polling_or_queue_mutations(self):
+        entered, release = threading.Event(), threading.Event()
+        result = {"python": "3.12.10", "accelerator": "cpu", "packages": {}, "checked_at": "2026-11-09T01:00:00+00:00"}
+
+        def slow_probe(config):
+            entered.set()
+            release.wait(5)
+            return result
+
+        status = {"state": "stopped", "managed": False, "health": "stopped"}
+        with patch("scripts.launcher.ops.inspect_environment", side_effect=slow_probe), patch.object(
+                self.app.controller, "status", return_value=status) as inspect_status:
+            try:
+                self.app.check_environment()
+                self.pump(0.3)
+                self.assertTrue(entered.is_set())
+                self.assertTrue(self.app.busy)
+                self.assertGreaterEqual(inspect_status.call_count, 1)
+                self.assertEqual(self.app.latest["health"], "stopped")
+                self.assertIn("Checking selected environment", self.app.operation_text.get())
+                previous = inspect_status.call_count
+                self.app.refresh()
+                self.pump(0.3)
+                self.assertGreater(inspect_status.call_count, previous)
+                self.assertEqual(str(self.app.save_button.cget("state")), "disabled")
+                extra_operation = Mock()
+                self.app.submit(extra_operation)
+                extra_operation.assert_not_called()
+            finally:
+                release.set()
+                self.pump(0.5)
+        self.assertFalse(self.app.busy)
+        self.assertEqual(self.app.operation_text.get(), "")
+
+    def test_runtime_source_display_uses_backend_identity_not_selected_python(self):
+        status = {"state": "external", "managed": False, "health": "ready", "local_source": {
+            "revision": "a" * 40, "source_digest": "b" * 64}, "runtime_identity": {
+            "availability": "available", "revision": "c" * 40, "source_digest": "d" * 64,
+            "python": "3.12.10", "started_at": "2026-11-09T01:00:00+00:00"}}
+        self.app.render_status(status)
+        text = self.app.operations.overview_values["version"].get()
+        self.assertIn("Local aaaaaaaaaaaa", text)
+        self.assertIn("Service cccccccccccc", text)
+        self.assertIn("Python 3.12.10", text)
+        self.assertIn("restart pending", text)
+        status["runtime_identity"] = {"availability": "unsupported"}
+        self.app.render_status(status)
+        text = self.app.operations.overview_values["version"].get()
+        self.assertIn("unknown", text)
+        self.assertIn("older server", text)
+        self.assertNotIn("cccccccccccc", text)
+
+    def test_runtime_identity_is_cached_but_refresh_and_new_runs_recheck(self):
+        status = {"state": "running", "managed": True, "run_id": "one", "home_url": "http://127.0.0.1:12345/"}
+        with patch.object(self.app.controller, "status", side_effect=lambda config: dict(status)), patch(
+                "scripts.launcher.read_fetch_activity", return_value={"availability": "unsupported"}), patch(
+                "scripts.launcher.read_runtime_identity", return_value={"availability": "unsupported"}) as read:
+            self.app.refresh()
+            self.pump(0.3)
+            self.app.refresh()
+            self.pump(0.3)
+            self.assertEqual(read.call_count, 1)
+            self.app.refresh(force_identity=True)
+            self.pump(0.3)
+            self.assertEqual(read.call_count, 2)
+            status["run_id"] = "two"
+            self.app.refresh()
+            self.pump(0.3)
+            self.assertEqual(read.call_count, 3)
+
+    def test_only_one_status_poll_can_be_pending_during_maintenance(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_status(config):
+            entered.set()
+            release.wait(5)
+            return {"state": "stopped", "managed": False}
+
+        with patch.object(self.app.controller, "status", side_effect=slow_status) as read:
+            try:
+                self.app.busy = True
+                for _ in range(10):
+                    self.app.refresh()
+                self.pump(0.2)
+                self.assertTrue(entered.is_set())
+                self.assertEqual(read.call_count, 1)
+                self.assertTrue(self.app.polling)
+            finally:
+                release.set()
+                self.pump(0.3)
+
+    def test_checkup_streams_rows_and_never_uses_unsaved_form_or_starts_service(self):
+        from scripts.launcher_checkup import CHECKS, service_key
+        from scripts.launcher_core import config_digest
+        self.app.variables["venv_path"].set("unsaved-environment")
+
+        def check(config, controller, emit):
+            self.assertEqual(config, self.app.config)
+            rows = []
+            for key, component in CHECKS:
+                row = {"key": key, "component": component, "outcome": "unknown", "summary": "Unverified",
+                       "checked_at": "2026-11-09T01:00:00+00:00", "action": "Keep existing service unchanged."}
+                emit(row)
+                rows.append(row)
+            return {"rows": rows, "profile_digest": config_digest(config), "service_key": service_key({}),
+                    "finished_at": "2026-11-09T01:00:00+00:00"}
+
+        with patch("scripts.launcher.run_checkup", side_effect=check), patch.object(self.app.controller, "start") as start, patch.object(
+                self.app.controller, "stop") as stop:
+            self.app.checkup()
+            self.pump(0.5)
+        self.assertFalse(self.app.busy)
+        self.assertEqual(len(self.app.operations.checkup_rows), len(CHECKS))
+        self.assertIn("Unverified", self.app.operations.checkup_table.item("service", "values"))
+        self.assertFalse(self.path.exists())
+        start.assert_not_called()
+        stop.assert_not_called()
+
+    def test_checkup_snapshot_is_invalidated_by_service_source_or_profile_change(self):
+        from scripts.launcher_checkup import service_key
+        from scripts.launcher_core import config_digest
+        view = self.app.operations
+        status = {"state": "running", "managed": True, "run_id": "one", "local_source": {"source_digest": "b" * 64}}
+        view.checkup_report = {"rows": [], "profile_digest": config_digest(self.app.config), "service_key": service_key(status),
+                               "local_source": status["local_source"], "finished_at": "2026-11-09T01:00:00+00:00"}
+        self.app.render_status(status)
+        self.assertNotIn("outdated", view.checkup_summary.get())
+        for change in ({"run_id": "two"}, {"local_source": {"source_digest": "c" * 64}}):
+            self.app.render_status({**status, **change})
+            self.assertIn("outdated", view.checkup_summary.get())
+        self.app.config = replace(self.app.config, port=unused_port())
+        self.app.render_status(status)
+        self.assertIn("outdated", view.checkup_summary.get())
+
+    def test_poll_failures_do_not_overwrite_active_operation_notice(self):
+        self.app.busy = True
+        self.app.notice.set("Checking selected environment...")
+        self.app.results.put(("status", None, None, "Status unavailable", self.app.config_generation))
+        self.app.drain()
+        self.assertEqual(self.app.notice.get(), "Checking selected environment...")
+        self.assertEqual(self.app.latest["health"], "unknown")
+
+    def test_failed_checkup_preserves_partial_rows_and_allows_retry(self):
+        def fail(config, controller, emit):
+            emit({"key": "service", "component": "Local service", "outcome": "unknown", "summary": "Unverified",
+                  "checked_at": "2026-11-09T01:00:00+00:00", "action": "No changes made."})
+            raise RuntimeError("FAKE_SECRET")
+        with patch("scripts.launcher.run_checkup", side_effect=fail):
+            self.app.checkup()
+            self.pump(0.5)
+        self.assertFalse(self.app.busy)
+        self.assertIn("incomplete", self.app.operations.checkup_summary.get())
+        self.assertIn("service", self.app.operations.checkup_rows)
+        self.assertNotIn("FAKE_SECRET", self.app.notice.get())
+        self.assertEqual(str(self.app.operations.checkup_button.cget("state")), "normal")
 
     def test_all_operational_tabs_fit_supported_sizes(self):
         from scripts.launcher_ops import timestamp
+        from scripts.launcher_checkup import CHECKS, service_key
+        from scripts.launcher_core import config_digest
         for timer in list(self.app.timers):
             self.root.after_cancel(timer)
         self.app.timers.clear()
@@ -675,7 +840,21 @@ class LauncherUITests(unittest.TestCase):
                                               ("numpy", "scipy", "scikit-learn", "joblib", "Pillow", "torch", "torchvision", "transformers", "PySocks")}})
         view.maintenance_result.set("Verified backup: G:/" + "long-private-directory/" * 8 + "backup.sqlite3")
         self.app.notice.set("Proxy check finished. This does not verify upstream access.")
-        self.app.render_status({"state": "running", "managed": True, "health": "ready", "profile_match": False})
+        status = {"state": "running", "managed": True, "health": "ready", "profile_match": False,
+                  "local_source": {"revision": "a" * 40, "source_digest": "b" * 64},
+                  "runtime_identity": {"availability": "available", "revision": "c" * 40, "source_digest": "d" * 64,
+                                       "python": "3.12.10", "started_at": timestamp()}}
+        view.begin_checkup()
+        rows = []
+        for key, component in CHECKS:
+            row = {"key": key, "component": component, "outcome": "unknown", "summary": "Upstream access remains unverified",
+                   "checked_at": timestamp(), "action": "Older services need an owner-controlled restart to expose startup identity; "
+                   "offline or incomplete snapshots remain unknown. Inspect Connections and Logs before any service changes."}
+            rows.append(row)
+            view.render_checkup_row(row)
+        view.finish_checkup({"rows": rows, "profile_digest": config_digest(self.app.config), "service_key": service_key(status),
+                             "local_source": status["local_source"], "finished_at": timestamp()})
+        self.app.render_status(status)
         for width, height in ((780, 760), (880, 760), (1100, 900)):
             self.root.geometry(f"{width}x{height}+20000+20000")
             self.root.deiconify()
@@ -694,6 +873,7 @@ class LauncherUITests(unittest.TestCase):
             headings = sum(font.nametofont("TkDefaultFont").measure(self.app.notebook.tab(tab, "text")) + 24
                            for tab in self.app.notebook.tabs())
             self.assertLessEqual(headings, self.app.notebook.winfo_width())
+            self.assertGreaterEqual(view.checkup_table.winfo_height(), 75)
 
 
 if __name__ == "__main__":

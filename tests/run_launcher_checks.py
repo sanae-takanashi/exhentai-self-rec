@@ -11,6 +11,11 @@ fixtures = Path(tempfile.mkdtemp(prefix="launcher-checks-"))
 os.environ["EXH_LAUNCHER_TEST_ROOT"] = str(fixtures)
 os.environ["EXH_REC_DATA_DIR"] = str(fixtures / "import-only")
 
+from exh_rec import db
+
+# Optional application tests may use the default connection; keep it synthetic.
+db.init_db()
+
 
 class RetainedTemporaryDirectory(tempfile.TemporaryDirectory):
     def cleanup(self):
@@ -22,8 +27,8 @@ class RetainedTemporaryDirectory(tempfile.TemporaryDirectory):
 
 
 tempfile.TemporaryDirectory = RetainedTemporaryDirectory
-suite = unittest.defaultTestLoader.loadTestsFromNames([
-    "tests.test_launcher", "tests.test_launcher_icon", "tests.test_launcher_logs", "tests.test_launcher_ops", "tests.test_hath_launcher",
+suite = unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:] or [
+    "tests.test_launcher", "tests.test_launcher_icon", "tests.test_launcher_logs", "tests.test_launcher_ops", "tests.test_launcher_runtime", "tests.test_hath_launcher",
     "tests.test_fetch_activity", "tests.test_fetch_pagination",
 ])
 result = unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)

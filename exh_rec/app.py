@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import db
+from .runtime_identity import capture_runtime
 from .fetch_activity import FetchActivity
 from .fetch_insights import start_listing, finish_listing, known_gallery_urls, fetch_insights
 from .ranking_insights import ranking_insights
@@ -120,6 +121,7 @@ from .visual import (
 )
 
 
+RUNTIME_IDENTITY = capture_runtime()
 HOST = os.environ.get("EXH_REC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EXH_REC_PORT", "18787"))
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -207,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_status())
             elif path == "/api/health":
                 self.send_json({"service": "exh-rec", "status": "ok"})
+            elif path == "/api/runtime":
+                self.send_json(dict(RUNTIME_IDENTITY))
             elif path == "/api/insights/fetch":
                 with db.connect() as conn:
                     self.send_json(fetch_insights(conn))

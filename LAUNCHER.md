@@ -33,8 +33,55 @@ fetch summary and latest retained sanitized error. Uptime is not inferred for
 external services. New supervisors record a digest of their launch profile;
 older already-running supervisors show profile agreement as unknown until the
 next owner-controlled restart. The digest does not prove database overrides
-or inherited environment values. Local revision means the checkout revision,
-not the revision of an already-running backend.
+or inherited environment values. Local and service-startup revisions are shown
+separately, together with the backend's Python version and startup timestamp.
+The source comparison uses a bounded SHA-256 snapshot of backend Python files
+and the two service bootstrap scripts. It detects uncommitted source changes
+even if the Git revision has not changed. Web assets, launch-UI code, dependencies,
+database overrides and inherited settings are not part of this comparison.
+The service reports a snapshot captured at application import, not a continuously
+re-read checkout revision or a guarantee of atomic live code updates.
+
+## Checkup And Status Refresh
+
+**Run Checkup** in Overview explicitly checks local service identity, startup
+source agreement, required launch-file existence, the selected environment's
+base packages, proxy TCP reachability, current-run SSH log evidence and saved
+observer receipts. It uses the saved profile, not unsaved form edits. It never
+starts/stops services, opens credential files, initiates SSH authentication,
+requests upstream gallery content, installs packages, or runs training/downloads.
+Disabled H@H checks are skipped without reading the observer database.
+
+Each result has a check timestamp and a selectable next-action detail. Results
+arrive individually, and failures do not suppress later independent checks.
+Passed, Failed, Warning, Unknown and Skipped are distinct; no overall "healthy"
+claim is made from partial evidence. A reachable TCP socket is not proof of
+upstream access, and historical observer receipts do not prove a live tunnel.
+The environment probe still has its 20-second timeout. Database integrity checks
+and backups remain separate explicit Storage actions.
+
+The result table is a point-in-time snapshot, not an automatic alert or a
+continuously green checklist. An observed service, source or saved-profile
+change invalidates its summary. A partial unexpected failure retains completed
+rows and leaves pending checks unverified; rerunning replaces that snapshot.
+Only the current launcher window retains these results; nothing is persisted
+as content-bearing diagnostic history.
+
+Status polling has a separate, single-worker executor from serialized service
+and maintenance operations. Environment probes, storage scans and backups do
+not suspend readiness, fetch progress or log refresh. The footer shows the
+current operation stage and elapsed time. There is no fabricated percentage,
+ETA, unsafe cancellation or concurrent mutation queue. Closing the UI leaves
+the service running and lets already-started bounded maintenance finish.
+
+The lightweight `/api/runtime` endpoint returns only startup revision, backend
+source digest, Python version and startup timestamp from memory. It does not
+open the database or recompute source identity per request. Older servers show
+startup identity as unknown until an owner-controlled restart; the launcher
+does not perform that restart. Source and runtime observations are refreshed
+at most every 15 seconds, with 60-second retries for unsupported old servers;
+managed-run changes and the Refresh button trigger a fresh check. New workers
+omit runtime polling from retained logs, just like health/fetch polling.
 
 Parameters cover `run.ps1`: virtual environment, bind address, port, data
 directory, proxy, visual encoder/device, H@H enablement, token-file path,

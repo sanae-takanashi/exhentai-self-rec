@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 import queue
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -21,6 +22,9 @@ from scripts.launcher_logs import read_log_snapshot
 from scripts.launcher_fetch import FetchActivityView, read_fetch_activity
 from scripts.launcher_views import OperationsView
 from scripts import launcher_ops as ops
+from scripts.launcher_checkup import CHECKS, run_checkup
+from scripts.launcher_runtime import read_runtime_identity
+from exh_rec.runtime_identity import capture_source
 
 
 def apply_launcher_icon(root):
@@ -99,12 +103,21 @@ class LauncherApp:
         self.path = config_path.resolve()
         self.controller = LauncherController(self.path)
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="launcher")
+        self.status_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="launcher-status")
         self.results = queue.Queue()
         self.busy = False
         self.closed = False
         self.timers = set()
         self.polling = False
         self.config_generation = 0
+        self.local_source = {}
+        self.source_checked_at = 0
+        self.runtime_observation = {}
+        self.runtime_probe_key = None
+        self.runtime_checked_at = 0
+        self.operation_started = None
+        self.operation_stage = ""
+        self.operation_text = tk.StringVar(value="")
         self.log_lines = None
         self.all_log_lines = []
         self.logs_external = False
@@ -133,7 +146,7 @@ class LauncherApp:
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
 
-        heading = ttk.Frame(root, padding=(20, 16, 20, 12))
+        heading = ttk.Frame(root, padding=(20, 12, 20, 6))
         heading.grid(row=0, column=0, sticky="ew")
         heading.columnconfigure(0, weight=1)
         brand = ttk.Frame(heading)
@@ -148,12 +161,12 @@ class LauncherApp:
         self.ownership = ttk.Label(heading, text="", style="Muted.TLabel")
         self.ownership.grid(row=1, column=1, sticky="e", pady=(7, 0))
 
-        actions = ttk.Frame(root, padding=(20, 0, 20, 14))
+        actions = ttk.Frame(root, padding=(20, 0, 20, 8))
         actions.grid(row=1, column=0, sticky="ew")
         self.start_button = ttk.Button(actions, text="Start Service", command=self.start)
         self.stop_button = ttk.Button(actions, text="Stop Service", command=self.stop)
         self.open_button = ttk.Button(actions, text="Open Home", command=self.open_home)
-        self.refresh_button = ttk.Button(actions, text="Refresh", command=self.refresh)
+        self.refresh_button = ttk.Button(actions, text="Refresh", command=lambda: self.refresh(force_identity=True))
         for column, button in enumerate((self.start_button, self.stop_button, self.open_button, self.refresh_button)):
             button.grid(row=0, column=column, sticky="ew", padx=(0, 8) if column < 3 else 0)
             actions.columnconfigure(column, weight=1)
@@ -231,7 +244,7 @@ class LauncherApp:
         self.field(advanced, 6, "DINO device", "dino_device", choices=("", "auto", "cpu", "cuda", "rocm"))
         self.field(advanced, 7, "Startup timeout (s)", "startup_timeout")
 
-        footer = ttk.Frame(root, padding=(20, 14, 20, 18))
+        footer = ttk.Frame(root, padding=(20, 7, 20, 8))
         footer.grid(row=3, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         self.save_button = ttk.Button(footer, text="Save Parameters", command=self.save)
@@ -244,6 +257,13 @@ class LauncherApp:
         self.startup_button.grid(row=0, column=1, sticky="e")
         ttk.Label(footer, textvariable=self.notice, wraplength=560, style="Error.TLabel").grid(
             row=0, column=0, sticky="ew", padx=(0, 10))
+        operation_bar = ttk.Frame(footer, height=24)
+        operation_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        operation_bar.columnconfigure(0, weight=1)
+        ttk.Label(operation_bar, textvariable=self.operation_text, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.operation_progress = ttk.Progressbar(operation_bar, mode="indeterminate", length=110)
+        self.operation_progress.grid(row=0, column=1, sticky="e")
+        self.operation_progress.grid_remove()
         for variable in self.variables.values():
             variable.trace_add("write", lambda *_: self.render_profile_edits())
         self.update_hath_fields()
@@ -318,7 +338,7 @@ class LauncherApp:
         def done(result):
             self.proxy_result = result
             self.notice.set("Proxy check finished. This does not verify upstream access.")
-        self.submit(lambda: ops.check_proxy(config), done)
+        self.submit(lambda: ops.check_proxy(config), done, label="Checking saved proxy TCP")
 
     def check_observer(self):
         config = self.config
@@ -326,7 +346,7 @@ class LauncherApp:
         def done(result):
             self.observer_result = result
             self.notice.set("Observer timestamps read. Tunnel connectivity is not assumed.")
-        self.submit(lambda: ops.observer_status(config), done)
+        self.submit(lambda: ops.observer_status(config), done, label="Reading observer history")
 
     def check_environment(self):
         config = self.config
@@ -334,7 +354,26 @@ class LauncherApp:
         def done(result):
             self.operations.render_environment(result)
             self.notice.set("Selected environment checked; running-service settings may differ.")
-        self.submit(lambda: ops.inspect_environment(config), done)
+        self.submit(lambda: ops.inspect_environment(config), done, label="Checking selected environment (20s limit)")
+
+    def checkup(self):
+        if self.busy or self.closed:
+            return
+        config, generation = self.config, self.config_generation
+        self.operations.begin_checkup()
+        self.notice.set("Checking saved profile; no service or content changes.")
+
+        def emit(row):
+            self.results.put(("checkup", row, None, None, generation))
+
+        def done(report):
+            if report.get("environment"):
+                self.operations.render_environment(report["environment"])
+            self.proxy_result = report.get("proxy", {})
+            self.observer_result = report.get("observer", {})
+            self.operations.finish_checkup(report)
+            self.notice.set("Checkup finished. Unknown checks remain unverified.")
+        self.submit(lambda: run_checkup(config, self.controller, emit), done, label="Checking local service")
 
     def scan_storage(self):
         config = self.config
@@ -342,7 +381,7 @@ class LauncherApp:
         def done(result):
             self.operations.render_storage(result)
             self.notice.set("Storage scan finished. Partial sizes are lower bounds.")
-        self.submit(lambda: ops.inspect_storage(config), done)
+        self.submit(lambda: ops.inspect_storage(config), done, label="Scanning saved storage (bounded)")
 
     def check_database(self):
         config = self.config
@@ -350,7 +389,7 @@ class LauncherApp:
         def done(result):
             self.operations.database_result.set("Database quick_check passed: " + ops.local_time(result["checked_at"]))
             self.notice.set("Read-only database check passed.")
-        self.submit(lambda: ops.check_database(config), done)
+        self.submit(lambda: ops.check_database(config), done, label="Checking database read-only (30s limit)")
 
     def create_backup(self):
         from tkinter import messagebox
@@ -366,7 +405,7 @@ class LauncherApp:
             self.operations.backup_summary.set("Last backup verified at creation: " + ops.local_time(result["at"]))
             self.operations.maintenance_result.set("Verified backup: " + result["path"])
             self.notice.set("Private backup verified. Existing data was not replaced.")
-        self.submit(lambda: ops.backup_database(config), done)
+        self.submit(lambda: ops.backup_database(config), done, label="Creating and verifying private backup (45s limit)")
 
     def export_diagnostics(self):
         config, status = self.config, dict(self.latest)
@@ -374,7 +413,7 @@ class LauncherApp:
         def done(result):
             self.operations.maintenance_result.set("Diagnostics: " + result["path"])
             self.notice.set("Diagnostic export verified. No gallery text, credentials, addresses or local paths inside.")
-        self.submit(lambda: ops.export_diagnostics(config, status), done)
+        self.submit(lambda: ops.export_diagnostics(config, status), done, label="Exporting sanitized diagnostics")
 
     def copy_logs(self):
         self.root.clipboard_clear()
@@ -400,10 +439,14 @@ class LauncherApp:
         for widget, mode in self.hath_widgets:
             widget.configure(state=mode if self.variables["hath_enabled"].get() and not managed and not self.busy else "disabled")
 
-    def submit(self, operation, callback=None):
-        if self.busy:
+    def submit(self, operation, callback=None, *, label="Working"):
+        if self.busy or self.closed:
             return
         self.busy = True
+        self.operation_started = time.monotonic()
+        self.operation_stage = label
+        self.operation_progress.grid()
+        self.operation_progress.start(60)
         self.render_status(self.latest)
 
         def work():
@@ -420,14 +463,15 @@ class LauncherApp:
             self.notebook.select(self.logs_tab)
             self.notice.set("Starting service...")
             self.submit(lambda: self.controller.start(config),
-                        lambda result: self.notice.set("Service already running." if result == "already-running" else "Background start requested."))
+                        lambda result: self.notice.set("Service already running." if result == "already-running" else "Background start requested."),
+                        label="Requesting background start")
 
     def stop(self):
         from tkinter import messagebox
         if not messagebox.askyesno("Stop Service", "Stop the managed server and its H@H tunnel? Active jobs may be interrupted.", parent=self.root):
             return
         self.notice.set("Stopping service...")
-        self.submit(self.controller.stop, lambda _: self.notice.set("Service stopped."))
+        self.submit(self.controller.stop, lambda _: self.notice.set("Service stopped."), label="Stopping managed service")
 
     def open_home(self):
         self.submit(lambda: self.controller.open_home(self.config),
@@ -454,8 +498,11 @@ class LauncherApp:
                 pass
             self.notice.set(error_message(error))
 
-    def refresh(self):
-        if self.closed or self.polling or self.busy:
+    def refresh(self, *, force_identity=False):
+        if force_identity:
+            self.runtime_checked_at = 0
+            self.source_checked_at = 0
+        if self.closed or self.polling:
             return
         self.polling = True
         config = self.config
@@ -470,11 +517,26 @@ class LauncherApp:
                                   else ["Recent logs unavailable."])
                 status["fetch_activity"] = (read_fetch_activity(status["home_url"])
                                             if status["state"] in {"running", "external"} else {"availability": "offline"})
+                if status["state"] in {"running", "external"}:
+                    key = (status.get("managed"), status.get("run_id"), status["home_url"])
+                    interval = 60 if self.runtime_observation.get("availability") == "unsupported" else 15
+                    if not self.runtime_checked_at or key != self.runtime_probe_key or time.monotonic() - self.runtime_checked_at >= interval:
+                        self.runtime_observation = read_runtime_identity(status["home_url"])
+                        self.runtime_probe_key = key
+                        self.runtime_checked_at = time.monotonic()
+                    status["runtime_identity"] = dict(self.runtime_observation)
+                else:
+                    self.runtime_probe_key = None
+                    status["runtime_identity"] = {"availability": "offline"}
+                if not self.source_checked_at or time.monotonic() - self.source_checked_at >= 15:
+                    self.local_source = capture_source()
+                    self.source_checked_at = time.monotonic()
+                status["local_source"] = dict(self.local_source)
                 status["checked_at"] = ops.timestamp()
                 self.results.put(("status", status, None, None, generation))
             except Exception as error:
                 self.results.put(("status", None, None, error_message(error), generation))
-        self.executor.submit(work)
+        self.status_executor.submit(work)
 
     def poll_status(self):
         if self.closed:
@@ -487,7 +549,14 @@ class LauncherApp:
             return
         while not self.results.empty():
             kind, result, callback, error, generation = self.results.get_nowait()
-            if kind == "status":
+            if kind == "checkup":
+                if generation == self.config_generation:
+                    self.operations.render_checkup_row(result)
+                    index = next(index for index, item in enumerate(CHECKS) if item[0] == result["key"]) + 1
+                    if index < len(CHECKS):
+                        self.operation_stage = "Checking " + CHECKS[index][1].lower()
+                continue
+            elif kind == "status":
                 self.polling = False
                 if generation != self.config_generation:
                     self.refresh()
@@ -495,17 +564,28 @@ class LauncherApp:
                 if result:
                     self.latest = result
                 if error:
-                    self.notice.set(error)
+                    if not self.busy:
+                        self.notice.set(error)
                     self.latest = {**self.latest, "state": "checking", "health": "unknown",
-                                   "fetch_activity": {"availability": "unavailable"}}
+                                   "fetch_activity": {"availability": "unavailable"},
+                                   "runtime_identity": {"availability": "unavailable"}}
             else:
                 self.busy = False
+                self.operation_started = None
+                self.operation_progress.stop()
+                self.operation_progress.configure(value=0)
+                self.operation_progress.grid_remove()
+                self.operation_text.set("")
                 if error:
                     self.notice.set(error)
+                    self.operations.fail_checkup()
                 elif callback:
                     callback(result)
                 self.refresh()
             self.render_status(self.latest)
+        if self.busy and self.operation_started is not None:
+            elapsed = max(0, int(time.monotonic() - self.operation_started))
+            self.operation_text.set(f"{self.operation_stage} | {elapsed}s")
         self.schedule(100, self.drain)
 
     def render_status(self, status):
@@ -520,7 +600,7 @@ class LauncherApp:
         self.start_button.configure(state="disabled" if self.busy or managed or state in {"starting", "stopping", "running", "external"} else "normal")
         self.stop_button.configure(state="normal" if managed and not self.busy and state != "stopping" else "disabled")
         self.open_button.configure(state="normal" if state in {"running", "external"} and not self.busy else "disabled")
-        self.refresh_button.configure(state="disabled" if self.busy else "normal")
+        self.refresh_button.configure(state="disabled" if self.polling else "normal")
         self.save_button.configure(state="disabled" if self.busy or managed else "normal")
         self.startup_button.configure(state="disabled" if self.busy else "normal")
         self.startup_check.configure(state="disabled" if self.busy else "normal")
@@ -532,7 +612,7 @@ class LauncherApp:
             self.render_logs(status["logs"], external=state == "external")
         if "fetch_activity" in status:
             self.fetch_activity.render(status["fetch_activity"])
-        if state == "failed" and status.get("error"):
+        if not self.busy and state == "failed" and status.get("error"):
             self.notice.set(error_message(status["error"]))
 
     def render_logs(self, lines, external=False):
@@ -568,7 +648,9 @@ class LauncherApp:
         for timer in self.timers:
             self.root.after_cancel(timer)
         self.timers.clear()
+        self.operation_progress.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.status_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 

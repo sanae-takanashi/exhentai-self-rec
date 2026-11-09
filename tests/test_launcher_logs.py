@@ -59,6 +59,8 @@ class LauncherLogTests(unittest.TestCase):
     def test_health_polling_is_silent_and_known_runtime_events_are_classified(self):
         self.assertIsNone(classify_output('127.0.0.1 - "GET /api/health HTTP/1.1" 200 -'))
         self.assertIsNone(classify_output('127.0.0.1 - "GET /api/fetch-progress HTTP/1.1" 200 -'))
+        self.assertIsNone(classify_output('127.0.0.1 - "GET /api/runtime HTTP/1.1" 200 -'))
+        self.assertIsNone(classify_output('127.0.0.1 - "GET /api/runtime HTTP/1.1" 404 -'))
         for line, code in [
             ("Serving ExHentai recommender at http://127.0.0.1:1", "service.ready"),
             ("H@H SSH tunnel exited with code 1; retrying in 5s", "hath.retry"),
