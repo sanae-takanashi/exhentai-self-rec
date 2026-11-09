@@ -8,6 +8,12 @@ Double-click `launch.vbs` for a console-free entry point using the repository's
 `.venv-rocm\Scripts\pythonw.exe launcher.pyw`. The UI and the service virtual
 environment are independent. No third-party GUI dependency is needed.
 
+The heading, title bar and taskbar use the green E/gallery icon from `assets/`.
+Windows gets separate 16-256 pixel icon frames and a launcher-specific taskbar
+identity instead of grouping it with other Python windows. Reopen the launcher
+to load a new icon; the background service does not need to restart. The source
+and build instructions are in [assets/README.md](assets/README.md).
+
 The connection strip shows Stopped, Starting, Running, Stopping, Unresponsive,
 Externally started, Port occupied, or Failed. Start, Stop, Open Home and Refresh operate on the
 saved profile. Closing the window leaves a background service running.

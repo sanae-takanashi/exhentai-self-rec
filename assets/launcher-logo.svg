@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
+  <title>ExHentai Recommender launcher</title>
+  <desc>A white E and a coral page edge on a deep green tile.</desc>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#164e47"/>
+  <polygon points="29,11 53,11 53,45 48,45 48,16 29,16" fill="#ffa783"/>
+  <polygon points="13,19 42,19 42,27 23,27 23,32 38,32 38,40 23,40 23,45 42,45 42,53 13,53" fill="#ffffff"/>
+</svg>

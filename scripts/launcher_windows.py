@@ -11,6 +11,22 @@ class LauncherWindowsError(RuntimeError):
     pass
 
 
+APP_USER_MODEL_ID = "ExhentaiSelfRec.Launcher"
+
+
+def set_taskbar_identity() -> bool:
+    """Separate the launcher from Python's taskbar group before creating Tk."""
+    if os.name != "nt":
+        return False
+    try:
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        method = shell.SetCurrentProcessExplicitAppUserModelID
+        method.argtypes, method.restype = [W.LPCWSTR], W.LONG
+        return method(APP_USER_MODEL_ID) == 0
+    except (OSError, AttributeError):
+        return False
+
+
 class BasicLimits(ctypes.Structure):
     _fields_ = [("user_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
                 ("flags", W.DWORD), ("minimum", ctypes.c_size_t), ("maximum", ctypes.c_size_t),

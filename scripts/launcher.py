@@ -16,11 +16,31 @@ from scripts.launcher_core import (
     DEFAULT_CONFIG, LaunchConfig, LauncherController, LauncherError,
     load_config, save_config, startup_registration, supervise_background,
 )
-from scripts.launcher_windows import LauncherWindowsError
+from scripts.launcher_windows import LauncherWindowsError, set_taskbar_identity
 from scripts.launcher_logs import read_log_snapshot
 from scripts.launcher_fetch import FetchActivityView, read_fetch_activity
 from scripts.launcher_views import OperationsView
 from scripts import launcher_ops as ops
+
+
+def apply_launcher_icon(root):
+    import tkinter as tk
+    assets = ROOT / "assets"
+    try:
+        images = {size: tk.PhotoImage(master=root, file=str(assets / f"launcher-{size}.png"))
+                  for size in (16, 32, 48, 64, 256)}
+        root.iconphoto(False, *images.values())
+        root._launcher_icons = tuple(images.values())
+        return images[32]
+    except (tk.TclError, OSError):
+        try:
+            root.iconbitmap(str(assets / "launcher.ico"))
+        except (tk.TclError, OSError):
+            pass  # Branding must not prevent access to service controls.
+    try:
+        return tk.PhotoImage(master=root, file=str(assets / "launcher-32.png"))
+    except (tk.TclError, OSError):
+        return None
 
 
 ERRORS = {
@@ -98,6 +118,7 @@ class LauncherApp:
             self.config = LaunchConfig.defaults()
             self.notice.set(error_message(error))
         root.title("ExHentai Recommender Launcher")
+        self.logo = apply_launcher_icon(root)
         root.geometry("880x760")
         root.minsize(780, 760)
         style = ttk.Style(root)
@@ -115,7 +136,11 @@ class LauncherApp:
         heading = ttk.Frame(root, padding=(20, 16, 20, 12))
         heading.grid(row=0, column=0, sticky="ew")
         heading.columnconfigure(0, weight=1)
-        ttk.Label(heading, text="ExHentai Recommender", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        brand = ttk.Frame(heading)
+        brand.grid(row=0, column=0, sticky="w")
+        if self.logo:
+            ttk.Label(brand, image=self.logo).grid(row=0, column=0, padx=(0, 10))
+        ttk.Label(brand, text="ExHentai Recommender", style="Title.TLabel").grid(row=0, column=1, sticky="w")
         self.state_label = ttk.Label(heading, text="Checking", style="Status.TLabel")
         self.state_label.grid(row=0, column=1, sticky="e", padx=(20, 0))
         self.address = tk.StringVar(value=self.config.home_url())
@@ -558,6 +583,7 @@ def main(argv=None):
         except Exception:
             return 1
     import tkinter as tk
+    set_taskbar_identity()
     root = tk.Tk()
     LauncherApp(root, args.config)
     root.mainloop()
