@@ -27,10 +27,12 @@ class RetainedTemporaryDirectory(tempfile.TemporaryDirectory):
 
 
 tempfile.TemporaryDirectory = RetainedTemporaryDirectory
-suite = unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:] or [
+suite = (unittest.defaultTestLoader.loadTestsFromNames([f"tests.{path.stem}" for path in sorted((ROOT / "tests").glob("test_*.py"))])
+         if sys.argv[1:] == ["--all"] else unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:] or [
     "tests.test_launcher", "tests.test_launcher_icon", "tests.test_launcher_logs", "tests.test_launcher_ops", "tests.test_launcher_runtime", "tests.test_hath_launcher",
     "tests.test_fetch_activity", "tests.test_fetch_pagination",
-])
+    "tests.test_jobs", "tests.test_launcher_jobs", "tests.test_launcher_tray",
+]))
 result = unittest.TextTestRunner(verbosity=2, buffer=True).run(suite)
 print(f"Retained synthetic fixture root: {fixtures}")
 sys.exit(0 if result.wasSuccessful() else 1)

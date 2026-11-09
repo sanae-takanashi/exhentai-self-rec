@@ -6,7 +6,8 @@ Double-click `launch.vbs` for a console-free entry point using the repository's
 `.venv-rocm` or `.venv` Python. Alternatively double-click `launcher.pyw`
 (a working Python file association is required), or run
 `.venv-rocm\Scripts\pythonw.exe launcher.pyw`. The UI and the service virtual
-environment are independent. No third-party GUI dependency is needed.
+environment are independent. Tk needs no third-party GUI dependency; optional
+tray support uses `pystray` and Pillow from `requirements-launcher.txt`.
 
 The heading, title bar and taskbar use the green E/gallery icon from `assets/`.
 Windows gets separate 16-256 pixel icon frames and a launcher-specific taskbar
@@ -22,10 +23,94 @@ from a port scan or an old state file. Existing manually started servers are
 detected but cannot be stopped or adopted. Stop them using their original
 launcher before starting a managed replacement.
 
-The six tabs are **Overview**, **Connections**, **Activity**, **Environment**,
-**Storage**, and **Logs**. This is an operational console, not a second gallery
+The seven tabs are **Overview**, **Jobs**, **Connections**, **Activity**,
+**Environment**, **Storage**, and **Logs**. This is an operational console, not a second gallery
 browser: content review, feedback, recommendation policy and download-item
 operations remain in the web UI.
+
+## Jobs And Workflows
+
+Jobs runs Fetch, Enrich, Retrain and verified private Backup tasks through one
+durable SQLite queue in the backend. The launcher is only a client: hiding or
+exiting it does not stop queued/running work. The existing web Fetch/Enrich
+requests and automatic fetch/model schedules use this same worker after a
+backend restart. The web API still waits for its result; repeated clicks can
+queue additional manual work. Automatic requests coalesce while equivalent
+work is already active. Other web operations are not moved into Jobs.
+
+The composer offers single tasks and Backup + Fetch/Enrich + Retrain presets.
+Query, detail limit, rated inclusion and filter fields apply to relevant steps.
+Save Workflow retains a named, parameterized preset in the backend database;
+an existing name can be replaced after confirmation. These are template-based
+workflows, not an arbitrary step editor. Up to 50 presets and 100 active jobs
+are accepted. All, Active and History filter the display. All active work and
+the latest 100 terminal records are shown, with total counts, timestamps,
+checkpoints, per-step states and allowlisted result counts. Older history
+remains in SQLite. Job queries/filters are private application data, not part
+of sanitized diagnostics; keep the database and its backups private.
+
+Queue appends work; Run Next moves it ahead of waiting work, without preempting
+the running job. Pause holds a queued job immediately. For a running Fetch or
+Enrich it requests a pause before the next listing page, query metadata phase,
+gallery detail or workflow step, after prior writes are committed. The running
+job retains the worker slot while paused, so later jobs wait. Resume continues
+the same execution. Cancel is cooperative at those checkpoints and retains
+committed pages, detail metadata and fetch cursors. Network requests, an entire
+query metadata phase, retraining and backup are not interrupted mid-operation;
+short jobs may finish before a pending request takes effect.
+
+A partial/failed step stops its workflow. Retry creates a new linked job,
+preserves successful workflow steps and re-executes incomplete steps with their
+saved parameters. It does not retry only failed galleries inside a step. Fetch
+uses its existing durable cursor rules, not an in-memory resume promise. If
+the backend stops, in-flight/paused jobs become Interrupted on next startup;
+queued jobs resume in order and held jobs remain held. Interrupted work never
+silently replays. A bookkeeping failure disables the worker rather than running
+untracked work; restart it deliberately after inspecting the database.
+
+Backup jobs use the backend's actual database, online SQLite backup and the
+same independent quick_check/hash receipt verification as Storage. Their
+artifacts live in that database directory's `backups/`. The queue does not
+persist exception text or gallery result payloads. Errors and notifications
+use fixed summaries. An uncertain POST result is never automatically retried:
+refresh Jobs before deciding whether to send the command again.
+
+Older backends show "backend restart required" and disable job controls. The
+launcher does not restart them automatically. Reopen the launcher for UI changes,
+then use the normal owner-controlled backend restart after checking active work
+to enable the new endpoints and worker. Jobs requires that updated backend;
+Storage's explicit offline maintenance remains independent.
+
+## Windows Tray
+
+Install in the Python environment used to open the launcher, for example:
+
+```powershell
+.\.venv-rocm\Scripts\python.exe -m pip install -r requirements-launcher.txt
+```
+
+The branded tray icon offers Show Launcher, Show Jobs, Open Home, Start Saved
+Profile, Stop Managed Service, quick Fetch/Enrich/Retrain/Backup, and Exit
+Launcher. Its callbacks only enqueue events for Tk's main thread. Start Saved
+Profile never saves unsaved form edits; Stop still requires confirmation and
+only controls this launcher's managed supervisor. Quick Backup also asks for
+the private-data confirmation. Quick job submission opens Jobs for feedback.
+
+Environment contains Close window to tray and Task notifications preferences.
+With a working tray, closing the window hides it by default; Hide to Tray is
+also available. Show Launcher or the default tray action restores it. Exit
+Launcher removes only the icon/UI, leaving backend work alive. Missing tray
+dependencies or a failed tray leave the ordinary window usable, and closing
+then exits normally instead of hiding an unreachable window.
+
+Preferences live in ignored `data/launcher/config.ui.json` (or the matching
+custom-profile sibling), independently of service parameters/startup digests.
+Changes are atomically saved with backups and readback. Notifications report
+new terminal jobs and an observed managed-service failure. The first history
+snapshot establishes a quiet baseline, repeated terminal states are suppressed,
+and large completion batches are aggregated. No workflow names, queries,
+gallery titles, paths, credentials or raw errors appear in notifications.
+Delivery depends on Windows notification settings; it is not guaranteed.
 
 Overview distinguishes verified health from process ownership and shows the
 supervisor uptime, last status check, launch-profile agreement, unsaved edits,
@@ -81,7 +166,7 @@ startup identity as unknown until an owner-controlled restart; the launcher
 does not perform that restart. Source and runtime observations are refreshed
 at most every 15 seconds, with 60-second retries for unsupported old servers;
 managed-run changes and the Refresh button trigger a fresh check. New workers
-omit runtime polling from retained logs, just like health/fetch polling.
+omit runtime, Jobs GET and health/fetch polling from retained logs.
 
 Parameters cover `run.ps1`: virtual environment, bind address, port, data
 directory, proxy, visual encoder/device, H@H enablement, token-file path,
@@ -230,7 +315,10 @@ modified. The real profile remains off until the owner explicitly enables it.
 
 `python tests/run_launcher_checks.py` retains synthetic fixtures and exercises
 configuration, command construction, probes, native containment/singletons,
-background startup/exit/stop, startup registry readback and UI callbacks.
+background startup/exit/stop, startup registry readback, Jobs state transitions,
+process-death recovery, HTTP/client validation, native tray lifecycle and UI callbacks.
+Pass `--all` to include the complete Python regression suite in the same
+retained-data isolation harness.
 Fixtures use ephemeral loopback ports and dummy credential files, never the
 production database, real SSH connections or download jobs. GUI layout and
 default-browser opening are additionally checked against a synthetic server.

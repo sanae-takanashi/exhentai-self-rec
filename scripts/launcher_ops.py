@@ -179,7 +179,11 @@ def hash_file(path):
 
 
 def backup_database(config, *, root=ROOT, seconds=45):
-    database = database_path(config, root)
+    return backup_sqlite_database(database_path(config, root), seconds=seconds)
+
+
+def backup_sqlite_database(database, *, seconds=45):
+    database = local_target(database)
     directory = local_target(database.parent / "backups")
     directory.mkdir(parents=True, exist_ok=True)
     name = "launcher-backup-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:10]

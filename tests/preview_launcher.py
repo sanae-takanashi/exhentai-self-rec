@@ -30,6 +30,20 @@ def main():
                   "local_source": {"revision": "a" * 40, "source_digest": "b" * 64},
                   "runtime_identity": {"availability": "available", "revision": "c" * 40, "source_digest": "d" * 64,
                                        "python": "3.12.10", "started_at": timestamp()}}
+        jobs = []
+        for index, (name, state, stage, kinds) in enumerate((
+                ("Daily refresh", "paused", "query_page", ("backup", "fetch", "retrain")),
+                ("Enrich", "queued", "queued", ("enrich",)),
+                ("Backup", "succeeded", "finished", ("backup",)),
+                ("Fetch", "partial", "finished", ("fetch",)))):
+            item = {"id": f"{index:032x}", "name": name, "stage": stage, "state": state, "source": "launcher",
+                    "created_at": timestamp(), "updated_at": timestamp(), "started_at": None, "finished_at": None,
+                    "retry_of": None, "error_code": ""}
+            item["steps"] = [{"kind": kind, "params": {}, "state": "succeeded" if kind == "backup" else "running" if state == "paused" and kind == "fetch" else "pending",
+                              "result": {"verified": True} if kind == "backup" else {}} for kind in kinds]
+            jobs.append(item)
+        status["jobs"] = {"availability": "available", "worker": True, "jobs": jobs,
+                          "counts": {"paused": 1, "queued": 1, "succeeded": 1, "partial": 1}, "workflows": []}
         app.latest = status
         view = app.operations
         view.begin_checkup()
@@ -63,6 +77,15 @@ def main():
             if max(ImageStat.Stat(image.convert("RGB")).stddev) < 8:
                 raise RuntimeError("Blank synthetic UI preview")
             image.save(directory / f"overview-{width}x{height}.png")
+            for name, frame in (("jobs", app.jobs.frame), ("environment", app.operations.environment)):
+                app.notebook.select(frame)
+                root.update()
+                time.sleep(0.2)
+                image = ImageGrab.grab(bbox=(left, top, left + root.winfo_width(), top + root.winfo_height()))
+                if max(ImageStat.Stat(image.convert("RGB")).stddev) < 8:
+                    raise RuntimeError("Blank synthetic UI preview")
+                image.save(directory / f"{name}-{width}x{height}.png")
+            app.notebook.select(app.operations.overview)
         app.busy = True
         app.operation_text.set("Checking selected environment (20s limit) | 8s")
         app.operation_progress.grid()

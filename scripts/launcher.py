@@ -25,6 +25,8 @@ from scripts import launcher_ops as ops
 from scripts.launcher_checkup import CHECKS, run_checkup
 from scripts.launcher_runtime import read_runtime_identity
 from exh_rec.runtime_identity import capture_source
+from scripts.launcher_jobs import JobsView, read_jobs, write_jobs
+from scripts.launcher_tray import DEFAULTS, Notifications, TrayBridge, load_preferences, save_preferences
 
 
 def apply_launcher_icon(root):
@@ -88,6 +90,11 @@ ERRORS = {
     "maintenance-timeout": "Maintenance timed out. An incomplete artifact may have been retained.",
     "backup-readback-failed": "Backup receipt could not be verified.",
     "diagnostic-readback-failed": "Diagnostic export could not be verified.",
+    "jobs-unavailable": "Jobs unavailable. Check service readiness and restart the backend when convenient.",
+    "jobs-invalid": "Choose a valid workflow, query and detail limit (1-50).",
+    "jobs-rejected": "Job request rejected. Refresh and check its current state.",
+    "jobs-outcome-unknown": "Job outcome unknown. Refresh Jobs before retrying to avoid duplicate work.",
+    "tray-settings-unavailable": "Tray preferences could not be verified. Existing service parameters were not changed.",
 }
 
 
@@ -96,7 +103,7 @@ def error_message(error) -> str:
 
 
 class LauncherApp:
-    def __init__(self, root, config_path: Path = DEFAULT_CONFIG):
+    def __init__(self, root, config_path: Path = DEFAULT_CONFIG, *, enable_tray=False):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk, self.root = tk, ttk, root
@@ -125,6 +132,22 @@ class LauncherApp:
         self.observer_result = {}
         self.latest = {"state": "checking", "managed": False}
         self.notice = tk.StringVar(value="")
+        self.tray = TrayBridge()
+        self.notifications = Notifications()
+        self.ui_path = self.path.with_name(self.path.stem + ".ui.json")
+        try:
+            preferences = load_preferences(self.ui_path)
+        except LauncherError as error:
+            preferences = dict(DEFAULTS)
+            self.notice.set(error_message(error))
+        self.close_to_tray = tk.BooleanVar(value=preferences["close_to_tray"])
+        self.task_notifications = tk.BooleanVar(value=preferences["notifications"])
+        self.jobs_observation = {}
+        self.jobs_probe_key = None
+        self.jobs_checked_at = 0
+        self.pending_job_selection = None
+        self.observed_service_run = None
+        self.expected_stop = False
         try:
             self.config = load_config(self.path)
         except (LauncherError, LauncherWindowsError) as error:
@@ -206,8 +229,9 @@ class LauncherApp:
         self.log_text.tag_configure("error", foreground="#b42332")
         self.log_text.tag_configure("warning", foreground="#8a5715")
         self.fetch_activity = FetchActivityView(notebook, tk, ttk)
+        self.jobs = JobsView(self)
         notebook.tab(self.fetch_activity.frame, text="Activity")
-        for frame in (self.operations.overview, self.operations.connections, self.fetch_activity.frame,
+        for frame in (self.operations.overview, self.jobs.frame, self.operations.connections, self.fetch_activity.frame,
                       self.operations.environment, self.operations.storage, self.logs_tab):
             notebook.insert("end", frame)
         notebook.select(self.operations.overview)
@@ -255,6 +279,17 @@ class LauncherApp:
         self.startup_check.grid(row=0, column=0, sticky="w")
         self.startup_button = ttk.Button(startup, text="Apply Startup", command=self.apply_startup)
         self.startup_button.grid(row=0, column=1, sticky="e")
+        tray_options = ttk.Frame(self.operations.environment)
+        tray_options.grid(row=4, sticky="ew", pady=(4, 0))
+        tray_options.columnconfigure(1, weight=1)
+        ttk.Checkbutton(tray_options, text="Close window to tray", variable=self.close_to_tray,
+                        command=self.save_tray_preferences).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(tray_options, text="Task notifications", variable=self.task_notifications,
+                        command=self.save_tray_preferences).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.hide_button = ttk.Button(tray_options, text="Hide to Tray", command=self.hide_to_tray)
+        self.hide_button.grid(row=0, column=2, sticky="e")
+        self.tray_status = tk.StringVar(value="Tray disabled" if not enable_tray else "Tray starting")
+        ttk.Label(self.operations.environment, textvariable=self.tray_status, style="Muted.TLabel").grid(row=5, sticky="w", pady=(5, 0))
         ttk.Label(footer, textvariable=self.notice, wraplength=560, style="Error.TLabel").grid(
             row=0, column=0, sticky="ew", padx=(0, 10))
         operation_bar = ttk.Frame(footer, height=24)
@@ -271,7 +306,10 @@ class LauncherApp:
             self.auto_start.set(startup_registration(self.path).enabled())
         except (LauncherError, LauncherWindowsError, OSError) as error:
             self.notice.set(error_message(error))
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.protocol("WM_DELETE_WINDOW", self.request_close)
+        if enable_tray and not self.tray.start(ROOT / "assets" / "launcher-256.png"):
+            self.tray_status.set("Tray unavailable; install requirements-launcher.txt")
+        self.hide_button.configure(state="disabled")
         self.schedule(50, self.refresh)
         self.schedule(100, self.drain)
         self.schedule(1500, self.poll_status)
@@ -286,7 +324,8 @@ class LauncherApp:
 
     def field(self, frame, row, label, name, browse=None, choices=None, editable=False, hath=False):
         ttk = self.ttk
-        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=5)
+        padding = 0 if frame == self.operations.environment_form else 5
+        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=padding)
         if choices is not None:
             widget = ttk.Combobox(frame, textvariable=self.variables[name], values=choices,
                                   state="normal" if editable else "readonly")
@@ -294,13 +333,13 @@ class LauncherApp:
         else:
             widget = ttk.Entry(frame, textvariable=self.variables[name])
             mode = "normal"
-        widget.grid(row=row, column=1, columnspan=1 if browse else 2, sticky="ew", pady=5)
+        widget.grid(row=row, column=1, columnspan=1 if browse else 2, sticky="ew", pady=padding)
         self.form_widgets.append((widget, mode))
         if hath:
             self.hath_widgets.append((widget, mode))
         if browse:
             button = ttk.Button(frame, text="Browse...", command=lambda: self.browse(name, browse))
-            button.grid(row=row, column=2, padx=(8, 0), pady=5)
+            button.grid(row=row, column=2, padx=(8, 0), pady=padding)
             self.form_widgets.append((button, "normal"))
             if hath:
                 self.hath_widgets.append((button, "normal"))
@@ -466,10 +505,124 @@ class LauncherApp:
                         lambda result: self.notice.set("Service already running." if result == "already-running" else "Background start requested."),
                         label="Requesting background start")
 
+    def start_saved(self):
+        if self.busy:
+            return
+        config = self.config
+        self.notice.set("Starting saved profile...")
+        self.submit(lambda: self.controller.start(config),
+                    lambda _: self.notice.set("Background start requested for saved profile."),
+                    label="Starting saved profile")
+
+    def jobs_ready(self):
+        snapshot = self.jobs.snapshot
+        return (not self.busy and self.latest.get("state") in {"running", "external"}
+                and snapshot.get("availability") == "available" and snapshot.get("worker") is True)
+
+    def queue_job(self, *, next_job=False, kind=None):
+        from tkinter import messagebox
+        if not self.jobs_ready():
+            self.notice.set(ERRORS["jobs-unavailable"])
+            return
+        try:
+            steps = [{"kind": kind, "params": {}}] if kind else self.jobs.definition()
+        except LauncherError as error:
+            self.notice.set(error_message(error))
+            return
+        if any(step["kind"] == "backup" for step in steps) and not messagebox.askyesno(
+                "Queue Private Backup", "This backup includes private settings and saved authentication. Keep it private.\n\nQueue this workflow?", parent=self.root):
+            return
+        self.send_job("api/jobs", {"steps": steps, "next": next_job})
+
+    def send_job(self, route, payload):
+        home_url = self.latest.get("home_url", self.config.home_url())
+        def done(result):
+            self.notice.set("Workflow saved." if route.endswith("workflows") else "Job request accepted.")
+            if not route.endswith("workflows"):
+                self.pending_job_selection = result["id"]
+                self.jobs.mode.set("All")
+                self.notebook.select(self.jobs.frame)
+        self.submit(lambda: write_jobs(home_url, route, payload), done, label="Updating Jobs")
+
+    def job_action(self, action):
+        from tkinter import messagebox
+        selected = self.jobs.selected()
+        if not self.jobs_ready() or not selected:
+            return
+        if action == "cancel" and not messagebox.askyesno("Cancel Job", "Cancel this job at the next committed checkpoint? Completed work is retained.", parent=self.root):
+            return
+        self.send_job("api/jobs/action", {"id": selected["id"], "action": action})
+
+    def save_job_workflow(self):
+        from tkinter import messagebox, simpledialog
+        if not self.jobs_ready():
+            return
+        try:
+            steps = self.jobs.definition()
+        except LauncherError as error:
+            self.notice.set(error_message(error))
+            return
+        name = simpledialog.askstring("Save Workflow", "Workflow name", parent=self.root)
+        if name is None:
+            return
+        payload = {"name": name, "steps": steps}
+        existing = next((item for item in self.jobs.snapshot.get("workflows", []) if item["name"].casefold() == name.strip().casefold()), None)
+        if existing:
+            if not messagebox.askyesno("Replace Workflow", "Replace the saved workflow with this name?", parent=self.root):
+                return
+            payload["id"] = existing["id"]
+        self.send_job("api/jobs/workflows", payload)
+
+    def save_tray_preferences(self):
+        try:
+            save_preferences(self.ui_path, close_to_tray=self.close_to_tray.get(), notifications=self.task_notifications.get())
+            self.notice.set("Tray preferences saved.")
+        except LauncherError as error:
+            self.notice.set(error_message(error))
+
+    def show(self, *, jobs=False):
+        self.root.deiconify()
+        self.root.lift()
+        if jobs:
+            self.notebook.select(self.jobs.frame)
+
+    def hide_to_tray(self):
+        if self.tray.available:
+            self.root.withdraw()
+
+    def request_close(self):
+        if self.close_to_tray.get() and self.tray.available:
+            self.hide_to_tray()
+        else:
+            self.close()
+
+    def drain_tray(self):
+        while not self.tray.events.empty():
+            event = self.tray.events.get_nowait()
+            if event == "exit":
+                self.close()
+                return
+            if event == "tray-ended":
+                self.show()
+                self.tray_status.set("Tray unavailable; launcher remains open")
+            elif event in {"show", "jobs"}:
+                self.show(jobs=event == "jobs")
+            elif event == "home":
+                self.open_home()
+            elif event == "start" and not self.busy:
+                self.start_saved()
+            elif event == "stop" and self.latest.get("managed") and not self.busy:
+                self.show()
+                self.stop()
+            elif event.startswith("queue:"):
+                self.show(jobs=True)
+                self.queue_job(kind=event.split(":", 1)[1])
+
     def stop(self):
         from tkinter import messagebox
         if not messagebox.askyesno("Stop Service", "Stop the managed server and its H@H tunnel? Active jobs may be interrupted.", parent=self.root):
             return
+        self.expected_stop = True
         self.notice.set("Stopping service...")
         self.submit(self.controller.stop, lambda _: self.notice.set("Service stopped."), label="Stopping managed service")
 
@@ -502,6 +655,7 @@ class LauncherApp:
         if force_identity:
             self.runtime_checked_at = 0
             self.source_checked_at = 0
+            self.jobs_checked_at = 0
         if self.closed or self.polling:
             return
         self.polling = True
@@ -519,6 +673,12 @@ class LauncherApp:
                                             if status["state"] in {"running", "external"} else {"availability": "offline"})
                 if status["state"] in {"running", "external"}:
                     key = (status.get("managed"), status.get("run_id"), status["home_url"])
+                    interval = 60 if self.jobs_observation.get("availability") == "unsupported" else 1
+                    if not self.jobs_checked_at or key != self.jobs_probe_key or time.monotonic() - self.jobs_checked_at >= interval:
+                        self.jobs_observation = read_jobs(status["home_url"])
+                        self.jobs_probe_key = key
+                        self.jobs_checked_at = time.monotonic()
+                    status["jobs"] = dict(self.jobs_observation)
                     interval = 60 if self.runtime_observation.get("availability") == "unsupported" else 15
                     if not self.runtime_checked_at or key != self.runtime_probe_key or time.monotonic() - self.runtime_checked_at >= interval:
                         self.runtime_observation = read_runtime_identity(status["home_url"])
@@ -526,6 +686,8 @@ class LauncherApp:
                         self.runtime_checked_at = time.monotonic()
                     status["runtime_identity"] = dict(self.runtime_observation)
                 else:
+                    self.jobs_probe_key = None
+                    status["jobs"] = {"availability": "offline"}
                     self.runtime_probe_key = None
                     status["runtime_identity"] = {"availability": "offline"}
                 if not self.source_checked_at or time.monotonic() - self.source_checked_at >= 15:
@@ -547,6 +709,13 @@ class LauncherApp:
     def drain(self):
         if self.closed:
             return
+        self.drain_tray()
+        if self.closed:
+            return
+        available = self.tray.available
+        self.hide_button.configure(state="normal" if available else "disabled")
+        if available:
+            self.tray_status.set("Tray active")
         while not self.results.empty():
             kind, result, callback, error, generation = self.results.get_nowait()
             if kind == "checkup":
@@ -562,12 +731,29 @@ class LauncherApp:
                     self.refresh()
                     continue
                 if result:
+                    run = result.get("run_id")
+                    if result.get("managed") and run and run != self.observed_service_run:
+                        self.observed_service_run = run
+                        self.expected_stop = False
+                    if result.get("state") == "failed" and self.observed_service_run:
+                        if not self.expected_stop and self.task_notifications.get():
+                            self.tray.notify("Managed service failed. Open Launcher for status.")
+                        self.observed_service_run = None
+                    elif result.get("state") == "stopped":
+                        self.observed_service_run = None
+                    if self.jobs_probe_key != getattr(self, "notification_key", self.jobs_probe_key):
+                        self.notifications = Notifications()
+                    self.notification_key = self.jobs_probe_key
+                    for message in self.notifications.observe(result.get("jobs", {})):
+                        if self.task_notifications.get():
+                            self.tray.notify(message)
                     self.latest = result
                 if error:
                     if not self.busy:
                         self.notice.set(error)
                     self.latest = {**self.latest, "state": "checking", "health": "unknown",
                                    "fetch_activity": {"availability": "unavailable"},
+                                   "jobs": {"availability": "unavailable"},
                                    "runtime_identity": {"availability": "unavailable"}}
             else:
                 self.busy = False
@@ -612,6 +798,13 @@ class LauncherApp:
             self.render_logs(status["logs"], external=state == "external")
         if "fetch_activity" in status:
             self.fetch_activity.render(status["fetch_activity"])
+        self.jobs.render(status.get("jobs", {"availability": "unavailable"}))
+        if self.pending_job_selection and self.jobs.table.exists(self.pending_job_selection):
+            self.jobs.table.selection_set(self.pending_job_selection)
+            self.jobs.table.see(self.pending_job_selection)
+            self.jobs.select()
+            self.pending_job_selection = None
+        self.tray.update(status, busy=self.busy, jobs=self.jobs_ready())
         if not self.busy and state == "failed" and status.get("error"):
             self.notice.set(error_message(status["error"]))
 
@@ -644,7 +837,10 @@ class LauncherApp:
             self.log_text.see("end")
 
     def close(self):
+        if self.closed:
+            return
         self.closed = True
+        self.tray.close()
         for timer in self.timers:
             self.root.after_cancel(timer)
         self.timers.clear()
@@ -667,7 +863,7 @@ def main(argv=None):
     import tkinter as tk
     set_taskbar_identity()
     root = tk.Tk()
-    LauncherApp(root, args.config)
+    LauncherApp(root, args.config, enable_tray=True)
     root.mainloop()
     return 0
 

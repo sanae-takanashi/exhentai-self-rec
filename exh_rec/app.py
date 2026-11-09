@@ -23,6 +23,7 @@ from typing import Any
 
 from . import db
 from .runtime_identity import capture_runtime
+from .jobs import JobError, JobHalt, JobQueue
 from .fetch_activity import FetchActivity
 from .fetch_insights import start_listing, finish_listing, known_gallery_urls, fetch_insights
 from .ranking_insights import ranking_insights
@@ -141,6 +142,7 @@ MODEL_RETRAIN_STATE: dict[str, Any] = {
 }
 MODEL_RETRAIN_WAKE = threading.Event()
 MODEL_RETRAIN_RUN_LOCK = threading.Lock()
+JOBS = JobQueue(lambda: db.connect())
 FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
 FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
 FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
@@ -211,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"service": "exh-rec", "status": "ok"})
             elif path == "/api/runtime":
                 self.send_json(dict(RUNTIME_IDENTITY))
+            elif path == "/api/jobs":
+                self.send_json(JOBS.snapshot(), cache_control="no-store")
             elif path == "/api/insights/fetch":
                 with db.connect() as conn:
                     self.send_json(fetch_insights(conn))
@@ -471,7 +475,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
             elif path == "/api/fetch":
                 payload = self.read_json()
-                result = fetch_and_store(
+                params = {"query": payload.get("query"), "include_rated": parse_bool(payload.get("include_rated")),
+                          "filter_text": payload.get("filter_text")}
+                result = JOBS.run_sync([{"kind": "fetch", "params": params}]) if JOBS.worker is not None else fetch_and_store(
                     force_query=payload.get("query"),
                     include_rated=parse_bool(payload.get("include_rated")),
                     filter_text=payload.get("filter_text"),
@@ -479,7 +485,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result)
             elif path == "/api/enrich":
                 payload = self.read_json()
-                result = enrich_recommendations(
+                params = {"include_rated": parse_bool(payload.get("include_rated")), "filter_text": payload.get("filter_text")}
+                if payload.get("limit") is not None:
+                    params["limit"] = bounded_int(payload["limit"], default=20, lower=1, upper=50)
+                result = JOBS.run_sync([{"kind": "enrich", "params": params}]) if JOBS.worker is not None else enrich_recommendations(
                     include_rated=parse_bool(payload.get("include_rated")),
                     filter_text=payload.get("filter_text"),
                     limit=payload.get("limit"),
@@ -783,6 +792,23 @@ class Handler(BaseHTTPRequestHandler):
                     gallery_urls=payload.get("gallery_urls"),
                 )
                 self.send_json(result)
+            elif path in {"/api/jobs", "/api/jobs/action", "/api/jobs/workflows"}:
+                payload = self.read_json()
+                if not JOBS.running:
+                    raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Jobs worker is unavailable")
+                if not isinstance(payload, dict):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "Expected a JSON object")
+                try:
+                    if path == "/api/jobs/action":
+                        result = JOBS.action(payload.get("id"), payload.get("action"))
+                    elif path == "/api/jobs/workflows":
+                        result = JOBS.save_workflow(payload.get("name"), payload.get("steps"), payload.get("id"))
+                    else:
+                        result = JOBS.submit(payload.get("steps"), name=payload.get("name"), source="launcher",
+                                             next_job=payload.get("next", False))
+                except JobError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from None
+                self.send_json({"service": "exh-rec", "schema": 1, "item": result}, status=HTTPStatus.ACCEPTED, cache_control="no-store")
             elif path == "/api/retrain":
                 self.read_json()
                 retrain_status = request_model_retrain()
@@ -822,9 +848,9 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid JSON") from exc
 
-    def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK, *, cache_control: str | None = None) -> None:
         data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        self.send_bytes(data, "application/json; charset=utf-8", status=status)
+        self.send_bytes(data, "application/json; charset=utf-8", status=status, cache_control=cache_control)
 
     def send_bytes(
         self,
@@ -1858,6 +1884,8 @@ def fetch_and_store(
     trigger: str = "manual",
     include_rated: bool = False,
     filter_text: str | None = None,
+    checkpoint=None,
+    defer_retrain=False,
 ) -> dict:
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch is already running")
@@ -1976,6 +2004,8 @@ def fetch_and_store(
                     remaining_extra_pages=max(0, page_limit - pages),
                 )
                 for page_number in range(page_limit):
+                    if checkpoint:
+                        checkpoint("query_page")
                     update_fetch_progress(
                         "fetching query page",
                         stage="fetching_pages",
@@ -2083,6 +2113,8 @@ def fetch_and_store(
                     if cursor_caught_up:
                         break
 
+                if checkpoint:
+                    checkpoint("query_metadata")
                 try:
                     cover_updated = enrich_covers_via_api(cookie, query_galleries, proxy_url=proxy_url, track_progress=True)
                     update_fetch_progress(
@@ -2155,6 +2187,8 @@ def fetch_and_store(
             detail_done=0,
         )
         for detail_index, gallery in enumerate(selected_for_detail, start=1):
+            if checkpoint:
+                checkpoint("detail")
             try:
                 update_fetch_progress(
                     "detail fetch started",
@@ -2212,6 +2246,8 @@ def fetch_and_store(
                     errors=list(errors),
                 )
 
+        if checkpoint:
+            checkpoint("finalizing")
         if fetched == 0 and not errors:
             errors.append(empty_fetch_error(queries))
             update_fetch_progress("fetch returned no galleries", stage="failed", errors=list(errors))
@@ -2219,7 +2255,9 @@ def fetch_and_store(
         status = "failed" if errors and fetched == 0 else "partial" if errors or cursor_incomplete_queries else "success"
         with db.connect() as conn:
             clear_shared_thumbnail_metadata(conn)
-            if enriched:
+            if enriched and defer_retrain:
+                mark_model_retrain_pending(conn)
+            elif enriched:
                 update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
                 retrain_model(conn, release_write_lock=True)
                 model_retrained = True
@@ -2271,6 +2309,14 @@ def fetch_and_store(
             "last_fetch": last_fetch,
             **page,
         }
+    except JobHalt:
+        if run_id is not None:
+            with db.connect() as conn:
+                if enriched:
+                    mark_model_retrain_pending(conn)
+                finish_running_fetch_run(conn, run_id, "failed", fetched, stored, enriched, ["Job stopped at a committed checkpoint"])
+        update_fetch_progress("fetch failed", stage="failed", status="failed", errors=["Job stopped at a committed checkpoint"])
+        raise
     except Exception as exc:
         if run_id is not None:
             errors.append(f"internal: {exc}")
@@ -2290,7 +2336,7 @@ def fetch_and_store(
 
 
 @observe_requests(report_fetch_request)
-def enrich_recommendations(include_rated: bool = False, filter_text: str | None = None, limit: Any = None) -> dict:
+def enrich_recommendations(include_rated: bool = False, filter_text: str | None = None, limit: Any = None, *, checkpoint=None, defer_retrain=False) -> dict:
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
     with db.connect() as conn:
@@ -2347,6 +2393,8 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
         )
 
         for detail_index, gallery in enumerate(candidates, start=1):
+            if checkpoint:
+                checkpoint("detail")
             try:
                 update_fetch_progress(
                     "detail fetch started",
@@ -2404,10 +2452,14 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
                     errors=list(errors),
                 )
 
+        if checkpoint:
+            checkpoint("finalizing")
         status = "failed" if errors and enriched == 0 else "partial" if errors else "success"
         with db.connect() as conn:
             clear_shared_thumbnail_metadata(conn)
-            if enriched:
+            if enriched and defer_retrain:
+                mark_model_retrain_pending(conn)
+            elif enriched:
                 update_fetch_progress("retraining model", stage="retraining", enriched=enriched)
                 retrain_model(conn, release_write_lock=True)
                 model_retrained = True
@@ -2450,6 +2502,14 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             "last_fetch": last_fetch,
             **page,
         }
+    except JobHalt:
+        if run_id is not None:
+            with db.connect() as conn:
+                if enriched:
+                    mark_model_retrain_pending(conn)
+                finish_running_fetch_run(conn, run_id, "failed", 0, 0, enriched, ["Job stopped at a committed checkpoint"])
+        update_fetch_progress("enrichment failed", stage="failed", status="failed", errors=["Job stopped at a committed checkpoint"])
+        raise
     except Exception as exc:
         if run_id is not None:
             errors.append(f"internal: {exc}")
@@ -4610,7 +4670,13 @@ def background_model_retrain(stop: threading.Event) -> None:
             with db.connect() as conn:
                 due, trigger, wait_seconds = model_retrain_due(conn)
             if due and trigger:
-                run_model_retrain(trigger)
+                if JOBS.running:
+                    JOBS.submit([{"kind": "retrain"}], source="model", coalesce=True)
+                    wait_for_model_retrain_wake(stop, 60.0)
+                elif JOBS.worker is None and not stop.is_set():
+                    run_model_retrain(trigger)
+                else:
+                    wait_for_model_retrain_wake(stop, 60.0)
                 continue
             wait_for_model_retrain_wake(stop, min(3600.0, max(1.0, wait_seconds)))
         except ApiError as exc:
@@ -4642,7 +4708,10 @@ def background_refresh(stop: threading.Event) -> None:
                 interval = refresh_interval_minutes(conn)
                 has_cookie = bool(db.get_setting(conn, "cookie_header", ""))
             if enabled and has_cookie:
-                fetch_and_store(trigger="background")
+                if JOBS.running:
+                    JOBS.submit([{"kind": "fetch"}], source="background", coalesce=True)
+                elif JOBS.worker is None and not stop.is_set():
+                    fetch_and_store(trigger="background")
             wait_for_refresh_wake(stop, max(300, interval * 60))
         except Exception as exc:
             print(f"background refresh failed: {exc}")
@@ -4663,6 +4732,24 @@ def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
             REFRESH_STATE["next_check_at"] = None
             return
     REFRESH_STATE["next_check_at"] = None
+
+
+def execute_job(kind, params, context, source):
+    if kind == "fetch":
+        return fetch_and_store(force_query=params.get("query"), trigger="background" if source == "background" else "manual",
+                               include_rated=params.get("include_rated", False), filter_text=params.get("filter_text"),
+                               checkpoint=context.checkpoint, defer_retrain=context.has_later("retrain"))
+    if kind == "enrich":
+        return enrich_recommendations(**params, checkpoint=context.checkpoint, defer_retrain=context.has_later("retrain"))
+    if kind == "retrain":
+        context.checkpoint("retraining")
+        return run_model_retrain("queued" if source == "model" else "manual", force=source != "model")
+    if kind == "backup":
+        from scripts.launcher_ops import backup_sqlite_database
+        context.checkpoint("backup")
+        result = backup_sqlite_database(db.DB_PATH)
+        return {"verified": result["verified"]}
+    raise JobError("Unsupported job kind")
 
 
 def server_display_url(host: str, port: int) -> str:
@@ -4708,6 +4795,7 @@ def main() -> None:
         MODEL_RETRAIN_STATE.update({"last_completed_at": completed_at, "last_error": None})
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop = threading.Event()
+    JOBS.start(execute_job)
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     retrain_worker = threading.Thread(target=background_model_retrain, args=(stop,), daemon=True)
     worker.start()
@@ -4722,6 +4810,7 @@ def main() -> None:
         pass
     finally:
         stop.set()
+        JOBS.shutdown()
         server.server_close()
 
 

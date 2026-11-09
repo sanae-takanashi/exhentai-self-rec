@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .fetch_insights import SCHEMA as FETCH_INSIGHTS_SCHEMA
+from .jobs import SCHEMA as JOBS_SCHEMA
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -423,6 +424,7 @@ def connect() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        conn.executescript(JOBS_SCHEMA)
         ensure_column(conn, "feedback", "score", "INTEGER")
         ensure_column(conn, "feedback", "reason_code", "TEXT")
         ensure_column(conn, "feedback", "surface", "TEXT")

@@ -82,9 +82,12 @@ detects existing instances, and opens the homepage in your default browser.
 Closing the launcher leaves its service running; Stop only controls services
 started by this launcher. Automatic startup is opt-in and runs in the background
 after the current user signs in, not before login. See [LAUNCHER.md](LAUNCHER.md).
-Its six operational tabs cover overview, connections, activity, environment,
-storage and logs. Offline checks, verified private SQLite backups and allowlisted
-diagnostic exports stay separate from the web UI's content workflows.
+Its seven tabs cover overview, jobs, connections, activity, environment,
+storage and logs. Jobs provides a durable single-worker queue, saved workflow
+presets, checkpoint pause/resume/cancel and retryable history. Optional Windows
+tray support adds quick jobs, task notifications and close-to-tray behavior.
+Install `requirements-launcher.txt` in the UI's Python environment for the tray.
+Offline maintenance stays available separately; gallery review remains in the web UI.
 
 ## H@H observer
 

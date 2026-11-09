@@ -447,6 +447,9 @@ class LauncherTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "Windows launcher")
 class LauncherUITests(unittest.TestCase):
     def setUp(self):
+        jobs_probe = patch("scripts.launcher.read_jobs", return_value={"availability": "unsupported"})
+        jobs_probe.start()
+        self.addCleanup(jobs_probe.stop)
         import tkinter as tk
         from scripts.launcher import LauncherApp
         parent = os.environ.get("EXH_LAUNCHER_TEST_ROOT")
@@ -602,7 +605,7 @@ class LauncherUITests(unittest.TestCase):
 
     def test_operational_tabs_have_no_content_actions_and_work_offline(self):
         self.assertEqual([self.app.notebook.tab(tab, "text") for tab in self.app.notebook.tabs()],
-                         ["Overview", "Connections", "Activity", "Environment", "Storage", "Logs"])
+                         ["Overview", "Jobs", "Connections", "Activity", "Environment", "Storage", "Logs"])
         self.app.render_status({"state": "stopped", "managed": False, "health": "stopped"})
         view = self.app.operations
         self.assertEqual(view.overview_values["health"].get(), "Offline")

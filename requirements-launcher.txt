@@ -1,0 +1,3 @@
+# Optional Windows tray support; the native launcher works without these.
+Pillow>=10,<13
+pystray>=0.19.5,<0.20
