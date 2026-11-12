@@ -79,6 +79,7 @@ function fixture(view = "review") {
   vm.runInContext(`
     api = fixtureApi;
     globalThis.fixtureRecordPageImpressions = recordPageImpressions;
+    globalThis.fixtureRefreshQueueCounts = refreshQueueCounts;
     refreshQueueCounts = () => {};
     recordPageImpressions = () => {};
     queueVisualEmbedding = () => {};
@@ -283,6 +284,106 @@ function focusFixture(view = "review") {
 const undoResponse = (id = 7) => ({
   ok: true, removed_gallery_url: items[0].url,
   feedback_undo_supported: true, feedback_update: { latest_feedback_id: id },
+});
+
+for (const view of ["review", "low-interest"]) {
+  for (const layout of ["focus", "grid"]) {
+    test(`${view} ${layout}: committed feedback updates the count immediately and undo restores it`, async () => {
+      const f = focusFixture(view);
+      const selector = view === "review" ? "#reviewQueueCount" : "#lowInterestQueueCount";
+      f.context.countSelector = selector;
+      f.run(`setReviewLayout("${layout}"); renderQueueCounts({ review: 1234, low_interest: 1234 });`);
+      const saving = f.run('score(fixtureItems[0].url, 1)');
+      assert.equal(f.run('document.querySelector(countSelector).textContent'), "1,234");
+      f.respond(0, undoResponse());
+      await saving;
+      assert.equal(f.run('document.querySelector(countSelector).textContent'), "1,233");
+      await f.run('applyFeedbackResult({ removed_gallery_url: fixtureItems[0].url }, fixtureItems[0].url)');
+      assert.equal(f.run('document.querySelector(countSelector).textContent'), "1,233", "duplicate removal decremented twice");
+      if (layout === "focus") {
+        const undo = f.run('undoReviewRating()');
+        f.respond(1, { ok: true });
+        await undo;
+        assert.equal(f.run('document.querySelector(countSelector).textContent'), "1,234");
+      }
+    });
+  }
+
+  test(`${view}: failed feedback leaves counts unchanged and local filtering does not replace the global total`, async () => {
+    const f = focusFixture(view);
+    f.context.countSelector = view === "review" ? "#reviewQueueCount" : "#lowInterestQueueCount";
+    f.run('renderQueueCounts({ review: 100, low_interest: 100 }); localFilterEl.value = "fixture";');
+    f.run('updateCurrentQueueCount({ total: 2 })');
+    const saving = f.run('score(fixtureItems[0].url, 1)');
+    f.requests[0].reject(new Error("Fixture rejection"));
+    await assert.rejects(saving);
+    assert.equal(f.run('document.querySelector(countSelector).textContent'), "100");
+    await f.run('applyFeedbackResult({ removed_gallery_url: fixtureItems[0].url }, fixtureItems[0].url)');
+    assert.equal(f.run('document.querySelector(countSelector).textContent'), "99");
+  });
+}
+
+test("queue counts: an old response cannot overwrite committed feedback; refreshes coalesce", async () => {
+  const f = focusFixture();
+  f.run('refreshQueueCounts = fixtureRefreshQueueCounts; renderQueueCounts({ review: 10 });');
+  const old = f.run('loadQueueCounts()');
+  assert.equal(f.requests[0].options.cache, "no-store");
+  const saving = f.run('score(fixtureItems[0].url, 5)');
+  f.respond(1, undoResponse());
+  await saving;
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "9");
+  f.run('refreshQueueCounts(); refreshQueueCounts();');
+  assert.equal(f.requests.length, 2);
+  f.respond(0, { review: 10 });
+  await old;
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "9", "stale response restored pre-feedback count");
+  assert.equal(f.requests.length, 3);
+  f.respond(2, { review: 8 });
+  await f.run('queueCountsPromise');
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "8", "fresh count did not reconcile membership changes");
+});
+
+test("queue counts: a newer page total wins over an older background count", async () => {
+  const f = focusFixture();
+  const old = f.run('loadQueueCounts()');
+  f.run('updateCurrentQueueCount({ total: 7 })');
+  f.respond(0, { review: 10 });
+  await old;
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "7");
+  f.respond(1, { review: 7 });
+  await f.run('queueCountsPromise');
+});
+
+test("queue counts: statistics received before a mutation acknowledgement cannot double-count its removal", async () => {
+  const f = focusFixture();
+  f.run('refreshQueueCounts = fixtureRefreshQueueCounts; renderQueueCounts({ review: 10 });');
+  const old = f.run('loadQueueCounts()');
+  const saving = f.run('score(fixtureItems[0].url, 5)');
+  f.respond(0, { review: 9 });
+  await old;
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "10");
+  f.respond(1, undoResponse());
+  await saving;
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "9");
+  f.respond(2, { review: 9 });
+  await f.run('queueCountsPromise');
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "9");
+});
+
+test("queue counts: a stalled read times out and a queued refresh remains retryable", async () => {
+  const f = focusFixture();
+  useManualDeadline(f);
+  f.run('refreshQueueCounts = fixtureRefreshQueueCounts; renderQueueCounts({ review: 10 });');
+  const old = f.run('loadQueueCounts()');
+  assert.equal(f.run('fixtureDeadlineMs'), 10000);
+  f.run('refreshQueueCounts(); fixtureDeadline();');
+  await old;
+  assert.equal(f.requests[0].options.signal.aborted, true);
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "10");
+  f.respond(1, { review: 9 });
+  await f.run('queueCountsPromise');
+  assert.equal(f.run('queueCountsPromise'), null);
+  assert.equal(f.run('reviewQueueCountEl.textContent'), "9");
 });
 
 test("Focus: navigation does not label; mode changes preserve the selected URL", async () => {

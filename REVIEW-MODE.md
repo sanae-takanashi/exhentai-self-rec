@@ -46,6 +46,12 @@ not inject or install it, and the script does not submit downloads or feedback.
   Pending operations disable navigation and prevent duplicate submissions.
   The existing request-generation guards remain in force across mode/view
   switches, list requests, feedback and undo.
+- Review and Low Interest badges immediately subtract a successfully removed
+  loaded candidate and add it back after successful undo, without waiting for
+  background statistics. Failed actions do not change the count. Uncached,
+  timeout-bounded statistics reconcile the full totals; older responses cannot
+  overwrite a newer local count or page total. Visible tabs also refresh counts
+  every ten seconds and when returning from a hidden tab, without reloading cards.
 - Keys 1-5 rate, A/D thumb down/up, S skips, O activates the normal gallery link,
   J/K (or left/right) navigate next/previous, and Z undoes the last rating.
   Q/W cycle the previous/next reason, including the empty option, without moving

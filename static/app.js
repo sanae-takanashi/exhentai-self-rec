@@ -119,6 +119,8 @@ let nextRecommendationOffset = 0;
 let hasMoreRecommendations = false;
 let queueCountsPromise = null;
 let queueCountsRefreshQueued = false;
+let queueCountsRevision = 0;
+const queueCountValues = new Map();
 let hathStatusPromise = null;
 let hathStatusPayload = null;
 let hathPackStatusPromise = null;
@@ -340,6 +342,7 @@ async function undoReviewRating() {
       return;
     }
     reviewUndo = null;
+    if (!renderedGalleryUrls.includes(undo.item.url)) adjustReviewQueueCount(undo.view, 1);
     renderedGalleryItems = renderedGalleryItems.filter((item) => item.url !== undo.item.url);
     renderedGalleryItems.splice(Math.min(undo.index, renderedGalleryItems.length), 0, undo.item);
     ++nextRecommendationOffset;
@@ -976,8 +979,18 @@ function renderQueueCount(element, value, label) {
     return;
   }
   const count = Math.max(0, Number(value));
+  queueCountValues.set(element, count);
+  ++queueCountsRevision;
   element.textContent = count.toLocaleString();
   element.title = `${count.toLocaleString()} ${label} need review`;
+}
+
+function adjustReviewQueueCount(view, delta) {
+  if (!isReviewView(view)) return;
+  const element = view === "review" ? reviewQueueCountEl : lowInterestQueueCountEl;
+  const count = queueCountValues.get(element);
+  if (!Number.isFinite(count)) return;
+  renderQueueCount(element, count + delta, view === "review" ? "galleries" : "low-interest galleries");
 }
 
 function renderQueueCounts(payload) {
@@ -1039,13 +1052,23 @@ function loadQueueCounts() {
   if (queueCountsPromise) {
     return queueCountsPromise;
   }
-  queueCountsPromise = api("/api/queue-counts")
+  const revision = queueCountsRevision;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  queueCountsPromise = api("/api/queue-counts", { signal: controller.signal, cache: "no-store" })
     .then((payload) => {
+      // A count can already include a commit whose feedback response is still pending.
+      if (controller.signal.aborted || pendingFeedbackUrls.size || reviewUndoPending) return null;
+      if (revision !== queueCountsRevision) {
+        queueCountsRefreshQueued = true;
+        return null;
+      }
       renderQueueCounts(payload);
       return payload;
     })
     .catch(() => null)
     .finally(() => {
+      clearTimeout(timeout);
       queueCountsPromise = null;
       if (queueCountsRefreshQueued) {
         queueCountsRefreshQueued = false;
@@ -1056,6 +1079,7 @@ function loadQueueCounts() {
 }
 
 function refreshQueueCounts() {
+  ++queueCountsRevision;
   if (queueCountsPromise) {
     queueCountsRefreshQueued = true;
     return queueCountsPromise;
@@ -2466,6 +2490,7 @@ async function applyFeedbackResult(payload, galleryUrl, requestedView = currentV
     }
     renderedGalleryUrls = renderedGalleryUrls.filter((url) => url !== removedUrl);
     if (removedIndex >= 0) {
+      adjustReviewQueueCount(requestedView, -1);
       nextRecommendationOffset = Math.max(0, nextRecommendationOffset - 1);
       if (isReviewView()) reviewPaginationDirty = true;
     }
@@ -4088,7 +4113,12 @@ loadSettings()
 
 setInterval(() => {
   loadStatus().catch(() => {});
+  if (!initialPageLoading && document.visibilityState !== "hidden") loadQueueCounts();
   if (currentView === "hath") {
     loadHathStatus({ announce: false }).catch(() => {});
   }
 }, 10000);
+
+document.addEventListener("visibilitychange", () => {
+  if (!initialPageLoading && document.visibilityState === "visible") loadQueueCounts();
+});

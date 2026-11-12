@@ -21,6 +21,11 @@ async function scenario(viewport, view = "review") {
   await context.addInitScript(() => {
     sessionStorage.setItem("review-layout", "focus");
     sessionStorage.setItem("review-current", "https://example.test/g/b/token/");
+    const schedule = window.setInterval.bind(window);
+    window.setInterval = (callback, ms, ...args) => {
+      if (ms === 10000) window.fixtureQueuePoll = callback;
+      return schedule(callback, ms, ...args);
+    };
   });
   const page = await context.newPage();
   const raster = await page.evaluate(() => {
@@ -52,7 +57,7 @@ async function scenario(viewport, view = "review") {
   let delivery, feedbackRoute, feedbackCalls = 0, undoCalls = 0, listCalls = 0;
   let ratingMode = "failure", undoMode = "failure";
   let classificationMode = "failure", classificationRoute, classificationCalls = 0, markCalls = 0;
-  let lastRating, holdCounts = false, countRoute;
+  let lastRating, holdCounts = false, countRoute, countCalls = 0;
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
   page.on("pageerror", (error) => errors.push(error.message));
   await context.route("**/*", async (route) => {
@@ -121,6 +126,7 @@ async function scenario(viewport, view = "review") {
       return json(route, { ok: true, removed_gallery_url: body.gallery_url });
     }
     if (pathname === "/api/queue-counts") {
+      countCalls++;
       if (holdCounts) { countRoute = route; return; }
       return json(route, { review: items.length - removed.size });
     }
@@ -181,6 +187,17 @@ async function scenario(viewport, view = "review") {
     assert(await first.isDisabled());
     assert.equal(listCalls, 1, "back to first reloaded the queue");
     assert.equal(feedbackCalls, 0, "back to first submitted feedback");
+    await page.evaluate(() => loadQueueCounts());
+    const beforePollCounts = countCalls;
+    await page.evaluate(() => window.fixtureQueuePoll());
+    await until(() => countCalls > beforePollCounts);
+    await page.evaluate(() => queueCountsPromise);
+    assert.equal(listCalls, 1, "background count polling replaced the queue");
+    const beforeVisibleCounts = countCalls;
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+    await until(() => countCalls > beforeVisibleCounts);
+    await page.evaluate(() => queueCountsPromise);
+    assert.equal(listCalls, 1, "returning to a visible tab replaced the queue");
     await page.locator(".thumb img").waitFor();
     await page.waitForFunction(() => document.querySelector(".thumb img")?.naturalWidth > 0);
     const popupPromise = page.waitForEvent("popup");
@@ -378,6 +395,8 @@ async function scenario(viewport, view = "review") {
     await json(classificationRoute, { ok: true, gallery_url: items[1].url, classification: "updates" });
     await page.waitForFunction((url) => document.querySelector(".focus-card")?.dataset.galleryUrl === url, items[2].url);
     await until(() => countRoute);
+    const queueBadge = page.locator(view === "review" ? "#reviewQueueCount" : "#lowInterestQueueCount");
+    assert.equal(await queueBadge.innerText(), "1", "committed classification waited for background counts");
     assert(await page.locator('[data-score="5"]').isEnabled(), "classification waits for background counts");
     assert.equal(listCalls, beforeMoveLists, "classification unexpectedly rebuilt the queue");
     await page.locator('[data-mark="ban"]').click();
