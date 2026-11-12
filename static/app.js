@@ -206,6 +206,7 @@ function updateReviewControls() {
   document.querySelector("#reviewTrialRanking").checked = reviewRankingMode === "personalized_trial";
   const index = renderedGalleryItems.findIndex((item) => item.url === reviewCurrentUrl);
   document.querySelector("#reviewPosition").textContent = `${index < 0 ? 0 : index + 1} / ${renderedGalleryItems.length}`;
+  document.querySelector("#reviewFirstBtn").disabled = reviewBusy() || index <= 0;
   document.querySelector("#reviewPrevBtn").disabled = reviewBusy() || index <= 0;
   document.querySelector("#reviewNextBtn").disabled = reviewBusy() || (index >= renderedGalleryItems.length - 1 && !hasMoreRecommendations && !reviewPaginationDirty);
   document.querySelector("#reviewUndoBtn").disabled = reviewBusy() || !reviewUndo;
@@ -282,6 +283,14 @@ function setReviewLayout(layout) {
   }
   reviewLayout = layout === "focus" ? "focus" : "grid";
   saveReviewPosition();
+  renderGalleryCards(renderedGalleryItems);
+}
+
+function navigateReviewToFirst() {
+  if (!isFocusReview() || reviewBusy() || !renderedGalleryItems.length) return;
+  const firstUrl = renderedGalleryItems[0].url;
+  if (reviewCurrentUrl === firstUrl) return;
+  reviewCurrentUrl = firstUrl;
   renderGalleryCards(renderedGalleryItems);
 }
 
@@ -4020,6 +4029,7 @@ for (const input of document.querySelectorAll("input[name='reviewRanking']")) {
     input.blur();
   });
 }
+document.querySelector("#reviewFirstBtn").addEventListener("click", navigateReviewToFirst);
 document.querySelector("#reviewPrevBtn").addEventListener("click", () => navigateReview(-1).catch((error) => setStatus(error.message, true)));
 document.querySelector("#reviewNextBtn").addEventListener("click", () => navigateReview(1).catch((error) => setStatus(error.message, true)));
 document.querySelector("#reviewUndoBtn").addEventListener("click", () => undoReviewRating().catch((error) => setStatus(error.message, true)));

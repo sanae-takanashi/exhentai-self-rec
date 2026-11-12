@@ -18,7 +18,10 @@ async function until(check) {
 
 async function scenario(viewport, view = "review") {
   const context = await browser.newContext({ viewport });
-  await context.addInitScript(() => sessionStorage.setItem("review-layout", "focus"));
+  await context.addInitScript(() => {
+    sessionStorage.setItem("review-layout", "focus");
+    sessionStorage.setItem("review-current", "https://example.test/g/b/token/");
+  });
   const page = await context.newPage();
   const raster = await page.evaluate(() => {
     const canvas = document.createElement("canvas");
@@ -133,7 +136,17 @@ async function scenario(viewport, view = "review") {
     assert(await page.locator("#reviewModeControls").isVisible());
     if (view === "low-interest") assert.equal(await page.locator("#reviewRankingSwitch").isVisible(), false);
     const current = () => page.locator(".focus-card").getAttribute("data-gallery-url");
+    const first = page.getByRole("button", { name: "Back to first gallery", exact: true });
+    if (view === "review") {
+      assert.equal(await current(), items[1].url, "saved URL did not resume after the inserted candidate");
+      assert.equal(await page.locator("#reviewPosition").innerText(), "2 / 3");
+      assert(await first.isEnabled());
+      await first.click();
+    }
     assert.equal(await current(), items[0].url);
+    assert(await first.isDisabled());
+    assert.equal(await page.locator("#reviewPosition").innerText(), "1 / 3");
+    assert.equal(await page.evaluate(() => sessionStorage.getItem("review-current")), items[0].url);
     assert.equal(await page.locator(".focus-card").count(), 1);
     const cover = page.locator("a.thumb");
     assert.equal(await cover.getAttribute("target"), "_blank");
@@ -162,7 +175,12 @@ async function scenario(viewport, view = "review") {
     await until(() => visible.length);
     assert.equal(visible[0].request_id, "synthetic-1");
     assert.deepEqual(visible.flatMap((event) => event.items.map((item) => item.gallery_url)), [items[1].url]);
-    await page.locator("#reviewPrevBtn").click();
+    assert(await first.isEnabled());
+    await first.click();
+    assert.equal(await current(), items[0].url);
+    assert(await first.isDisabled());
+    assert.equal(listCalls, 1, "back to first reloaded the queue");
+    assert.equal(feedbackCalls, 0, "back to first submitted feedback");
     await page.locator(".thumb img").waitFor();
     await page.waitForFunction(() => document.querySelector(".thumb img")?.naturalWidth > 0);
     const popupPromise = page.waitForEvent("popup");
@@ -301,6 +319,10 @@ async function scenario(viewport, view = "review") {
     assert.equal(listCalls, 1);
     await page.evaluate(() => window.scrollTo(0, 0));
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    for (const control of await page.locator("#reviewSessionToolbar > *").all()) {
+      const box = await control.boundingBox();
+      assert(box.x >= 0 && box.x + box.width <= viewport.width, "Focus navigation overflows the viewport");
+    }
     const bounds = await page.locator(".focus-rating").boundingBox();
     const scrollingFocus = viewport.width <= 820 && viewport.height <= 650;
     assert(bounds.y >= 0);
@@ -377,6 +399,7 @@ async function scenario(viewport, view = "review") {
     assert.equal(external.length, 1);
     assert.deepEqual(errors, []);
     assert.match(await page.locator("#recommendations .hint").innerText(), view === "review" ? /Review complete/ : /low-interest band/);
+    assert(await first.isDisabled(), "empty queue must disable back to first");
     assert.equal(lastRating.surface, view);
     return { view, viewport, feedbackCalls, undoCalls, classificationCalls, markCalls, visibleEvents: visible.length, passed: true };
   } finally {

@@ -296,6 +296,62 @@ test("Focus: navigation does not label; mode changes preserve the selected URL",
   assert.equal(f.run('recommendationsEl.children[0].dataset.galleryUrl'), items[1].url);
 });
 
+for (const view of ["review", "low-interest"]) {
+  test(`${view} Focus: back to first resets a restored position without changing the queue or undo`, () => {
+    const f = focusFixture(view);
+    f.run(`
+      globalThis.savedPosition = {};
+      globalThis.sessionStorage = { setItem(key, value) { savedPosition[key] = value; } };
+      reviewCurrentUrl = fixtureItems[1].url;
+      reviewUndo = { feedbackId: 42 };
+      reviewPaginationDirty = true;
+      hasMoreRecommendations = true;
+      renderGalleryCards([{ ...fixtureItems[0], url: "https://example.test/g/inserted/token/" }, ...fixtureItems]);
+    `);
+    const before = f.urls();
+    assert.equal(f.run('document.querySelector("#reviewPosition").textContent'), "3 / 3");
+    assert.equal(f.run('document.querySelector("#reviewFirstBtn").disabled'), false);
+    f.run('navigateReviewToFirst()');
+    assert.equal(f.run('reviewCurrentUrl'), before[0]);
+    assert.equal(f.run('savedPosition["review-current"]'), before[0]);
+    assert.equal(f.run('document.querySelector("#reviewPosition").textContent'), "1 / 3");
+    assert.equal(f.run('document.querySelector("#reviewFirstBtn").disabled'), true);
+    assert.equal(f.run('reviewUndo.feedbackId'), 42);
+    assert.equal(f.run('nextRecommendationOffset'), 2);
+    assert.equal(f.run('reviewPaginationDirty && hasMoreRecommendations'), true);
+    assert.deepEqual(f.urls(), before);
+    assert.equal(f.requests.length, 0);
+    f.run('setReviewLayout("grid"); setReviewLayout("focus"); navigateReviewToFirst();');
+    assert.equal(f.run('reviewCurrentUrl'), before[0]);
+    assert.equal(f.requests.length, 0);
+  });
+
+  test(`${view} Focus: back to first respects busy, empty and inactive layout guards`, () => {
+    const f = focusFixture(view);
+    for (const [start, finish] of [
+      ['reviewLoading = true', 'reviewLoading = false'],
+      ['reviewRankingPending = true', 'reviewRankingPending = false'],
+      ['reviewUndoPending = true', 'reviewUndoPending = false'],
+      ['pendingFeedbackUrls.add(fixtureItems[0].url)', 'pendingFeedbackUrls.clear()'],
+      ['pendingGalleryRefreshUrls.add(fixtureItems[0].url)', 'pendingGalleryRefreshUrls.clear()'],
+    ]) {
+      f.run(`reviewCurrentUrl = fixtureItems[1].url; ${start}; updateReviewControls();`);
+      assert.equal(f.run('document.querySelector("#reviewFirstBtn").disabled'), true);
+      f.run('navigateReviewToFirst()');
+      assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+      f.run(finish);
+    }
+    f.run('setReviewLayout("grid"); navigateReviewToFirst();');
+    assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+    f.run('setReviewLayout("focus"); currentView = "history"; navigateReviewToFirst();');
+    assert.equal(f.run('reviewCurrentUrl'), items[1].url);
+    f.run('currentView = fixtureView; renderGalleryCards([]); navigateReviewToFirst();');
+    assert.equal(f.run('reviewCurrentUrl'), "");
+    assert.equal(f.run('document.querySelector("#reviewFirstBtn").disabled'), true);
+    assert.equal(f.requests.length, 0);
+  });
+}
+
 test("Focus: pending rating blocks duplicate actions and navigation; success advances once", async () => {
   const f = focusFixture();
   const first = f.run('score(fixtureItems[0].url, 5)');

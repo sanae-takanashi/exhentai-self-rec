@@ -37,6 +37,10 @@ not inject or install it, and the script does not submit downloads or feedback.
 - Previous / Next navigate the loaded queue without submitting feedback.
   Navigation never opens the external site. More candidates can be loaded at
   the queue boundary. Duplicate URLs are not appended.
+- Back to first gallery jumps to the first loaded candidate, including when a
+  saved URL resumes after newly inserted candidates. It preserves queue order,
+  pagination and rating undo, saves the new position, and does not fetch or rate.
+  The control is disabled at the first item, on an empty queue, or while busy.
 - A successful score, thumb vote or Skip removes the current item and shows
   its successor; a failure leaves it in place with controls enabled for retry.
   Pending operations disable navigation and prevent duplicate submissions.
