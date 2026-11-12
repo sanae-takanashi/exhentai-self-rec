@@ -61,6 +61,7 @@ EVALUATION_PATH = Path(
 )
 _MODEL_CACHE: dict[str, Any] = {}
 _MODEL_LOCK = threading.RLock()
+_SNAPSHOT_LOCK = threading.Lock()
 
 
 class PersonalizedModelUnavailable(RuntimeError):
@@ -850,7 +851,10 @@ def train_personalized_model(
     with _MODEL_LOCK:
         examples = training_examples(conn, strict_temporal=strict_temporal)
         signature = model_data_signature(conn, examples)
-        return _train_personalized_model(conn, persist=persist, examples=examples, signature=signature)
+        artifact = _train_personalized_model(conn, persist=persist, examples=examples, signature=signature)
+    # Never acquire the SQLite writer while owning the training lock.
+    _record_training_run(conn, artifact)
+    return artifact
 
 
 def _train_personalized_model(
@@ -870,7 +874,7 @@ def _train_personalized_model(
     }
     if len(examples) < MIN_LABELED or min(positives, negatives) < MIN_CLASS:
         status = {**base, "ready": False, "status": "insufficient-data"}
-        _MODEL_CACHE[signature] = status
+        _cache_model(status)
         return status
     try:
         modules = sklearn_modules()
@@ -938,16 +942,12 @@ def _train_personalized_model(
             "metadata_support": fitted["metadata_support"],
             "multi_interest_enabled": False,
         }
-        _MODEL_CACHE.clear()
-        _MODEL_CACHE[signature] = artifact
         if persist and _is_file_database(conn):
             _atomic_dump(artifact, modules)
-        _record_training_run(conn, artifact)
+        _cache_model(artifact)
         return artifact
     except Exception as exc:
         status = {**base, "ready": False, "status": "failed", "error": str(exc)}
-        _MODEL_CACHE[signature] = status
-        _record_training_run(conn, status)
         return status
 
 
@@ -957,39 +957,82 @@ def _is_file_database(conn: sqlite3.Connection) -> bool:
 
 
 def _atomic_dump(artifact: dict, modules: dict[str, Any]) -> None:
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(prefix="personalized-", suffix=".joblib", dir=MODEL_PATH.parent)
+    # Preserve the active legacy artifact before replacing the compatibility file.
+    previous = _read_model_file(MODEL_PATH, modules)
+    if previous and previous.get("schema") == MODEL_SCHEMA and previous.get("signature"):
+        previous_path = _versioned_model_path(str(previous["signature"]))
+        if not previous_path.exists():
+            _dump_model_file(previous, modules, previous_path)
+    _dump_model_file(artifact, modules, _versioned_model_path(str(artifact["signature"])))
+    _dump_model_file(artifact, modules, MODEL_PATH)
+
+
+def _versioned_model_path(signature: str) -> Path:
+    name = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+    return MODEL_PATH.with_name(MODEL_PATH.stem + "-versions") / (name + ".joblib")
+
+
+def _dump_model_file(artifact: dict, modules: dict[str, Any], target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix="personalized-", suffix=".joblib", dir=target.parent)
     os.close(handle)
+    # Interrupted candidates are retained for recovery, never loaded as a version.
+    modules["joblib"].dump(artifact, temporary, compress=3)
+    os.replace(temporary, target)
+
+
+def _read_model_file(path: Path, modules: dict | None = None) -> dict | None:
     try:
-        modules["joblib"].dump(artifact, temporary, compress=3)
-        os.replace(temporary, MODEL_PATH)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if path.exists():
+            artifact = (modules or sklearn_modules())["joblib"].load(path)
+            return artifact if isinstance(artifact, dict) else None
+    except Exception:
+        pass
+    return None
+
+
+def _cache_model(artifact: dict) -> None:
+    with _SNAPSHOT_LOCK:
+        _MODEL_CACHE[artifact["signature"]] = artifact
+        while len(_MODEL_CACHE) > 2:
+            _MODEL_CACHE.pop(next(iter(_MODEL_CACHE)))
+
+
+def _matching_model(signature: str, file_database: bool) -> dict | None:
+    with _SNAPSHOT_LOCK:
+        artifact = _MODEL_CACHE.get(signature)
+    if artifact is None and file_database:
+        for path in (_versioned_model_path(signature), MODEL_PATH):
+            candidate = _read_model_file(path)
+            if candidate and candidate.get("schema") == MODEL_SCHEMA and candidate.get("signature") == signature:
+                artifact = candidate
+                _cache_model(artifact)
+                break
+    if artifact is None:
+        return None
+    snapshot = dict(artifact)
+    return _refresh_acceptance(snapshot) if file_database and snapshot.get("ready") else snapshot
 
 
 def _record_training_run(conn: sqlite3.Connection, artifact: dict) -> None:
-    try:
-        conn.execute(
-            """
-            INSERT INTO model_training_runs(
-                model_version, status, sample_count, positive_count, negative_count,
-                selected_c, metrics_json, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact.get("model_version") or f"{MODEL_SCHEMA}-{artifact.get('signature', 'unknown')}",
-                artifact.get("status") or "unknown",
-                int(artifact.get("sample_count") or 0),
-                int(artifact.get("positive_count") or 0),
-                int(artifact.get("negative_count") or 0),
-                artifact.get("selected_c"),
-                json.dumps({"validation": artifact.get("validation", [])}, ensure_ascii=True),
-                artifact.get("error"),
-            ),
-        )
-    except sqlite3.OperationalError:
-        pass
+    conn.execute(
+        """
+        INSERT INTO model_training_runs(
+            model_version, status, sample_count, positive_count, negative_count,
+            selected_c, metrics_json, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            artifact.get("model_version") or f"{MODEL_SCHEMA}-{artifact.get('signature', 'unknown')}",
+            artifact.get("status") or "unknown",
+            int(artifact.get("sample_count") or 0),
+            int(artifact.get("positive_count") or 0),
+            int(artifact.get("negative_count") or 0),
+            artifact.get("selected_c"),
+            json.dumps({"validation": artifact.get("validation", [])}, ensure_ascii=True),
+            artifact.get("error"),
+        ),
+    )
 
 
 def _refresh_acceptance(artifact: dict) -> dict:
@@ -1006,63 +1049,35 @@ def load_personalized_model(
     train_if_needed: bool = True,
     allow_stale: bool = False,
 ) -> dict:
-    if allow_stale and _is_file_database(conn) and MODEL_PATH.exists():
+    file_database = _is_file_database(conn)
+    if allow_stale and file_database:
         active_row = conn.execute(
             "SELECT value FROM settings WHERE key = 'model_retrain_active_signature'"
         ).fetchone()
         active_signature = str(active_row[0] or "") if active_row else ""
         if active_signature:
-            try:
-                modules = sklearn_modules()
-                artifact = modules["joblib"].load(MODEL_PATH)
-                if (
-                    artifact.get("schema") == MODEL_SCHEMA
-                    and artifact.get("ready")
-                    and artifact.get("signature") == active_signature
-                ):
-                    return _refresh_acceptance(artifact)
-            except Exception:
-                pass
+            artifact = _matching_model(active_signature, file_database)
+            if artifact is not None:
+                return artifact
+        if not train_if_needed:
+            return {"ready": False, "status": "missing", "signature": active_signature}
+    # Read-only callers never wait for numerical training or start it themselves.
+    examples = training_examples(conn)
+    signature = model_data_signature(conn, examples)
+    artifact = _matching_model(signature, file_database)
+    if artifact is not None:
+        return artifact
+    if not train_if_needed:
+        return {"ready": False, "status": "missing", "signature": signature}
     with _MODEL_LOCK:
         examples = training_examples(conn)
         signature = model_data_signature(conn, examples)
-        cached = _MODEL_CACHE.get(signature)
-        if cached is not None:
-            if _is_file_database(conn) and cached.get("ready"):
-                _refresh_acceptance(cached)
-            return cached
-        if _is_file_database(conn) and MODEL_PATH.exists():
-            try:
-                modules = sklearn_modules()
-                artifact = modules["joblib"].load(MODEL_PATH)
-                if artifact.get("schema") == MODEL_SCHEMA and artifact.get("signature") == signature:
-                    _refresh_acceptance(artifact)
-                    _MODEL_CACHE[signature] = artifact
-                    return artifact
-                active_row = conn.execute(
-                    "SELECT value FROM settings WHERE key = 'model_retrain_active_signature'"
-                ).fetchone()
-                active_signature = str(active_row[0] or "") if active_row else ""
-                if (
-                    allow_stale
-                    and artifact.get("schema") == MODEL_SCHEMA
-                    and artifact.get("ready")
-                    and artifact.get("signature") == active_signature
-                ):
-                    stale = dict(artifact)
-                    stale["stale"] = True
-                    stale["pending_signature"] = signature
-                    return _refresh_acceptance(stale)
-            except Exception:
-                pass
-        if train_if_needed:
-            return _train_personalized_model(
-                conn,
-                persist=True,
-                examples=examples,
-                signature=signature,
-            )
-        return {"ready": False, "status": "missing", "signature": signature}
+        artifact = _matching_model(signature, file_database)
+        if artifact is not None:
+            return artifact
+        artifact = _train_personalized_model(conn, persist=True, examples=examples, signature=signature)
+    _record_training_run(conn, artifact)
+    return artifact
 
 
 def score_personalized_galleries(

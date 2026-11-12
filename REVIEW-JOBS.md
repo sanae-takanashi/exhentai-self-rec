@@ -23,11 +23,41 @@ commit together before the worker is woken; duplicate events do not enqueue
 another change. Download exclusion is immediate, while learned weights update
 when the queued training completes.
 
+Copying a previous continuing-gallery rating also commits the copied feedback
+and pending change together before waking the worker. It never retrains inline.
+Feedback and undo received during training remain in the next pending batch.
+
 Runtime retraining commits caller writes before waiting for the model lock.
 Feature calculation uses a read snapshot, followed by a short atomic weight
 replacement; expensive personalized training does not own a SQLite writer.
 Settled Review/count requests avoid redundant membership/audit writes and
 commit any necessary changes before sending the HTTP response.
+
+Serving scores and `GET /api/model` never acquire the numerical training lock
+or start personalized training. They use the database-confirmed active model,
+or return an explicit missing status if that artifact cannot be recovered.
+Classifier status reads also avoid starting training. Training-run audit writes
+happen after the numerical lock is released; a failed audit write or failed
+runtime training preserves the pending claim instead of reporting completion.
+
+Personalized artifacts are atomically published under signature-derived names
+in a sibling `*-versions/` directory, alongside the compatibility `.joblib` file.
+The previous compatibility artifact is preserved before replacement. A new file
+is not active until its signature commits to SQLite, so a rollback or restart
+can recover the old active version. Versions and interrupted temporary candidates
+are retained, not automatically pruned; include these directories in storage
+planning and backups. Acceptance refreshes operate on serving snapshots rather
+than mutating the published cache entry.
+
+Fetch and enrichment protect the entire acquired-lock scope, including setup
+and finalizers. Exceptions release the fetch lock and clear its running flag.
+
+Jobs retry only positively identified `SQLITE_BUSY` failures of the initial
+`BEGIN IMMEDIATE`, before any job is claimed. There are at most seven attempts,
+with a 250 ms SQLite busy timeout and interruptible backoff up to two seconds.
+Exhaustion stops the worker and notifies waiters; queued jobs remain durable.
+Errors after acquisition, uncertain commits and unclassified errors still stop
+the worker without automatically replaying work.
 
 ## Pending work and recovery
 
@@ -55,3 +85,8 @@ personalized training while exercising real training transactions and threads.
 They do not train models, touch the live database, or start a server.
 Temporary fixtures are retained to respect the workspace's recoverable file
 operations policy.
+
+`tests/test_lock_safety.py` additionally covers concurrent serving, copy/undo
+during training, subsequent pending runs, artifact publication/crash recovery,
+fetch setup/finalizer faults and real SQLite claim contention. Run it against
+an isolated data/model directory, as with the other personalized-model tests.

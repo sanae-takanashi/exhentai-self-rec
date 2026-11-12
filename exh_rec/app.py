@@ -624,7 +624,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with db.connect() as conn:
                         ensure_gallery_exists(conn, gallery_url)
-                        source = copy_continuing_feedback(conn, gallery_url)
+                        source = copy_continuing_feedback(conn, gallery_url, retrain=False)
+                        retrain_status = mark_model_retrain_pending(conn)
+                    MODEL_RETRAIN_WAKE.set()
+                    with db.connect() as conn:
                         page = continuing_update_payload(
                             conn,
                             limit=40,
@@ -632,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                 except ValueError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-                self.send_json({"ok": True, "copied_from": source, **page})
+                self.send_json({"ok": True, "copied_from": source, "model_retrain": retrain_status, **page})
             elif path == "/api/mark":
                 payload = self.read_json()
                 gallery_url = str(payload.get("gallery_url") or "")
@@ -1891,6 +1894,14 @@ def fetch_and_store(
 ) -> dict:
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch is already running")
+    try:
+        return _fetch_and_store(force_query, trigger, include_rated, filter_text, checkpoint, defer_retrain)
+    finally:
+        FETCH_STATE["running"] = False
+        FETCH_LOCK.release()
+
+
+def _fetch_and_store(force_query, trigger, include_rated, filter_text, checkpoint, defer_retrain) -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         pages = fetch_pages(conn)
@@ -1902,22 +1913,17 @@ def fetch_and_store(
         tags = get_bootstrap_tags(conn)
         learned_tags = learned_query_tags(conn, learned_limit)
     if not cookie:
-        FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
     query_plan = build_query_plan(tags, learned_tags, force_query=force_query)
     cutoff = recent_gallery_cutoff()
-    try:
-        with db.connect() as conn:
-            activity_plan = []
-            for entry in query_plan:
-                cursor = get_fetch_query_state(conn, entry)
-                active = cursor_enabled_for(entry) and bool(cursor and cursor["anchors"])
-                activity_plan.append({**entry, "page_budget": pages + stale_extra_pages if active else pages,
-                                      "resuming": bool(cursor and cursor.get("resume_url"))})
-    except Exception:
-        FETCH_LOCK.release()
-        raise
+    with db.connect() as conn:
+        activity_plan = []
+        for entry in query_plan:
+            cursor = get_fetch_query_state(conn, entry)
+            active = cursor_enabled_for(entry) and bool(cursor and cursor["anchors"])
+            activity_plan.append({**entry, "page_budget": pages + stale_extra_pages if active else pages,
+                                  "resuming": bool(cursor and cursor.get("resume_url"))})
     queries = [entry["query"] for entry in query_plan]
     run_id: int | None = None
     fetched = 0
@@ -2334,20 +2340,26 @@ def fetch_and_store(
             last = None
         FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
         FETCH_ACTIVITY.update("stopped", FETCH_STATE)
-        FETCH_LOCK.release()
 
 
 @observe_requests(report_fetch_request)
 def enrich_recommendations(include_rated: bool = False, filter_text: str | None = None, limit: Any = None, *, checkpoint=None, defer_retrain=False) -> dict:
     if not FETCH_LOCK.acquire(blocking=False):
         raise ApiError(HTTPStatus.CONFLICT, "A fetch or enrichment is already running")
+    try:
+        return _enrich_recommendations(include_rated, filter_text, limit, checkpoint, defer_retrain)
+    finally:
+        FETCH_STATE["running"] = False
+        FETCH_LOCK.release()
+
+
+def _enrich_recommendations(include_rated, filter_text, limit, checkpoint, defer_retrain) -> dict:
     with db.connect() as conn:
         cookie = db.get_setting(conn, "cookie_header", "")
         detail_limit = detail_fetch_limit(conn)
         extra_pages = sample_extra_pages(conn)
         proxy_url = network_proxy(conn)
     if not cookie:
-        FETCH_LOCK.release()
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
     requested_limit = detail_limit if limit is None else bounded_int(limit, default=detail_limit, lower=0, upper=50)
@@ -2527,7 +2539,6 @@ def enrich_recommendations(include_rated: bool = False, filter_text: str | None 
             last = None
         FETCH_STATE.update({"running": False, "last_fetch": last, "updated_at": current_timestamp()})
         FETCH_ACTIVITY.update("stopped", FETCH_STATE)
-        FETCH_LOCK.release()
 
 
 REFRESH_THUMBS_MAX = 60

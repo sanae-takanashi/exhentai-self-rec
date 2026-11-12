@@ -251,7 +251,7 @@ def _atomic_dump(artifact: dict, modules: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def load_continuing_classifier(conn: sqlite3.Connection) -> dict:
+def load_continuing_classifier(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
     signature = _signature(conn)
     if signature in _CACHE:
         return _CACHE[signature]
@@ -263,6 +263,8 @@ def load_continuing_classifier(conn: sqlite3.Connection) -> dict:
                 return artifact
         except Exception:
             pass
+    if not train_if_needed:
+        return {"ready": False, "accepted": False, "status": "missing", "signature": signature}
     return train_continuing_classifier(conn)
 
 

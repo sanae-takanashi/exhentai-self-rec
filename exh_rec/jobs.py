@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import json
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -12,6 +13,7 @@ ACTIVE = frozenset({"queued", "held", "running", "pause_requested", "paused", "c
 TERMINAL = frozenset({"succeeded", "partial", "failed", "cancelled", "interrupted"})
 STATES = ACTIVE | TERMINAL
 STEP_STATES = frozenset({"pending", "running", "succeeded", "partial", "failed", "cancelled", "interrupted"})
+CLAIM_BUSY_RETRIES = 6
 STAGES = frozenset({"queued", "starting", "query_page", "query_metadata", "detail", "finalizing",
                     "retraining", "backup", "step_complete", "finished", "interrupted", "cancelled"})
 SCHEMA = """
@@ -112,6 +114,10 @@ def result_summary(result):
     if type(result.get("verified")) is bool:
         summary["verified"] = result["verified"]
     return summary
+
+
+class _ClaimBusy(Exception):
+    pass
 
 
 class JobContext:
@@ -311,7 +317,13 @@ class JobQueue:
 
     def _claim(self):
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("PRAGMA busy_timeout = 250")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY:
+                    raise _ClaimBusy from None
+                raise
             if conn.execute("SELECT 1 FROM jobs WHERE state IN ('running','pause_requested','paused','cancel_requested') LIMIT 1").fetchone():
                 return None
             row = conn.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority DESC, sequence LIMIT 1").fetchone()
@@ -375,10 +387,22 @@ class JobQueue:
                     waiter["error" if error else "result"] = error if error else result
                     waiter["event"].set()
 
+    def _claim_with_retry(self):
+        for attempt in range(CLAIM_BUSY_RETRIES + 1):
+            if self.stop.is_set():
+                return None
+            try:
+                return self._claim()
+            except _ClaimBusy:
+                if attempt == CLAIM_BUSY_RETRIES:
+                    raise JobError("Jobs writer remained busy; inspect Jobs before retrying") from None
+                if self.stop.wait(min(2.0, 0.25 * 2 ** attempt)):
+                    return None
+
     def _loop(self):
         while not self.stop.is_set():
             try:
-                job = self._claim()
+                job = self._claim_with_retry()
                 if job is not None:
                     self._execute(job)
                     continue

@@ -1187,6 +1187,8 @@ def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -
         conn.executemany(FEATURE_WEIGHT_UPSERT, [(feature, *totals) for feature, totals in weights.items()])
         conn.commit()
     personalized = train_personalized_model(conn)
+    if release_write_lock and personalized.get("status") == "failed":
+        raise personalized_module.PersonalizedModelUnavailable("Personalized training failed; pending work retained")
     conn.execute(
         """
         INSERT INTO settings(key, value) VALUES ('model_retrain_active_signature', ?)
@@ -3446,7 +3448,7 @@ def continuing_previous_feedback(
     return source
 
 
-def copy_continuing_feedback(conn: sqlite3.Connection, gallery_url: str) -> dict:
+def copy_continuing_feedback(conn: sqlite3.Connection, gallery_url: str, retrain: bool = True) -> dict:
     gallery_url = normalize_gallery_url(gallery_url)
     series_index = continuing_update_series_index(conn)
     metadata = series_index.get(gallery_url)
@@ -3466,6 +3468,7 @@ def copy_continuing_feedback(conn: sqlite3.Connection, gallery_url: str) -> dict
         score=score,
         reason_code=source.get("reason_code"),
         surface="updates",
+        retrain=retrain,
     )
     return source
 
@@ -3847,7 +3850,7 @@ def bootstrap_search_text(gallery: dict) -> str:
     return " ".join(value.lower() for value in values if value)
 
 
-def model_snapshot(conn: sqlite3.Connection, train_if_needed: bool = True) -> dict:
+def model_snapshot(conn: sqlite3.Connection, train_if_needed: bool = False) -> dict:
     visual_model = visual_preference_model(conn)
     visual_counts = visual_version_counts(conn)
     personalized_model = model_public_status(
@@ -3857,10 +3860,8 @@ def model_snapshot(conn: sqlite3.Connection, train_if_needed: bool = True) -> di
             allow_stale=not train_if_needed,
         )
     )
-    continuing_classifier = (
-        public_classifier_status(load_continuing_classifier(conn))
-        if train_if_needed
-        else {"ready": False, "status": "not-loaded"}
+    continuing_classifier = public_classifier_status(
+        load_continuing_classifier(conn, train_if_needed=train_if_needed)
     )
     return {
         "bootstrap_tags": get_bootstrap_tags(conn),
