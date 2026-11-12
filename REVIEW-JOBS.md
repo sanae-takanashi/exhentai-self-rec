@@ -18,6 +18,17 @@ background worker, and its schedule is independent of saving a rating.
 HTTP request does not train the model inline. A manual request received while
 training is running remains queued for a subsequent run.
 
+H@H completion events use this same schedule. The event and a pending change
+commit together before the worker is woken; duplicate events do not enqueue
+another change. Download exclusion is immediate, while learned weights update
+when the queued training completes.
+
+Runtime retraining commits caller writes before waiting for the model lock.
+Feature calculation uses a read snapshot, followed by a short atomic weight
+replacement; expensive personalized training does not own a SQLite writer.
+Settled Review/count requests avoid redundant membership/audit writes and
+commit any necessary changes before sending the HTTP response.
+
 ## Pending work and recovery
 
 `pending_count` counts outstanding changes, rather than unique galleries.
@@ -39,7 +50,8 @@ empty pending count while a job is running does not indicate completion.
 ## Isolated checks
 
 Run `.venv-rocm/Scripts/python.exe -B -m unittest discover -s tests -p test_retrain_jobs.py`.
-The tests use a fresh temporary SQLite database for each case and mock actual
-training. They do not train models, touch the live database, or start a server.
+The tests use a fresh temporary SQLite database for each case and stub expensive
+personalized training while exercising real training transactions and threads.
+They do not train models, touch the live database, or start a server.
 Temporary fixtures are retained to respect the workspace's recoverable file
 operations policy.

@@ -277,7 +277,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
             elif path == "/api/queue-counts":
                 with db.connect() as conn:
-                    self.send_json(queue_counts_payload(conn))
+                    result = queue_counts_payload(conn)
+                self.send_json(result)
             elif path == "/api/low-interest-audit":
                 with db.connect() as conn:
                     self.send_json(low_interest_audit_report(conn))
@@ -305,23 +306,22 @@ class Handler(BaseHTTPRequestHandler):
                 require_bootstrap_match = parse_bool(query.get("require_bootstrap_match", ["0"])[0])
                 filter_text = query.get("filter", query.get("filter_text", [""]))[0]
                 with db.connect() as conn:
-                    self.send_json(
-                        recommendation_payload(
-                            conn,
-                            limit=limit,
-                            include_rated=include_rated,
-                            offset=offset,
-                            filter_text=filter_text,
-                            freshness_weight=freshness_weight,
-                            posted_after=posted_after,
-                            bootstrap_explore_count=bootstrap_explore_count,
-                            explore_seed=explore_seed,
-                            language_filter=language_filter,
-                            model_mode=model_mode,
-                            interest_band=interest_band,
-                            require_bootstrap_match=require_bootstrap_match,
-                        )
+                    result = recommendation_payload(
+                        conn,
+                        limit=limit,
+                        include_rated=include_rated,
+                        offset=offset,
+                        filter_text=filter_text,
+                        freshness_weight=freshness_weight,
+                        posted_after=posted_after,
+                        bootstrap_explore_count=bootstrap_explore_count,
+                        explore_seed=explore_seed,
+                        language_filter=language_filter,
+                        model_mode=model_mode,
+                        interest_band=interest_band,
+                        require_bootstrap_match=require_bootstrap_match,
                     )
+                self.send_json(result)
             elif path == "/api/discovery":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 limit = query_int(query, "limit", default=40, lower=1, upper=100)
@@ -429,9 +429,11 @@ class Handler(BaseHTTPRequestHandler):
                     with db.connect() as conn:
                         result = ingest_event_batch(conn, payload)
                         if result["completed_changed"]:
-                            retrain_model(conn, release_write_lock=True)
+                            mark_model_retrain_pending(conn)
                 except HathPayloadError as exc:
                     raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                if result["completed_changed"]:
+                    MODEL_RETRAIN_WAKE.set()
                 self.send_json(result)
             elif path == "/api/integrations/hath/pack/start":
                 payload = self.read_json()
@@ -1248,7 +1250,7 @@ def configured_visual_encoder(conn) -> str:
 def import_preferences_payload(data: dict, replace: bool = False) -> dict:
     try:
         with db.connect() as conn:
-            result = import_preferences(conn, data, replace=replace)
+            result = import_preferences(conn, data, replace=replace, release_write_lock=True)
             return {"ok": True, "imported": result, "model": model_snapshot(conn)}
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc

@@ -846,7 +846,9 @@ def export_preferences(conn: sqlite3.Connection) -> dict:
     }
 
 
-def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = False) -> dict:
+def import_preferences(
+    conn: sqlite3.Connection, payload: dict, replace: bool = False, *, release_write_lock: bool = False,
+) -> dict:
     if payload.get("schema") not in {"exh-rec-preferences-v1", "exh-rec-preferences-v2"}:
         raise ValueError("Unsupported preference export schema")
     if replace:
@@ -1020,7 +1022,7 @@ def import_preferences(conn: sqlite3.Connection, payload: dict, replace: bool = 
         )
         imported_classifications += 1
 
-    retrain_model(conn)
+    retrain_model(conn, release_write_lock=release_write_lock)
     train_continuing_classifier(conn)
     return {
         "bootstrap_tags": imported_tags,
@@ -1097,12 +1099,32 @@ def import_feedback_score(value: object) -> int | None:
 
 
 def retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -> dict:
+    # Runtime callers must never wait for the model lock while owning a DB writer.
+    if release_write_lock:
+        conn.commit()
     with RETRAIN_LOCK:
         return _retrain_model(conn, release_write_lock=release_write_lock)
 
 
 def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -> dict:
-    conn.execute("DELETE FROM feature_weights")
+    if release_write_lock:
+        conn.execute("BEGIN")
+    else:
+        conn.execute("DELETE FROM feature_weights")
+    weights: dict[str, list] = {}
+
+    def apply(gallery, signal, score=None):
+        if not release_write_lock:
+            apply_feedback_features(conn, gallery, signal, score=score, tag_strengths=tag_strengths)
+            return
+        for feature, weight, positive, negative in feedback_feature_updates(
+            gallery, signal, score=score, tag_strengths=tag_strengths,
+        ):
+            totals = weights.setdefault(feature, [0.0, 0, 0])
+            totals[0] += weight
+            totals[1] += positive
+            totals[2] += negative
+
     tag_strengths = tag_corpus_strengths(conn)
     confidence_by_id = feedback_confidence_index(conn)
     rows = conn.execute(
@@ -1126,7 +1148,7 @@ def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -
         signal *= confidence_by_id.get(feedback_id, 1.0)
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
-        apply_feedback_features(conn, gallery, signal, score=score, tag_strengths=tag_strengths)
+        apply(gallery, signal, score=score)
     mark_rows = conn.execute(
         """
         SELECT g.*, m.kind AS mark_kind
@@ -1139,7 +1161,7 @@ def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -
         signal = gallery_mark_signal(str(gallery.pop("mark_kind") or ""))
         gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
         gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
-        apply_feedback_features(conn, gallery, signal, score=5 if signal > 0 else 1, tag_strengths=tag_strengths)
+        apply(gallery, signal, score=5 if signal > 0 else 1)
     download_signal = hath_download_signal_weight(conn)
     if download_signal > 0:
         download_rows = conn.execute(
@@ -1157,8 +1179,12 @@ def _retrain_model(conn: sqlite3.Connection, release_write_lock: bool = False) -
             gallery = dict(row)
             gallery["tags"] = json.loads(gallery.pop("tags_json") or "[]")
             gallery["tag_weights"] = json.loads(gallery.pop("tag_weights_json", None) or "{}")
-            apply_feedback_features(conn, gallery, download_signal, tag_strengths=tag_strengths)
+            apply(gallery, download_signal)
     if release_write_lock:
+        # Release the read snapshot before upgrading to a short replacement write.
+        conn.commit()
+        conn.execute("DELETE FROM feature_weights")
+        conn.executemany(FEATURE_WEIGHT_UPSERT, [(feature, *totals) for feature, totals in weights.items()])
         conn.commit()
     personalized = train_personalized_model(conn)
     conn.execute(
@@ -1361,6 +1387,37 @@ def feedback_confidence_index(conn: sqlite3.Connection) -> dict[int, float]:
     return _cached_scan(conn, "feedback-confidence", fingerprint, build)
 
 
+FEATURE_WEIGHT_UPSERT = """
+    INSERT INTO feature_weights(feature, weight, positive_count, negative_count, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(feature) DO UPDATE SET
+        weight = feature_weights.weight + excluded.weight,
+        positive_count = feature_weights.positive_count + excluded.positive_count,
+        negative_count = feature_weights.negative_count + excluded.negative_count,
+        updated_at = CURRENT_TIMESTAMP
+"""
+
+
+def feedback_feature_updates(
+    gallery: dict,
+    signal: float,
+    score: int | None = None,
+    tag_strengths: dict[str, float] | None = None,
+):
+    if signal == 0:
+        return
+    for feature, strength in gallery_feature_values(gallery, tag_strengths=tag_strengths):
+        if not feedback_updates_feature(feature, signal=signal, score=score):
+            continue
+        weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature) * strength
+        yield (
+            feature,
+            weighted_signal,
+            1 if signal > 0 else 0,
+            1 if signal < 0 else 0,
+        )
+
+
 def apply_feedback_features(
     conn: sqlite3.Connection,
     gallery: dict,
@@ -1368,29 +1425,9 @@ def apply_feedback_features(
     score: int | None = None,
     tag_strengths: dict[str, float] | None = None,
 ) -> None:
-    if signal == 0:
-        return
-    for feature, strength in gallery_feature_values(gallery, tag_strengths=tag_strengths):
-        if not feedback_updates_feature(feature, signal=signal, score=score):
-            continue
-        weighted_signal = signal * LEARNING_RATE * feature_learning_multiplier(feature) * strength
-        conn.execute(
-            """
-            INSERT INTO feature_weights(feature, weight, positive_count, negative_count, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(feature) DO UPDATE SET
-                weight = feature_weights.weight + excluded.weight,
-                positive_count = feature_weights.positive_count + excluded.positive_count,
-                negative_count = feature_weights.negative_count + excluded.negative_count,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (
-                feature,
-                weighted_signal,
-                1 if signal > 0 else 0,
-                1 if signal < 0 else 0,
-            ),
-        )
+    rows = list(feedback_feature_updates(gallery, signal, score=score, tag_strengths=tag_strengths))
+    if rows:
+        conn.executemany(FEATURE_WEIGHT_UPSERT, rows)
 
 
 def feedback_updates_feature(feature: str, signal: float, score: int | None = None) -> bool:
@@ -1853,7 +1890,7 @@ def recommend_page(
             conn,
             membership_key,
             low_interest_percent,
-            scored,
+            [item for item in scored if str(item.get("url") or "") not in retained_low_interest_urls],
         )
         low_interest_policy["membership_policy_key"] = membership_key
     audit_status = None
@@ -2431,6 +2468,8 @@ def persist_low_interest_memberships(
         for item in scored
         if item.get("url") and item.get("low_interest_percentile")
     ]
+    if not rows:
+        return 0
     before = conn.total_changes
     conn.executemany(
         """
