@@ -8,7 +8,6 @@ import json
 import math
 import mimetypes
 import os
-import queue
 import random
 import socket
 import threading
@@ -21,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import db, review_prewarm
+from . import db, review_prewarm, feedback_jobs, maintenance
 from .runtime_identity import capture_runtime
 from .jobs import JobError, JobHalt, JobQueue
 from .fetch_activity import FetchActivity
@@ -143,10 +142,6 @@ MODEL_RETRAIN_STATE: dict[str, Any] = {
 MODEL_RETRAIN_WAKE = threading.Event()
 MODEL_RETRAIN_RUN_LOCK = threading.Lock()
 JOBS = JobQueue(lambda: db.connect())
-FEEDBACK_ENRICHMENT_QUEUE: queue.Queue[str] = queue.Queue()
-FEEDBACK_ENRICHMENT_PENDING: set[str] = set()
-FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
-FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
 THUMB_CACHE_LOCKS = [threading.Lock() for _ in range(64)]
@@ -215,7 +210,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/runtime":
                 self.send_json(dict(RUNTIME_IDENTITY))
             elif path == "/api/jobs":
-                self.send_json(JOBS.snapshot(), cache_control="no-store")
+                self.send_json({**JOBS.snapshot(), "maintenance": maintenance.snapshot()}, cache_control="no-store")
+            elif path == "/api/maintenance":
+                self.send_json(maintenance.snapshot(), cache_control="no-store")
             elif path == "/api/insights/fetch":
                 with db.connect() as conn:
                     self.send_json(fetch_insights(conn))
@@ -591,6 +588,8 @@ class Handler(BaseHTTPRequestHandler):
                         elapsed_ms=elapsed_ms,
                     )
                     feedback_update["model_retrain"] = retrain_status
+                    if signal != 0 and str(payload.get("enrich_feedback") or "").strip().lower() != "sync" and parse_bool(payload.get("enrich_feedback")):
+                        feedback_jobs.request(conn, normalize_gallery_url(gallery_url))
                     log_feedback_update(feedback_update)
                 feedback_enrichment = feedback_enrichment_plan(signal, payload)
                 if model_invalidated:
@@ -917,6 +916,8 @@ def get_settings() -> dict:
             "cookie_missing_keys": missing_common_cookie_keys(cookie),
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
             "review_prewarm": review_prewarm.settings(conn),
+            "backup": maintenance.settings(conn),
+            "maintenance": maintenance.snapshot(),
             "refresh_interval_minutes": refresh_interval_minutes(conn),
             "model_retrain_mode": configured_model_retrain_mode(conn),
             "model_retrain_feedback_threshold": model_retrain_feedback_threshold(conn),
@@ -1077,6 +1078,11 @@ def save_settings(payload: dict[str, Any]) -> None:
             refresh_relevant_change = True
         if "review_prewarm_enabled" in payload:
             db.set_setting(conn, "review_prewarm_enabled", "1" if parse_bool(payload["review_prewarm_enabled"]) else "0")
+        if "backup_enabled" in payload:
+            db.set_setting(conn, "backup_enabled", "1" if parse_bool(payload["backup_enabled"]) else "0")
+        if "backup_interval_hours" in payload:
+            hours = bounded_int(payload["backup_interval_hours"], default=24, lower=6, upper=168)
+            db.set_setting(conn, "backup_interval_hours", str(hours))
         if "review_prewarm_window" in payload:
             window = bounded_int(payload["review_prewarm_window"], default=120, lower=40, upper=400)
             db.set_setting(conn, "review_prewarm_window", str(window))
@@ -3225,39 +3231,16 @@ def enrich_feedback_gallery(gallery_url: str) -> dict:
     }
 
 
-def feedback_enrichment_worker() -> None:
-    while True:
-        gallery_url = FEEDBACK_ENRICHMENT_QUEUE.get()
-        try:
-            result = enrich_feedback_gallery(gallery_url)
-            if result.get("status") == "failed":
-                print(f"feedback detail enrichment failed for {gallery_url}: {result.get('reason')}", flush=True)
-        except Exception as exc:
-            print(f"feedback detail enrichment failed for {gallery_url}: {exc}", flush=True)
-        finally:
-            with FEEDBACK_ENRICHMENT_LOCK:
-                FEEDBACK_ENRICHMENT_PENDING.discard(gallery_url)
-            FEEDBACK_ENRICHMENT_QUEUE.task_done()
-
-
 def queue_feedback_enrichment(gallery_url: str) -> dict:
-    global FEEDBACK_ENRICHMENT_WORKER
     gallery_url = normalize_gallery_url(gallery_url)
     if not gallery_url:
         return {"status": "skipped", "reason": "gallery URL is invalid"}
-    with FEEDBACK_ENRICHMENT_LOCK:
-        if gallery_url in FEEDBACK_ENRICHMENT_PENDING:
-            return {"status": "queued", "gallery_url": gallery_url, "deduplicated": True}
-        FEEDBACK_ENRICHMENT_PENDING.add(gallery_url)
-        if FEEDBACK_ENRICHMENT_WORKER is None or not FEEDBACK_ENRICHMENT_WORKER.is_alive():
-            FEEDBACK_ENRICHMENT_WORKER = threading.Thread(
-                target=feedback_enrichment_worker,
-                name="feedback-detail-enrichment",
-                daemon=True,
-            )
-            FEEDBACK_ENRICHMENT_WORKER.start()
-    FEEDBACK_ENRICHMENT_QUEUE.put(gallery_url)
-    return {"status": "queued", "gallery_url": gallery_url, "deduplicated": False}
+    with db.connect() as conn:
+        feedback_jobs.request(conn, gallery_url)
+        row = conn.execute("SELECT state,job_id FROM feedback_enrichment_requests WHERE gallery_url=?", (gallery_url,)).fetchone()
+    maintenance.WAKE.set()
+    return {"status": "queued" if row["state"] in {"pending", "assigned"} else row["state"],
+            "gallery_url": gallery_url, "job_id": row["job_id"], "durable": True}
 
 
 def feedback_enrichment_plan(signal: float, payload: dict[str, Any]) -> dict:
@@ -3265,7 +3248,8 @@ def feedback_enrichment_plan(signal: float, payload: dict[str, Any]) -> dict:
         return {"status": "skipped", "reason": "neutral feedback"}
     mode = str(payload.get("enrich_feedback") or "").strip().lower()
     if mode == "sync":
-        return enrich_feedback_gallery(str(payload.get("gallery_url") or ""))
+        with FETCH_LOCK:
+            return enrich_feedback_gallery(str(payload.get("gallery_url") or ""))
     if not parse_bool(payload.get("enrich_feedback")):
         return {"status": "deferred", "reason": "review feedback does not fetch remote detail before responding"}
     return queue_feedback_enrichment(str(payload.get("gallery_url") or ""))
@@ -4776,6 +4760,8 @@ def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
 
 
 def execute_job(kind, params, context, source):
+    if kind == "feedback_enrich":
+        return feedback_jobs.run_batch(context)
     if kind == "review_prewarm":
         return review_prewarm.run_batch(context.checkpoint, automatic=source == "background")
     if kind == "fetch":
@@ -4788,10 +4774,7 @@ def execute_job(kind, params, context, source):
         context.checkpoint("retraining")
         return run_model_retrain("queued" if source == "model" else "manual", force=source != "model")
     if kind == "backup":
-        from scripts.launcher_ops import backup_sqlite_database
-        context.checkpoint("backup")
-        result = backup_sqlite_database(db.DB_PATH)
-        return {"verified": result["verified"]}
+        return maintenance.backup(context)
     raise JobError("Unsupported job kind")
 
 
@@ -4843,9 +4826,13 @@ def main() -> None:
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     retrain_worker = threading.Thread(target=background_model_retrain, args=(stop,), daemon=True)
     prewarm_worker = threading.Thread(target=review_prewarm.background, args=(stop,), daemon=True, name="review-prewarm")
+    maintenance_worker = threading.Thread(target=maintenance.scheduler_background, args=(stop,), daemon=True, name="maintenance-scheduler")
+    health_worker = threading.Thread(target=maintenance.health_background, args=(stop,), daemon=True, name="health-monitor")
     worker.start()
     retrain_worker.start()
     prewarm_worker.start()
+    maintenance_worker.start()
+    health_worker.start()
     print(f"Serving ExHentai recommender at {server_display_url(HOST, PORT)}")
     if HOST == "0.0.0.0":
         print(f"Remote clients can use http://<server-ip>:{PORT}")
@@ -4856,6 +4843,7 @@ def main() -> None:
         pass
     finally:
         stop.set()
+        maintenance.WAKE.set()
         JOBS.shutdown()
         server.server_close()
 

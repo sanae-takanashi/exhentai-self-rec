@@ -1,5 +1,6 @@
 """Durable, single-worker jobs. No credentials or exception text enter history."""
 from datetime import datetime, timezone
+from contextlib import nullcontext
 import json
 import re
 import sqlite3
@@ -8,7 +9,7 @@ import time
 import uuid
 
 
-KINDS = {"fetch": "Fetch", "enrich": "Enrich", "review_prewarm": "Review Prewarm", "retrain": "Retrain", "backup": "Backup"}
+KINDS = {"fetch": "Fetch", "enrich": "Enrich", "feedback_enrich": "Feedback Enrichment", "review_prewarm": "Review Prewarm", "retrain": "Retrain", "backup": "Backup"}
 ACTIVE = frozenset({"queued", "held", "running", "pause_requested", "paused", "cancel_requested"})
 TERMINAL = frozenset({"succeeded", "partial", "failed", "cancelled", "interrupted"})
 STATES = ACTIVE | TERMINAL
@@ -80,7 +81,7 @@ def validate_steps(values):
         kind, params = value["kind"], value.get("params", {})
         allowed = {"fetch": {"query", "include_rated", "filter_text"},
                    "enrich": {"limit", "include_rated", "filter_text"}, "review_prewarm": set(),
-                   "retrain": set(), "backup": set()}[kind]
+                   "feedback_enrich": set(), "retrain": set(), "backup": set()}[kind]
         if not isinstance(params, dict) or set(params) - allowed:
             raise JobError("Unsupported job parameters")
         clean = {}
@@ -190,15 +191,18 @@ class JobQueue:
         return {"service": "exh-rec", "schema": 1, "worker": self.running,
                 "jobs": [public_job(row) for row in (*active, *history)], "counts": counts, "workflows": workflows}
 
-    def submit(self, steps, *, name=None, source="launcher", next_job=False, coalesce=False):
+    def submit(self, steps, *, name=None, source="launcher", next_job=False, coalesce=False, connection=None):
         steps = validate_steps(steps)
         if not isinstance(source, str) or source not in {"launcher", "web", "background", "model"} or type(next_job) is not bool:
             raise JobError("Invalid job source or order")
         title = name_text(name) if name is not None else " + ".join(KINDS[step["kind"]] for step in steps)
         encoded = json.dumps(steps, ensure_ascii=True)
         job_id, now = uuid.uuid4().hex, timestamp()
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.connect() if connection is None else nullcontext(connection) as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE")
+            elif not conn.in_transaction:
+                raise JobError("Caller must own the submission transaction")
             if coalesce:
                 for row in conn.execute("SELECT * FROM jobs WHERE source = ? AND state IN ('queued','held','running','paused','pause_requested','cancel_requested')", (source,)):
                     existing = public_job(row)
@@ -208,11 +212,13 @@ class JobQueue:
             pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE state NOT IN ('succeeded','partial','failed','cancelled','interrupted')").fetchone()[0]
             if pending >= 100:
                 raise JobError("Queue is full")
-            priority = -1 if source == "background" and all(step["kind"] == "review_prewarm" for step in steps) else 0
+            priority = min(({"feedback_enrich": -1, "backup": -2, "review_prewarm": -3}.get(step["kind"], 0)
+                            for step in steps), default=0) if source == "background" else 0
             conn.execute("INSERT INTO jobs(id,name,source,state,steps_json,priority,created_at,updated_at) VALUES(?,?,?,'queued',?,?,?,?)",
                          (job_id, title, source, encoded, time.time_ns() if next_job else priority, now, now))
+            result = public_job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
         self.wake.set()
-        return self.get(job_id)
+        return result
 
     def save_workflow(self, name, steps, workflow_id=None):
         title, steps = name_text(name), validate_steps(steps)

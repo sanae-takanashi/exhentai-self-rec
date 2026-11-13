@@ -80,6 +80,20 @@ CREATE TABLE IF NOT EXISTS review_media_prewarm (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS feedback_enrichment_requests (
+    gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'pending',
+    job_id TEXT REFERENCES jobs(id),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS recommendation_impressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT NOT NULL,

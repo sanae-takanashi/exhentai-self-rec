@@ -33,6 +33,8 @@ const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
 const reviewPrewarmEnabledEl = document.querySelector("#reviewPrewarmEnabled");
 const reviewPrewarmWindowEl = document.querySelector("#reviewPrewarmWindow");
+const backupEnabledEl = document.querySelector("#backupEnabled");
+const backupIntervalHoursEl = document.querySelector("#backupIntervalHours");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const searchFetchBtn = document.querySelector("#searchFetchBtn");
@@ -790,6 +792,11 @@ async function loadSettings() {
   autoRefreshEl.checked = settings.auto_refresh;
   reviewPrewarmEnabledEl.checked = settings.review_prewarm?.enabled !== false;
   reviewPrewarmWindowEl.value = settings.review_prewarm?.window || 120;
+  backupEnabledEl.checked = settings.backup?.enabled !== false;
+  backupIntervalHoursEl.value = settings.backup?.interval_hours || 24;
+  const backup = settings.backup;
+  document.querySelector("#backupStatus").textContent = backup?.error_code ? "Backup: attention required" :
+    backup?.restore_verified ? `Backup + restore check: ${backup.last_completed_at}` : "Backup: pending";
   const prewarm = settings.review_prewarm;
   document.querySelector("#reviewPrewarmStatus").textContent = prewarm?.last_error_code
     ? "Prewarm check failed; retry pending"
@@ -871,6 +878,8 @@ async function saveSettings() {
     auto_refresh: autoRefreshEl.checked,
     review_prewarm_enabled: reviewPrewarmEnabledEl.checked,
     review_prewarm_window: Number(reviewPrewarmWindowEl.value),
+    backup_enabled: backupEnabledEl.checked,
+    backup_interval_hours: Number(backupIntervalHoursEl.value),
   };
   const settings = await api("/api/settings", {
     method: "POST",

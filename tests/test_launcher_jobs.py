@@ -158,9 +158,10 @@ class JobsAPITest(unittest.TestCase):
 
     def test_executor_reuses_verified_backup_and_defers_workflow_retrain(self):
         with patch.object(db, "DB_PATH", self.database):
-            context = Mock()
+            db.init_db()
+            context = Mock(job_id="0" * 32)
             self.assertTrue(app.execute_job("backup", {}, context, "launcher")["verified"])
-        receipts = list((self.directory / "backups").glob("*.json"))
+        receipts = [path for path in (self.directory / "backups").glob("*.json") if not path.name.endswith('.bundle.json')]
         self.assertEqual(len(receipts), 1)
         self.assertTrue(json.loads(receipts[0].read_text())["verified"])
         context.has_later.return_value = True

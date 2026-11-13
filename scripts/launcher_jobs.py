@@ -74,7 +74,15 @@ def validate_snapshot(payload):
     workflows = [{"id": identifier(item["id"]), "name": _text(item["name"], 80),
                   "steps": [{"kind": step["kind"], "params": step["params"]} for step in validate_steps(item["steps"])]}
                  for item in workflows]
-    return {"worker": payload["worker"], "jobs": jobs, "counts": dict(counts), "workflows": workflows}
+    result = {"worker": payload["worker"], "jobs": jobs, "counts": dict(counts), "workflows": workflows}
+    health = payload.get("maintenance")
+    if isinstance(health, dict) and health.get("state") in {"starting", "ok", "warning", "stale"}:
+        allowed = {"worker_unavailable", "feedback_attention", "long_running_job", "backup_attention",
+                   "backup_old", "prewarm_attention", "disk_low", "read_probe_unavailable"}
+        warnings = health.get("warnings", [])
+        if isinstance(warnings, list) and all(isinstance(item, str) and item in allowed for item in warnings):
+            result["maintenance"] = {"state": health["state"], "warnings": warnings}
+    return result
 
 
 def _request(home_url, route, payload=None, *, timeout=0.8):
@@ -231,6 +239,8 @@ class JobsView:
         self.steps.configure(yscrollcommand=step_scroll.set)
         self.status = tk.StringVar(value="")
         ttk.Label(self.frame, textvariable=self.status, style="Muted.TLabel", wraplength=680).grid(row=9, sticky="ew", pady=(5, 0))
+        self.health = tk.StringVar(value="Health: waiting")
+        ttk.Label(self.frame, textvariable=self.health, style="Muted.TLabel", wraplength=680).grid(row=10, sticky="ew", pady=(5, 0))
         self.select()
 
     def load_preset(self):
@@ -269,6 +279,9 @@ class JobsView:
 
     def render(self, snapshot):
         self.snapshot = snapshot
+        health = snapshot.get("maintenance", {})
+        self.health.set("Health: " + health.get("state", "unavailable") +
+                        (" | " + ", ".join(health["warnings"]) if health.get("warnings") else ""))
         availability = snapshot.get("availability")
         if availability != "available":
             self.heading.set({"offline": "Jobs: service offline", "unsupported": "Jobs: backend restart required"}.get(availability, "Jobs: unavailable"))

@@ -198,6 +198,15 @@
         </label>
         <output id="reviewPrewarmStatus" class="hint"></output>
         <label class="check">
+          <input id="backupEnabled" type="checkbox">
+          Scheduled recovery backup
+        </label>
+        <label>
+          Backup interval (hours)
+          <input id="backupIntervalHours" type="number" min="6" max="168" value="24">
+        </label>
+        <output id="backupStatus" class="hint"></output>
+        <label class="check">
           <input id="autoRefresh" type="checkbox">
           Auto refresh
         </label>
