@@ -1,5 +1,6 @@
 """Fail-closed Jobs client, HTTP integration and native controls."""
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -62,6 +63,58 @@ def endpoint(mode="ready", payload=None):
         server.shutdown()
         server.server_close()
         thread.join(3)
+
+
+class JobsTimingTest(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)
+        self.job = {**job_payload(), "created_at": (self.now - timedelta(hours=3)).isoformat(),
+                    "updated_at": self.now.isoformat()}
+
+    def test_waiting_jobs_do_not_look_executed(self):
+        for state, label in (("queued", "Queued"), ("held", "Created")):
+            with self.subTest(state=state):
+                self.job["state"] = state
+                when, elapsed, detail = client.job_timing(self.job, now=self.now)
+                self.assertEqual(when, label + " 3h ago")
+                self.assertEqual(elapsed, "Not started")
+                self.assertIn("Started Not started | Finished -", detail)
+
+    def test_running_and_paused_elapsed_uses_start_not_checkpoint(self):
+        self.job["started_at"] = (self.now - timedelta(minutes=65, seconds=2)).isoformat()
+        for state in ("running", "paused", "pause_requested", "cancel_requested"):
+            with self.subTest(state=state):
+                self.job["state"] = state
+                when, elapsed, detail = client.job_timing(self.job, now=self.now)
+                self.assertEqual((when, elapsed), ("Started 1h ago", "1h 5m"))
+                self.assertIn("Elapsed (including pauses): 1h 5m", detail)
+        self.assertEqual(client.job_timing(self.job, now=self.now + timedelta(minutes=5))[1], "1h 10m")
+
+    def test_terminal_history_elapsed_freezes_at_finish_and_shows_local_times(self):
+        self.job.update(state="succeeded", started_at=(self.now - timedelta(days=2, minutes=2)).isoformat(),
+                        finished_at=(self.now - timedelta(days=2)).isoformat())
+        for state in client.TERMINAL:
+            with self.subTest(state=state):
+                self.job["state"] = state
+                when, elapsed, detail = client.job_timing(self.job, now=self.now)
+                self.assertEqual((when, elapsed), ("Finished 2d ago", "2m 0s"))
+                self.assertIn("Started " + client.local_time(self.job["started_at"]), detail)
+                self.assertIn("Finished " + client.local_time(self.job["finished_at"]), detail)
+                self.assertEqual(client.job_timing(self.job, now=self.now + timedelta(days=1))[1], elapsed)
+
+    def test_cancelled_before_start_and_missing_historical_finish(self):
+        self.job.update(state="cancelled", finished_at=(self.now - timedelta(seconds=15)).isoformat())
+        self.assertEqual(client.job_timing(self.job, now=self.now)[:2], ("Finished 15s ago", "Not started"))
+        self.job.update(state="interrupted", started_at=self.job["created_at"], finished_at=None)
+        self.assertEqual(client.job_timing(self.job, now=self.now)[1], "Unknown")
+
+    def test_timezone_offsets_subminute_long_duration_and_clock_skew(self):
+        self.job.update(state="running", started_at="2026-11-13T19:59:55+08:00")
+        self.assertEqual(client.job_timing(self.job, now=self.now)[:2], ("Started 5s ago", "5s"))
+        self.job["started_at"] = (self.now - timedelta(days=3, hours=4)).isoformat()
+        self.assertEqual(client.job_timing(self.job, now=self.now)[1], "3d 4h")
+        self.job["started_at"] = (self.now + timedelta(seconds=30)).isoformat()
+        self.assertEqual(client.job_timing(self.job, now=self.now)[:2], ("Started just now", "0s"))
 
 
 class JobsClientTest(unittest.TestCase):
@@ -287,6 +340,28 @@ class JobsUITest(unittest.TestCase):
         with patch("scripts.launcher.write_jobs") as write:
             self.app.queue_job()
         write.assert_not_called()
+
+    def test_execution_timing_in_rows_details_and_periodic_render_preserves_selection(self):
+        job = self.available["jobs"][0]
+        view = self.app.jobs
+        self.assertEqual(view.table.set(job["id"], "elapsed"), "Not started")
+        self.assertTrue(view.table.set(job["id"], "when").startswith("Queued "))
+        self.assertIn("Started Not started", view.detail.get())
+        now = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)
+        job.update(state="running", started_at=(now - timedelta(minutes=5)).isoformat())
+        with patch.object(client, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            self.app.render_status(self.app.latest)
+            self.assertEqual(view.table.set(job["id"], "when"), "Started 5m ago")
+            self.assertEqual(view.table.set(job["id"], "elapsed"), "5m 0s")
+            clock.now.return_value = now + timedelta(minutes=1)
+            self.app.render_status(self.app.latest)
+            self.assertEqual(view.table.set(job["id"], "elapsed"), "6m 0s")
+            job.update(state="succeeded", finished_at=(datetime.fromisoformat(job["started_at"]) + timedelta(seconds=75)).isoformat())
+            self.app.render_status(self.app.latest)
+        self.assertEqual(view.table.set(job["id"], "elapsed"), "1m 15s")
+        self.assertIn("Finished " + client.local_time(job["finished_at"]), view.detail.get())
+        self.assertEqual(view.table.selection(), (job["id"],))
 
     def test_partial_job_enables_retry_and_resume_only_for_paused(self):
         job = self.available["jobs"][0]

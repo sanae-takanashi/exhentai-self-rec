@@ -1,5 +1,5 @@
 """Bounded Jobs client and native queue/workflow views."""
-from datetime import datetime
+from datetime import datetime, timezone
 import ipaddress
 import json
 import urllib.error
@@ -146,6 +146,48 @@ PRESETS = {name: [{"kind": kind} for kind in kinds] for name, kinds in (
     ("Backup + Enrich + Retrain", ("backup", "enrich", "retrain")))}
 
 
+def _duration(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds}s"
+
+
+def job_timing(job, *, now=None):
+    """Format persisted execution timestamps, not checkpoint update activity."""
+    now = now if now is not None else datetime.now(timezone.utc)
+    started, finished = job["started_at"], job["finished_at"]
+    if finished:
+        event, value = "Finished", finished
+    elif started:
+        event, value = "Started", started
+    else:
+        event = "Queued" if job["state"] == "queued" else "Created"
+        value = job["created_at"]
+    seconds = max(0, int((now - datetime.fromisoformat(value)).total_seconds()))
+    age = "just now"
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m"), (1, "s")):
+        if seconds >= size:
+            age = f"{seconds // size}{unit} ago"
+            break
+    if not started:
+        elapsed = "Not started"
+    elif finished or job["state"] not in TERMINAL:
+        end = datetime.fromisoformat(finished) if finished else now
+        elapsed = _duration((end - datetime.fromisoformat(started)).total_seconds())
+    else:
+        elapsed = "Unknown"
+    detail = ("Created " + local_time(job["created_at"]) + " | Updated " + local_time(job["updated_at"])
+              + "\nStarted " + (local_time(started) if started else "Not started")
+              + " | Finished " + (local_time(finished) if finished else "-")
+              + "\nElapsed (including pauses): " + elapsed)
+    return f"{event} {age}", elapsed, detail
+
+
 class JobsView:
     def __init__(self, app):
         self.app = app
@@ -204,14 +246,17 @@ class JobsView:
         table_frame.grid(row=5, sticky="nsew")
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
-        self.table = ttk.Treeview(table_frame, columns=("name", "state", "step", "source"), show="headings", height=5)
-        for key, label, width in (("name", "Job", 250), ("state", "State", 135), ("step", "Checkpoint", 150), ("source", "Source", 85)):
+        self.table = ttk.Treeview(table_frame, columns=("name", "state", "when", "elapsed", "step", "source"), show="headings", height=5)
+        for key, label, width in (("name", "Job", 170), ("state", "State", 115), ("when", "Execution", 155),
+                                  ("elapsed", "Elapsed", 90), ("step", "Checkpoint", 115), ("source", "Source", 75)):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, minwidth=65, stretch=key == "name")
         self.table.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table_frame, command=self.table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
-        self.table.configure(yscrollcommand=scrollbar.set)
+        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
         self.table.tag_configure("failed", foreground="#b42332")
         self.table.tag_configure("partial", foreground="#8a5715")
         self.table.tag_configure("interrupted", foreground="#8a5715")
@@ -301,6 +346,7 @@ class JobsView:
         self.render_table()
 
     def render_table(self):
+        now = datetime.now(timezone.utc)
         previous = self.table.selection()
         visible = [job for job in self.jobs.values() if self.mode.get() == "All"
                    or (job["state"] in TERMINAL) == (self.mode.get() == "History")]
@@ -309,7 +355,9 @@ class JobsView:
             if child not in wanted:
                 self.table.delete(child)
         for index, job in enumerate(visible):
-            values = (job["name"], job["state"].replace("_", " ").title(), job["stage"].replace("_", " ").title(), job["source"].title())
+            when, elapsed, _ = job_timing(job, now=now)
+            values = (job["name"], job["state"].replace("_", " ").title(), when, elapsed,
+                      job["stage"].replace("_", " ").title(), job["source"].title())
             if self.table.exists(job["id"]):
                 self.table.item(job["id"], values=values, tags=(job["state"],))
                 self.table.move(job["id"], "", index)
@@ -329,7 +377,7 @@ class JobsView:
                 result = ", ".join(f"{key}: {value}" for key, value in step["result"].items())
                 state = "Paused" if job["state"] == "paused" and step["state"] == "running" else step["state"].title()
                 self.steps.insert("", "end", values=(f"{index}. {KINDS[step['kind']]}", state, result))
-            self.detail.set("Created " + local_time(job["created_at"]) + " | Updated " + local_time(job["updated_at"]))
+            self.detail.set(job_timing(job)[2])
             self.status.set({"pause_requested": "Pause pending at the next committed checkpoint.",
                              "paused": "Paused at a committed checkpoint; queue execution is waiting.",
                              "cancel_requested": "Cancel pending at the next committed checkpoint.",
