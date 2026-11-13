@@ -47,7 +47,8 @@ def validate_job(value):
             raise ValueError()
         clean["state"] = step["state"]
         clean["result"] = {key: item for key, item in step["result"].items()
-                           if key in {"fetched", "stored", "enriched", "parent_enriched", "bytes", "errors"}
+                           if key in {"fetched", "stored", "enriched", "parent_enriched", "bytes", "errors",
+                                      "checked", "ready", "partial", "images", "analyzed"}
                            and type(item) is int and 0 <= item <= 10**12}
         if type(step["result"].get("verified")) is bool:
             clean["result"]["verified"] = step["result"]["verified"]
@@ -131,7 +132,8 @@ def write_jobs(home_url, route, payload):
 
 
 PRESETS = {name: [{"kind": kind} for kind in kinds] for name, kinds in (
-    ("Fetch", ("fetch",)), ("Enrich", ("enrich",)), ("Retrain", ("retrain",)), ("Backup", ("backup",)),
+    ("Fetch", ("fetch",)), ("Enrich", ("enrich",)), ("Review Prewarm", ("review_prewarm",)),
+    ("Retrain", ("retrain",)), ("Backup", ("backup",)),
     ("Backup + Fetch + Retrain", ("backup", "fetch", "retrain")),
     ("Backup + Enrich + Retrain", ("backup", "enrich", "retrain")))}
 

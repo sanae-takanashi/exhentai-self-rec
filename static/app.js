@@ -31,6 +31,8 @@ const reviewRequireBootstrapMatchEl = document.querySelector("#reviewRequireBoot
 const visualEncoderEl = document.querySelector("#visualEncoder");
 const dinov2DeviceEl = document.querySelector("#dinov2Device");
 const autoRefreshEl = document.querySelector("#autoRefresh");
+const reviewPrewarmEnabledEl = document.querySelector("#reviewPrewarmEnabled");
+const reviewPrewarmWindowEl = document.querySelector("#reviewPrewarmWindow");
 const recommendationsEl = document.querySelector("#recommendations");
 const queryEl = document.querySelector("#query");
 const searchFetchBtn = document.querySelector("#searchFetchBtn");
@@ -786,6 +788,12 @@ async function loadSettings() {
   visualEncoderEl.value = settings.visual_encoder || visualDefaultEncoder;
   dinov2DeviceEl.value = settings.dinov2_device || "auto";
   autoRefreshEl.checked = settings.auto_refresh;
+  reviewPrewarmEnabledEl.checked = settings.review_prewarm?.enabled !== false;
+  reviewPrewarmWindowEl.value = settings.review_prewarm?.window || 120;
+  const prewarm = settings.review_prewarm;
+  document.querySelector("#reviewPrewarmStatus").textContent = prewarm?.checked
+    ? `${prewarm.ready} / ${prewarm.checked} ready · ${prewarm.pending} pending · ${prewarm.cooling} cooling down`
+    : "";
 }
 
 async function loadStatus() {
@@ -859,6 +867,8 @@ async function saveSettings() {
     visual_encoder: visualEncoderEl.value,
     dinov2_device: dinov2DeviceEl.value.trim(),
     auto_refresh: autoRefreshEl.checked,
+    review_prewarm_enabled: reviewPrewarmEnabledEl.checked,
+    review_prewarm_window: Number(reviewPrewarmWindowEl.value),
   };
   const settings = await api("/api/settings", {
     method: "POST",

@@ -90,3 +90,50 @@ operations policy.
 during training, subsequent pending runs, artifact publication/crash recovery,
 fetch setup/finalizer faults and real SQLite claim contention. Run it against
 an isolated data/model directory, as with the other personalized-model tests.
+
+## Review media prewarm
+
+`Review Prewarm` is a durable Jobs kind. Background preparation is enabled by
+default when a saved cookie exists. Settings expose its toggle and candidate
+window (default 120, range 40-400). Each job prepares at most three galleries,
+then releases the single Jobs worker. Automatic jobs sort behind ordinary queued
+work; they do not preempt running jobs. The native launcher also offers a manual
+`Review Prewarm` preset, with the usual pause/cancel/retry controls. Pausing a
+running job retains the existing queue-wide pause semantics; disable automatic
+prewarm in Settings to stop future scheduling.
+
+Selection uses the current saved Review language, model/ranking, bootstrap-match,
+recency and primary-band policy. It reads retained Low Interest memberships and
+existing audit slots but never creates memberships, freezes an audit day, records
+impressions or changes feedback. Transient browser text filters and an already
+loaded Focus cursor are not known to this scheduler; its window follows the
+server's current ranking, not an exact mirror of a browser's retained queue.
+
+Preparation fetches missing detail/sample metadata, caches the cover and all
+selected sample previews (including sprite crops), then analyzes the cover plus
+up to ten samples. It uses the configured encoder/device. DINOv2 uses local model
+files only; an unavailable model leaves the job partial, without silently changing
+the encoder or downloading weights. The existing explicit model-download action
+can populate missing model files. Simple uses the same normalized 8x8 RGB feature
+layout as the browser fallback, with Pillow's bilinear resampling.
+
+Readiness is persisted against the media URLs/crop geometry, encoder/model version
+and saved embedding digest. Changed metadata, overwritten embeddings or missing
+cache files invalidate readiness. Failed attempts retain committed work and have
+bounded exponential cooldown (10 minutes initially, up to 6 hours). One failed
+gallery does not abort the rest of the batch. Automatic scheduling coalesces active
+work and stops scanning for five minutes when there is nothing due. Restarts keep
+readiness/cooldowns; interrupted Jobs retain the existing explicit retry behavior.
+
+Network access and inference run outside SQLite write transactions and reuse the
+existing network limiter/ban cooldown. Cache fills are single-flight per striped
+resource lock, publish through temporary siblings, and check recorded sizes/hashes.
+DINO inference is serialized across foreground/background callers. Changed visual
+features mark one coalesced pending training unit; they never retrain per image.
+No cache files are automatically pruned. Completed prewarm avoids remote fetching
+and inference during Review, but local transfer/decoding and genuinely new or stale
+media can still take time.
+
+`tests/test_review_prewarm.py` covers the synthetic preparation pipeline, sprite
+fallback, idempotency/invalidation, transaction availability, cooldown, cancellation,
+bounded batches, queue priority, scheduler coalescing and concurrent cache fills.

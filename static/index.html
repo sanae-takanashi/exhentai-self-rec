@@ -189,6 +189,15 @@
         <div class="hint">Pre-fetches the DINOv2 model and image processor into the local cache through the configured proxy. Use this if DINOv2 reports it cannot load the image processor.</div>
 
         <label class="check">
+          <input id="reviewPrewarmEnabled" type="checkbox">
+          Background Review prewarm
+        </label>
+        <label>
+          Review prewarm window
+          <input id="reviewPrewarmWindow" type="number" min="40" max="400" value="120">
+        </label>
+        <output id="reviewPrewarmStatus" class="hint"></output>
+        <label class="check">
           <input id="autoRefresh" type="checkbox">
           Auto refresh
         </label>

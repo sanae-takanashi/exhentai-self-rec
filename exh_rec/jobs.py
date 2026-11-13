@@ -8,14 +8,14 @@ import time
 import uuid
 
 
-KINDS = {"fetch": "Fetch", "enrich": "Enrich", "retrain": "Retrain", "backup": "Backup"}
+KINDS = {"fetch": "Fetch", "enrich": "Enrich", "review_prewarm": "Review Prewarm", "retrain": "Retrain", "backup": "Backup"}
 ACTIVE = frozenset({"queued", "held", "running", "pause_requested", "paused", "cancel_requested"})
 TERMINAL = frozenset({"succeeded", "partial", "failed", "cancelled", "interrupted"})
 STATES = ACTIVE | TERMINAL
 STEP_STATES = frozenset({"pending", "running", "succeeded", "partial", "failed", "cancelled", "interrupted"})
 CLAIM_BUSY_RETRIES = 6
 STAGES = frozenset({"queued", "starting", "query_page", "query_metadata", "detail", "finalizing",
-                    "retraining", "backup", "step_complete", "finished", "interrupted", "cancelled"})
+                    "retraining", "backup", "media", "visual", "step_complete", "finished", "interrupted", "cancelled"})
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +79,8 @@ def validate_steps(values):
             raise JobError("Unsupported job kind")
         kind, params = value["kind"], value.get("params", {})
         allowed = {"fetch": {"query", "include_rated", "filter_text"},
-                   "enrich": {"limit", "include_rated", "filter_text"}, "retrain": set(), "backup": set()}[kind]
+                   "enrich": {"limit", "include_rated", "filter_text"}, "review_prewarm": set(),
+                   "retrain": set(), "backup": set()}[kind]
         if not isinstance(params, dict) or set(params) - allowed:
             raise JobError("Unsupported job parameters")
         clean = {}
@@ -107,7 +108,8 @@ def public_job(row):
 def result_summary(result):
     if not isinstance(result, dict):
         return {}
-    summary = {key: result[key] for key in ("fetched", "stored", "enriched", "parent_enriched", "bytes")
+    summary = {key: result[key] for key in ("fetched", "stored", "enriched", "parent_enriched", "bytes",
+                                          "checked", "ready", "partial", "images", "analyzed")
                if type(result.get(key)) is int and 0 <= result[key] <= 10**12}
     if isinstance(result.get("errors"), list):
         summary["errors"] = len(result["errors"])
@@ -206,8 +208,9 @@ class JobQueue:
             pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE state NOT IN ('succeeded','partial','failed','cancelled','interrupted')").fetchone()[0]
             if pending >= 100:
                 raise JobError("Queue is full")
+            priority = -1 if source == "background" and all(step["kind"] == "review_prewarm" for step in steps) else 0
             conn.execute("INSERT INTO jobs(id,name,source,state,steps_json,priority,created_at,updated_at) VALUES(?,?,?,'queued',?,?,?,?)",
-                         (job_id, title, source, encoded, time.time_ns() if next_job else 0, now, now))
+                         (job_id, title, source, encoded, time.time_ns() if next_job else priority, now, now))
         self.wake.set()
         return self.get(job_id)
 

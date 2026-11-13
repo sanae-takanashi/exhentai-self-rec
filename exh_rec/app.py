@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import db
+from . import db, review_prewarm
 from .runtime_identity import capture_runtime
 from .jobs import JobError, JobHalt, JobQueue
 from .fetch_activity import FetchActivity
@@ -149,6 +149,7 @@ FEEDBACK_ENRICHMENT_LOCK = threading.Lock()
 FEEDBACK_ENRICHMENT_WORKER: threading.Thread | None = None
 COMMON_EXHENTAI_COOKIE_KEYS = ("ipb_member_id", "ipb_pass_hash", "igneous")
 ALLOWED_THUMB_HOSTS = {"s.exhentai.org", "ehgt.org"}
+THUMB_CACHE_LOCKS = [threading.Lock() for _ in range(64)]
 THUMB_MAX_BYTES = 5 * 1024 * 1024
 LOCAL_PAGES = LocalPageLibrary(Path(os.environ.get("EXH_REC_LOCAL_PAGES_DIR", db.DATA_DIR / "hath-page-library")))
 PARENT_UPDATE_LOG_LIMIT = 120
@@ -915,6 +916,7 @@ def get_settings() -> dict:
             "cookie_preview": preview_cookie(cookie),
             "cookie_missing_keys": missing_common_cookie_keys(cookie),
             "auto_refresh": db.get_setting(conn, "auto_refresh", "1") == "1",
+            "review_prewarm": review_prewarm.settings(conn),
             "refresh_interval_minutes": refresh_interval_minutes(conn),
             "model_retrain_mode": configured_model_retrain_mode(conn),
             "model_retrain_feedback_threshold": model_retrain_feedback_threshold(conn),
@@ -1073,6 +1075,11 @@ def save_settings(payload: dict[str, Any]) -> None:
         if "auto_refresh" in payload:
             db.set_setting(conn, "auto_refresh", "1" if parse_bool(payload["auto_refresh"]) else "0")
             refresh_relevant_change = True
+        if "review_prewarm_enabled" in payload:
+            db.set_setting(conn, "review_prewarm_enabled", "1" if parse_bool(payload["review_prewarm_enabled"]) else "0")
+        if "review_prewarm_window" in payload:
+            window = bounded_int(payload["review_prewarm_window"], default=120, lower=40, upper=400)
+            db.set_setting(conn, "review_prewarm_window", str(window))
         if "refresh_interval_minutes" in payload:
             minutes = bounded_int(payload["refresh_interval_minutes"], default=30, lower=5, upper=240)
             db.set_setting(conn, "refresh_interval_minutes", str(minutes))
@@ -3672,6 +3679,7 @@ def recommendation_payload(
     require_bootstrap_match: bool = False,
     posted_after: str | None = None,
     interest_band: str = "all",
+    selection_read_only: bool = False,
 ) -> dict:
     if language_filter is None:
         language_filter = configured_language_filter(conn)
@@ -3696,6 +3704,7 @@ def recommendation_payload(
         low_interest_auto_threshold=review_low_interest_auto_threshold(conn),
         low_interest_max_percent=review_low_interest_max_percent(conn),
         interest_band=interest_band,
+        selection_read_only=selection_read_only,
         low_interest_audit_daily_count=(
             review_low_interest_audit_daily_count(conn)
             if review_low_interest_audit_enabled(conn)
@@ -4067,6 +4076,30 @@ def feedback_history_payload(conn, gallery_url: str, limit: int = 25) -> dict:
 
 def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]:
     thumb_url = normalize_thumbnail_url(thumb_url)
+    with thumbnail_cache_lock(thumb_url):
+        return _cached_thumbnail(thumb_url, gallery_url)
+
+
+def thumbnail_cache_lock(key: str):
+    return THUMB_CACHE_LOCKS[int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % len(THUMB_CACHE_LOCKS)]
+
+
+def write_thumbnail_cache(key: str, data: bytes, content_type: str) -> None:
+    data_path, meta_path = thumbnail_cache_paths(key)
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = f".tmp-{threading.get_ident()}-{time.time_ns()}"
+    data_temp = data_path.with_name(data_path.name + suffix)
+    meta_temp = meta_path.with_name(meta_path.name + suffix)
+    data_temp.write_bytes(data)
+    meta_temp.write_text(json.dumps({"source_url": key, "content_type": content_type,
+                                    "fetched_at": current_timestamp(), "size": len(data),
+                                    "sha256": hashlib.sha256(data).hexdigest()}, ensure_ascii=True), encoding="utf-8")
+    os.replace(data_temp, data_path)
+    os.replace(meta_temp, meta_path)
+
+
+def _cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]:
+    thumb_url = normalize_thumbnail_url(thumb_url)
     if not thumb_url:
         raise ApiError(HTTPStatus.BAD_REQUEST, "thumbnail url is required")
     if not is_allowed_thumbnail_url(thumb_url):
@@ -4084,19 +4117,7 @@ def cached_thumbnail(thumb_url: str, gallery_url: str = "") -> tuple[bytes, str]
         raise ApiError(HTTPStatus.BAD_REQUEST, "Save your ExHentai cookie first")
 
     data, content_type = fetch_thumbnail_bytes(cookie, thumb_url, thumbnail_referer(gallery_url), proxy_url=proxy_url)
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_path.write_bytes(data)
-    meta_path.write_text(
-        json.dumps(
-            {
-                "source_url": thumb_url,
-                "content_type": content_type,
-                "fetched_at": current_timestamp(),
-            },
-            ensure_ascii=True,
-        ),
-        encoding="utf-8",
-    )
+    write_thumbnail_cache(thumb_url, data, content_type)
     return data, content_type
 
 
@@ -4139,12 +4160,17 @@ def render_sample_entry(entry, gallery_url: str) -> tuple[bytes, str]:
     """Fetch (and crop, for sprite frames) the image bytes for one sample entry."""
     if not isinstance(entry, dict):
         return cached_thumbnail(str(entry), gallery_url)
-    sheet_url = str(entry.get("url") or "")
+    sheet_url = normalize_thumbnail_url(str(entry.get("url") or ""))
     sheet_bytes, sheet_type = cached_thumbnail(sheet_url, gallery_url)
     box = sprite_crop_box(entry)
     if not box:
         return sheet_bytes, sheet_type
     cache_key = f"{sheet_url}#{box[0]},{box[1]},{box[2]},{box[3]}"
+    with thumbnail_cache_lock(cache_key):
+        return cached_sprite_crop(cache_key, sheet_bytes, sheet_type, box)
+
+
+def cached_sprite_crop(cache_key, sheet_bytes, sheet_type, box):
     data_path, meta_path = thumbnail_cache_paths(cache_key)
     cached = read_cached_thumbnail(data_path, meta_path, cache_key)
     if cached:
@@ -4155,15 +4181,7 @@ def render_sample_entry(entry, gallery_url: str) -> tuple[bytes, str]:
         # Pillow missing or the sheet could not be decoded: serve the whole sheet
         # so the page still shows an image instead of a broken thumbnail.
         return sheet_bytes, sheet_type
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_path.write_bytes(data)
-    meta_path.write_text(
-        json.dumps(
-            {"source_url": cache_key, "content_type": content_type, "fetched_at": current_timestamp()},
-            ensure_ascii=True,
-        ),
-        encoding="utf-8",
-    )
+    write_thumbnail_cache(cache_key, data, content_type)
     return data, content_type
 
 
@@ -4346,15 +4364,25 @@ def read_cached_thumbnail(data_path: Path, meta_path: Path, thumb_url: str) -> t
     if not data_path.exists():
         return None
     content_type = ""
+    meta = {}
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            content_type = str(meta.get("content_type") or "")
+            content_type = str(meta.get("content_type") or "") if isinstance(meta, dict) else ""
         except (OSError, json.JSONDecodeError):
             content_type = ""
     if not content_type.startswith("image/"):
         content_type = mimetypes.guess_type(urllib.parse.urlparse(thumb_url).path)[0] or "application/octet-stream"
-    return data_path.read_bytes(), content_type
+    try:
+        data = data_path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    if meta_path.exists() and isinstance(meta, dict) and "sha256" in meta:
+        if meta.get("size") != len(data) or meta["sha256"] != hashlib.sha256(data).hexdigest():
+            return None
+    return data, content_type
 
 
 def thumbnail_referer(gallery_url: str) -> str:
@@ -4748,6 +4776,8 @@ def wait_for_refresh_wake(stop: threading.Event, timeout: int) -> None:
 
 
 def execute_job(kind, params, context, source):
+    if kind == "review_prewarm":
+        return review_prewarm.run_batch(context.checkpoint, automatic=source == "background")
     if kind == "fetch":
         return fetch_and_store(force_query=params.get("query"), trigger="background" if source == "background" else "manual",
                                include_rated=params.get("include_rated", False), filter_text=params.get("filter_text"),
@@ -4811,8 +4841,10 @@ def main() -> None:
     JOBS.start(execute_job)
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     retrain_worker = threading.Thread(target=background_model_retrain, args=(stop,), daemon=True)
+    prewarm_worker = threading.Thread(target=review_prewarm.background, args=(stop,), daemon=True, name="review-prewarm")
     worker.start()
     retrain_worker.start()
+    prewarm_worker.start()
     print(f"Serving ExHentai recommender at {server_display_url(HOST, PORT)}")
     if HOST == "0.0.0.0":
         print(f"Remote clients can use http://<server-ip>:{PORT}")

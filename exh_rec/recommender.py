@@ -1794,6 +1794,7 @@ def recommend_page(
     training_conn: sqlite3.Connection | None = None,
     review_ranking_mode: str | None = None,
     min_posted_date: str | None = None,
+    selection_read_only: bool = False,
 ) -> dict:
     # Temporal replay can freeze learned preferences independently of candidate features.
     limit = max(1, min(10000, int(limit)))
@@ -1887,7 +1888,7 @@ def recommend_page(
         max_percent=low_interest_max_percent,
         retained_low_interest_urls=retained_low_interest_urls,
     )
-    if membership_key is not None:
+    if membership_key is not None and not selection_read_only:
         persist_low_interest_memberships(
             conn,
             membership_key,
@@ -1901,6 +1902,7 @@ def recommend_page(
             conn,
             scored,
             low_interest_audit_daily_count,
+            read_only=selection_read_only,
         )
         selected_audits = sum(bool(item.get("audit_id")) for item in scored)
         low_interest_policy["audit_selected_count"] = selected_audits

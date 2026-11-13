@@ -17,6 +17,7 @@ DINOV2_MODEL_NAME = os.environ.get("EXH_REC_DINOV2_MODEL", "facebook/dinov2-smal
 SIGLIP2_MODEL_NAME = os.environ.get("EXH_REC_SIGLIP2_MODEL", "google/siglip2-base-patch16-224")
 DEFAULT_DINOV2_DEVICE = os.environ.get("EXH_REC_DINOV2_DEVICE", "auto")
 _DINO_LOCK = threading.Lock()
+_DINO_INFERENCE_LOCK = threading.Lock()
 _DINO_STATE: dict[str, Any] = {}
 _SIGLIP2_LOCK = threading.Lock()
 _SIGLIP2_STATE: dict[str, Any] = {}
@@ -180,10 +181,15 @@ def torch_device_status(requested_device: str) -> dict:
     }
 
 
-def dinov2_image_embeddings(image_blobs: list[bytes], device: str | None = None) -> list[list[float]]:
+def dinov2_image_embeddings(image_blobs: list[bytes], device: str | None = None, *, local_files_only: bool = False) -> list[list[float]]:
+    with _DINO_INFERENCE_LOCK:
+        return _dinov2_image_embeddings(image_blobs, device, local_files_only=local_files_only)
+
+
+def _dinov2_image_embeddings(image_blobs: list[bytes], device: str | None, *, local_files_only: bool) -> list[list[float]]:
     if not image_blobs:
         raise ValueError("at least one image is required")
-    processor, model, torch, Image = load_dinov2(device)
+    processor, model, torch, Image = load_dinov2(device, local_files_only=True) if local_files_only else load_dinov2(device)
     images = []
     for blob in image_blobs:
         image = Image.open(io.BytesIO(blob)).convert("RGB")
@@ -281,7 +287,7 @@ def load_siglip2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
         return processor, model, torch, Image
 
 
-def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
+def load_dinov2(device: str | None = None, *, local_files_only: bool = False) -> tuple[Any, Any, Any, Any]:
     requested_device = normalize_dinov2_device(device or DEFAULT_DINOV2_DEVICE)
     if _DINO_STATE.get("loaded") and _DINO_STATE.get("device_config") == requested_device:
         return _DINO_STATE["processor"], _DINO_STATE["model"], _DINO_STATE["torch"], _DINO_STATE["Image"]
@@ -306,10 +312,13 @@ def load_dinov2(device: str | None = None) -> tuple[Any, Any, Any, Any]:
 
         try:
             resolved_device = resolve_dinov2_device(torch, requested_device)
+            options = {"local_files_only": True} if local_files_only else {}
             try:
-                processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME)
-                model = AutoModel.from_pretrained(DINOV2_MODEL_NAME)
+                processor = AutoImageProcessor.from_pretrained(DINOV2_MODEL_NAME, **options)
+                model = AutoModel.from_pretrained(DINOV2_MODEL_NAME, **options)
             except Exception:
+                if local_files_only:
+                    raise
                 # The first attempt commonly fails because the cache is missing a
                 # file (for example preprocessor_config.json after a network hiccup),
                 # which transformers reports as the cryptic "Can't load image

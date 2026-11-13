@@ -71,14 +71,15 @@ def prepare_daily_low_interest_audits(
     daily_count: int,
     *,
     audit_date: str | date | None = None,
+    read_only: bool = False,
 ) -> dict:
     current_date = _today(audit_date)
     date_text = current_date.isoformat()
     daily_count = max(0, min(10, int(daily_count)))
-    frozen = conn.execute(
+    frozen = read_only or conn.execute(
         "SELECT 1 FROM low_interest_audit_days WHERE audit_date=?", (date_text,)
     ).fetchone() is not None
-    expired = conn.execute(
+    expired = not read_only and conn.execute(
         """SELECT 1 FROM low_interest_audits
         WHERE status='pending' AND visible_at IS NOT NULL AND audit_date<? LIMIT 1""",
         (date_text,),
@@ -100,7 +101,7 @@ def prepare_daily_low_interest_audits(
     frame = [item for item in scored if item.get("low_interest_fallback")]
     scored_by_url = {str(item.get("url") or ""): item for item in scored if item.get("url")}
     recent_start = (current_date - timedelta(days=AUDIT_WINDOW_DAYS - 1)).isoformat()
-    frozen = conn.execute(
+    frozen = read_only or conn.execute(
         "SELECT 1 FROM low_interest_audit_days WHERE audit_date=?", (date_text,)
     ).fetchone() is not None
     existing = conn.execute(

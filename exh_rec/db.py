@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS review_media_prewarm (
+    gallery_url TEXT PRIMARY KEY REFERENCES galleries(url) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL,
+    embedding_digest TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    retry_after REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS recommendation_impressions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT NOT NULL,
