@@ -4838,6 +4838,7 @@ def main() -> None:
         MODEL_RETRAIN_STATE.update({"last_completed_at": completed_at, "last_error": None})
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     stop = threading.Event()
+    review_prewarm.bind_service(globals())
     JOBS.start(execute_job)
     worker = threading.Thread(target=background_refresh, args=(stop,), daemon=True)
     retrain_worker = threading.Thread(target=background_model_retrain, args=(stop,), daemon=True)

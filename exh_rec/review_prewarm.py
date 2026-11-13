@@ -6,6 +6,7 @@ import io
 import json
 import sqlite3
 import time
+from types import SimpleNamespace
 
 from . import db
 from .visual import (DINOV2_MODEL_NAME, DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VERSION,
@@ -13,7 +14,22 @@ from .visual import (DINOV2_MODEL_NAME, DINOV2_VISUAL_VERSION, SIMPLE_VISUAL_VER
 
 
 BATCH_SIZE = 3
-STATUS = {"checked": 0, "ready": 0, "pending": 0, "cooling": 0}
+STATUS = {"checked": 0, "ready": 0, "pending": 0, "cooling": 0, "last_error_code": ""}
+_SERVICE = None
+
+
+def bind_service(namespace):
+    global _SERVICE
+    # Both python -m and runpy entrypoints can execute app outside its import name.
+    # Reuse their live queue/locks instead of importing a second application instance.
+    _SERVICE = SimpleNamespace(**namespace)
+
+
+def service():
+    if _SERVICE is not None:
+        return _SERVICE
+    from . import app
+    return app
 
 
 def settings(conn):
@@ -26,14 +42,14 @@ def settings(conn):
 
 
 def encoder_config(conn):
-    from . import app
+    app = service()
     encoder = app.configured_visual_encoder(conn)
     return (encoder, app.configured_dinov2_device(conn),
             DINOV2_VISUAL_VERSION if encoder == "dinov2" else SIMPLE_VISUAL_VERSION)
 
 
 def entries(item):
-    from . import app
+    app = service()
     samples = item.get("samples")
     if samples is None:
         samples = app.safe_json_list(item.get("samples_json"))
@@ -42,7 +58,7 @@ def entries(item):
 
 
 def cache_key(entry):
-    from . import app
+    app = service()
     if not isinstance(entry, dict):
         return app.normalize_thumbnail_url(str(entry))
     url = app.normalize_thumbnail_url(app.sample_entry_url(entry))
@@ -57,7 +73,7 @@ def fingerprint(item, config):
 
 
 def media_cached(item):
-    from . import app
+    app = service()
     if not item.get("detail_fetched_at") or not item.get("samples"):
         return False
     return bool(entries(item)) and all(app.read_cached_thumbnail(*app.thumbnail_cache_paths(cache_key(entry)),
@@ -71,7 +87,7 @@ def analysis_current(item, state, config):
 
 
 def candidates():
-    from . import app
+    app = service()
     with db.connect() as conn:
         # Enforce a truly read-only scan, including membership/audit selection.
         conn.execute("PRAGMA query_only=ON")
@@ -101,7 +117,7 @@ def candidates():
 
 
 def load_item(url):
-    from . import app
+    app = service()
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM galleries WHERE url=?", (url,)).fetchone()
         return app.gallery_db_row_payload(conn, row) if row else None
@@ -124,7 +140,7 @@ def record_attempt(item, config):
 
 
 def refresh_detail(item, checkpoint):
-    from . import app
+    app = service()
     if not app.FETCH_LOCK.acquire(blocking=False):
         raise RuntimeError("metadata_busy")
     try:
@@ -158,7 +174,7 @@ def simple_embeddings(blobs):
 
 
 def prepare_gallery(item, config, previous, checkpoint):
-    from . import app
+    app = service()
     if not item.get("detail_fetched_at") or not item.get("samples"):
         item = refresh_detail(item, checkpoint)
     for attempt in range(2):
@@ -257,7 +273,7 @@ def run_batch(checkpoint=lambda stage: None, *, automatic=False):
 
 
 def schedule_once():
-    from . import app
+    app = service()
     with db.connect() as conn:
         if not settings(conn)["enabled"] or not db.get_setting(conn, "cookie_header", "") or not app.JOBS.running:
             return False
@@ -276,7 +292,9 @@ def background(stop):
     while not stop.is_set():
         try:
             submitted = schedule_once()
+            STATUS["last_error_code"] = ""
         except Exception:
-            submitted = False
+            STATUS["last_error_code"] = "scheduler_failed"
+            submitted = True
         if stop.wait(30 if submitted else 300):
             return

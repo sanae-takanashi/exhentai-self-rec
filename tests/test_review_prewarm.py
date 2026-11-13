@@ -46,6 +46,7 @@ class PrewarmTest(unittest.TestCase):
         self.jobs = JobQueue(lambda: db.connect())
         self.jobs.initialize()
         self.stack.enter_context(patch.object(app, "JOBS", self.jobs))
+        self.stack.enter_context(patch.object(warm, "_SERVICE", None))
 
     def fetch(self, *_args, **_kwargs):
         # Every external stage must leave SQLite's writer slot free.
@@ -317,6 +318,25 @@ class PrewarmTest(unittest.TestCase):
             with db.connect() as conn:
                 db.set_setting(conn, "review_prewarm_enabled", "0")
             self.assertFalse(warm.schedule_once())
+
+    def test_module_entrypoint_uses_bound_live_queue_not_a_second_import(self):
+        queue = types.SimpleNamespace(running=True, submit=Mock())
+        warm.bind_service({"JOBS": queue})
+        self.assertIs(warm.service().JOBS, queue)
+        self.assertFalse(app.JOBS.running)
+        with patch.object(warm, "candidates", return_value=[{"url": "synthetic"}]):
+            self.assertTrue(warm.schedule_once())
+        queue.submit.assert_called_once_with([{"kind": "review_prewarm"}], source="background", coalesce=True)
+
+    def test_scheduler_failure_has_fixed_status_and_bounded_retry(self):
+        stop = Mock()
+        stop.wait.side_effect = [False, True]
+        stop.is_set.return_value = False
+        with patch.object(warm, "schedule_once", side_effect=RuntimeError("FAKE_SECRET")):
+            warm.background(stop)
+        self.assertEqual(warm.STATUS["last_error_code"], "scheduler_failed")
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [30, 30])
+        warm.STATUS["last_error_code"] = ""
 
 
 class PrewarmEncoderTest(unittest.TestCase):

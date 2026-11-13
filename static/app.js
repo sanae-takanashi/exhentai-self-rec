@@ -791,7 +791,9 @@ async function loadSettings() {
   reviewPrewarmEnabledEl.checked = settings.review_prewarm?.enabled !== false;
   reviewPrewarmWindowEl.value = settings.review_prewarm?.window || 120;
   const prewarm = settings.review_prewarm;
-  document.querySelector("#reviewPrewarmStatus").textContent = prewarm?.checked
+  document.querySelector("#reviewPrewarmStatus").textContent = prewarm?.last_error_code
+    ? "Prewarm check failed; retry pending"
+    : prewarm?.checked
     ? `${prewarm.ready} / ${prewarm.checked} ready · ${prewarm.pending} pending · ${prewarm.cooling} cooling down`
     : "";
 }

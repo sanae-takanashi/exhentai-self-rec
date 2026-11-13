@@ -124,6 +124,9 @@ bounded exponential cooldown (10 minutes initially, up to 6 hours). One failed
 gallery does not abort the rest of the batch. Automatic scheduling coalesces active
 work and stops scanning for five minutes when there is nothing due. Restarts keep
 readiness/cooldowns; interrupted Jobs retain the existing explicit retry behavior.
+The scheduler binds to the live entrypoint's queue and locks, including `python -m`
+and launcher `runpy` startup. Check failures expose a fixed status code and retry
+after 30 seconds without disclosing remote exception text.
 
 Network access and inference run outside SQLite write transactions and reuse the
 existing network limiter/ban cooldown. Cache fills are single-flight per striped
